@@ -158,10 +158,25 @@ def get_nvidia_gpu_stats():
 def get_drm_gpu_stats():
     gpus = []
 
-    for card_path in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
-        device_path = Path(card_path) / "device"
+    for card_path in sorted(glob.glob("/sys/class/drm/card*")):
+        card = Path(card_path)
+
+        # Only accept real DRM card directories:
+        # card0, card1, card2, ...
+        # Ignore connector entries such as card0-HDMI-A-1.
+        suffix = card.name.removeprefix("card")
+
+        if not suffix.isdigit():
+            continue
+
+        device_path = card / "device"
 
         if not device_path.exists():
+            continue
+
+        vendor_file = device_path / "vendor"
+
+        if not vendor_file.exists():
             continue
 
         vendor_id = _read_text_file(device_path / "vendor")
