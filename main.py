@@ -2,6 +2,9 @@ import os
 import time
 import threading
 import subprocess
+import shutil
+import glob
+from pathlib import Path
 import docker
 
 from fastapi import FastAPI, HTTPException
@@ -82,11 +85,32 @@ def add_io_rates(container_id, stats):
     return stats
 
 
-def get_gpu_stats():
+def _safe_float(value):
+    try:
+        if value in (None, "", "N/A", "[Not Supported]"):
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_text_file(path):
+    try:
+        return Path(path).read_text().strip()
+    except Exception:
+        return None
+
+
+def get_nvidia_gpu_stats():
+    nvidia_smi = shutil.which("nvidia-smi")
+
+    if not nvidia_smi:
+        return None
+
     try:
         result = subprocess.run(
             [
-                "nvidia-smi",
+                nvidia_smi,
                 "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed",
                 "--format=csv,noheader,nounits",
             ],
@@ -96,23 +120,127 @@ def get_gpu_stats():
             check=True,
         )
 
-        line = result.stdout.strip().splitlines()[0]
-        parts = [part.strip() for part in line.split(",")]
+        lines = [
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
 
-        return {
-            "name": parts[0],
-            "utilization_percent": float(parts[1]),
-            "memory_used_mb": float(parts[2]),
-            "memory_total_mb": float(parts[3]),
-            "temperature_c": float(parts[4]),
-            "power_draw_w": float(parts[5]),
-            "power_limit_w": float(parts[6]),
-            "fan_percent": float(parts[7]),
+        if not lines:
+            return None
+
+        gpus = []
+
+        for line in lines:
+            parts = [part.strip() for part in line.split(",")]
+
+            if len(parts) < 8:
+                continue
+
+            gpus.append({
+                "vendor": "nvidia",
+                "name": parts[0],
+                "utilization_percent": _safe_float(parts[1]),
+                "memory_used_mb": _safe_float(parts[2]),
+                "memory_total_mb": _safe_float(parts[3]),
+                "temperature_c": _safe_float(parts[4]),
+                "power_draw_w": _safe_float(parts[5]),
+                "power_limit_w": _safe_float(parts[6]),
+                "fan_percent": _safe_float(parts[7]),
+            })
+
+        return gpus or None
+
+    except Exception:
+        return None
+
+
+def get_drm_gpu_stats():
+    gpus = []
+
+    for card_path in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+        device_path = Path(card_path) / "device"
+
+        if not device_path.exists():
+            continue
+
+        vendor_id = _read_text_file(device_path / "vendor")
+        device_id = _read_text_file(device_path / "device")
+
+        vendor_map = {
+            "0x10de": "nvidia",
+            "0x1002": "amd",
+            "0x8086": "intel",
         }
 
-    except Exception as error:
-        print(f"GPU lookup failed: {error}")
-        return None
+        vendor = vendor_map.get(
+            (vendor_id or "").lower(),
+            "unknown",
+        )
+
+        name = f"{vendor.upper()} GPU"
+
+        uevent = _read_text_file(device_path / "uevent")
+
+        if uevent:
+            for line in uevent.splitlines():
+                if line.startswith("PCI_ID="):
+                    name = f"{vendor.upper()} GPU {line.split('=', 1)[1]}"
+                    break
+
+        temperature_c = None
+
+        for hwmon in glob.glob(
+            str(device_path / "hwmon" / "hwmon*")
+        ):
+            temp_raw = _read_text_file(
+                Path(hwmon) / "temp1_input"
+            )
+
+            if temp_raw:
+                try:
+                    temperature_c = round(
+                        float(temp_raw) / 1000,
+                        1,
+                    )
+                    break
+                except ValueError:
+                    pass
+
+        gpus.append({
+            "vendor": vendor,
+            "name": name,
+            "device_id": device_id,
+            "utilization_percent": None,
+            "memory_used_mb": None,
+            "memory_total_mb": None,
+            "temperature_c": temperature_c,
+            "power_draw_w": None,
+            "power_limit_w": None,
+            "fan_percent": None,
+        })
+
+    return gpus or None
+
+
+def get_gpu_stats():
+    gpus = get_nvidia_gpu_stats()
+
+    if not gpus:
+        gpus = get_drm_gpu_stats()
+
+    if not gpus:
+        return {
+            "available": False,
+            "count": 0,
+            "devices": [],
+        }
+
+    return {
+        "available": True,
+        "count": len(gpus),
+        "devices": gpus,
+    }
 
 
 def build_container_snapshot():
