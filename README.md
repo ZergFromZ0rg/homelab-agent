@@ -542,16 +542,60 @@ Force a run immediately:
 curl -X POST http://localhost:8123/backup/run
 ```
 
-### Restore a host
+### Restore a host that failed or was wiped
+
+The backup repo has everything needed to redeploy the stacks. It does
+**not** contain volume data or real secret values — restore those
+separately.
+
+**1. Base system.** Install the OS and Docker (including the Compose
+plugin). No need to match the old hostname, but note which `HOST_NAME` the
+machine used — that is its folder in the repo.
+
+**2. Get the backup.**
 
 ```bash
 git clone https://github.com/your-user/homelab.git
 cd homelab/machines/<host>
+```
+
+`inventory.json` in that folder lists every named volume, image (with
+tag and digest), and network the host had — use it as the checklist for
+the next two steps.
+
+**3. Restore volume data** from your separate encrypted backup into the
+Docker volumes named in `inventory.json`, *before* starting the stacks:
+
+```bash
+docker volume create <project>_<volume>
+# then untar / rsync your data backup into that volume
+```
+
+Skip this for stateless stacks.
+
+**4. Put secrets back.** Compose values in the backup are either
+`REDACTED` or `${VAR}` references. For each stack, recreate its `.env`
+file (or edit the compose file) with the real values. `.env` files are
+never in the backup by design.
+
+**5. Bring the stacks up.**
+
+```bash
 for stack in */; do (cd "$stack" && docker compose up -d); done
 ```
 
-Then restore volume data separately, using `inventory.json` as the list of
-volumes and image tags to expect.
+Compose pulls the images and recreates the networks. If a stack pinned
+`latest`, check the running image against the digest in `inventory.json`.
+
+**6. Redeploy the agent** on the restored host (see
+[Run command (with backup)](#run-command-with-backup)) so it resumes
+backing itself up, then:
+
+```bash
+curl -X POST http://localhost:8123/backup/run
+```
+
+Confirm `machines/<host>/` in the repo matches the restored machine.
 
 ## Start Container
 
@@ -779,6 +823,10 @@ setup.
 
 ## Updating
 
+Deployed agents do **not** update themselves. New agent code is picked up
+by rebuilding and recreating the container on each host. The configuration
+backup keeps running on the old container until you do.
+
 Pull the latest source:
 
 ```bash
@@ -791,15 +839,9 @@ Rebuild the image:
 docker build -t homelab-agent .
 ```
 
-Then recreate the running container using the appropriate command for that host.
-
-For NVIDIA hosts, remember to retain:
-
-```text
---gpus all
-```
-
-when recreating the container.
+Then recreate the running container using the same command you deployed it
+with (keep `--gpus all` on NVIDIA hosts, and the backup env vars and
+mounts if backup is enabled).
 
 ## Built With
 
