@@ -811,4 +811,4 @@ when recreating the container.
 
 ## License
 
-No license has been specified yet.
+MIT. See [LICENSE](LICENSE).
