@@ -9,6 +9,8 @@ import docker
 
 from fastapi import FastAPI, HTTPException
 
+from stack_backup import StackBackup
+
 app = FastAPI()
 
 client = docker.from_env()
@@ -542,9 +544,182 @@ def get_container_stats(container):
 
 
 
+def _compose_labels(labels):
+    labels = labels or {}
+
+    return {
+        "project": labels.get("com.docker.compose.project"),
+        "service": labels.get("com.docker.compose.service"),
+        "working_dir": labels.get(
+            "com.docker.compose.project.working_dir"
+        ),
+        "config_files": labels.get(
+            "com.docker.compose.project.config_files"
+        ),
+    }
+
+
+def get_volume_sizes():
+    try:
+        data = client.df()
+
+    except Exception as error:
+        print(f"Volume size lookup failed: {error}")
+        return {}
+
+    sizes = {}
+
+    for volume in data.get("Volumes") or []:
+        name = volume.get("Name")
+        usage = volume.get("UsageData") or {}
+        size = usage.get("Size")
+
+        if name is not None and isinstance(size, int) and size >= 0:
+            sizes[name] = size
+
+    return sizes
+
+
+def get_volume_inventory(sizes_by_name):
+    volumes = []
+
+    for volume in client.volumes.list():
+        attrs = volume.attrs or {}
+        labels = attrs.get("Labels") or {}
+
+        volumes.append({
+            "name": volume.name,
+            "driver": attrs.get("Driver"),
+            "mountpoint": attrs.get("Mountpoint"),
+            "created_at": attrs.get("CreatedAt"),
+            "compose_project": labels.get(
+                "com.docker.compose.project"
+            ),
+            "compose_volume": labels.get(
+                "com.docker.compose.volume"
+            ),
+            "options": attrs.get("Options") or {},
+            "size_bytes": sizes_by_name.get(volume.name),
+        })
+
+    volumes.sort(key=lambda item: item["name"] or "")
+    return volumes
+
+
+def get_image_inventory():
+    images = []
+
+    for image in client.images.list():
+        attrs = image.attrs or {}
+
+        images.append({
+            "id": image.id,
+            "tags": sorted(image.tags),
+            "digests": sorted(attrs.get("RepoDigests") or []),
+            "size_bytes": int(attrs.get("Size", 0) or 0),
+            "created": attrs.get("Created"),
+        })
+
+    images.sort(
+        key=lambda item: (
+            item["tags"][0] if item["tags"] else item["id"]
+        )
+    )
+
+    return images
+
+
+def get_network_inventory():
+    networks = []
+
+    for network in client.networks.list():
+        attrs = network.attrs or {}
+        labels = attrs.get("Labels") or {}
+        ipam_config = (attrs.get("IPAM") or {}).get("Config") or []
+
+        networks.append({
+            "name": network.name,
+            "driver": attrs.get("Driver"),
+            "scope": attrs.get("Scope"),
+            "internal": attrs.get("Internal", False),
+            "subnets": [
+                entry.get("Subnet")
+                for entry in ipam_config
+                if entry.get("Subnet")
+            ],
+            "compose_project": labels.get(
+                "com.docker.compose.project"
+            ),
+        })
+
+    networks.sort(key=lambda item: item["name"] or "")
+    return networks
+
+
+def get_container_inventory():
+    entries = []
+
+    for container in client.containers.list(all=True):
+        attrs = container.attrs or {}
+        config = attrs.get("Config") or {}
+        host_config = attrs.get("HostConfig") or {}
+        labels = config.get("Labels") or {}
+
+        restart_policy = (
+            (host_config.get("RestartPolicy") or {}).get("Name") or ""
+        )
+
+        ports = {}
+
+        for target, bindings in (
+            host_config.get("PortBindings") or {}
+        ).items():
+            ports[target] = sorted({
+                binding.get("HostPort")
+                for binding in (bindings or [])
+                if binding.get("HostPort")
+            })
+
+        mounts = []
+
+        for mount in attrs.get("Mounts") or []:
+            mounts.append({
+                "type": mount.get("Type"),
+                "source": mount.get("Name") or mount.get("Source"),
+                "target": mount.get("Destination"),
+                "rw": mount.get("RW", True),
+            })
+
+        try:
+            image_ref = (
+                container.image.tags[0]
+                if container.image.tags
+                else container.image.short_id
+            )
+            image_id = container.image.id
+
+        except Exception:
+            image_ref = config.get("Image")
+            image_id = attrs.get("Image")
+
+        entries.append({
+            "name": container.name,
+            "image": image_ref,
+            "image_id": image_id,
+            "restart_policy": restart_policy,
+            "compose": _compose_labels(labels),
+            "ports": ports,
+            "mounts": mounts,
+        })
+
+    entries.sort(key=lambda item: item["name"] or "")
+    return entries
+
+
 @app.on_event("startup")
 def startup_event():
     start_cache_worker()
+    stack_backup.start()
 
 @app.get("/")
 def root():
@@ -573,6 +748,52 @@ def get_containers():
         "gpu": gpu,
         "containers": containers,
     }
+
+
+def build_inventory(sizes: bool = False):
+    volume_sizes = get_volume_sizes() if sizes else {}
+
+    return {
+        "host": HOST_NAME,
+        "generated_at": time.time(),
+        "sizes_included": bool(sizes),
+        "volumes": get_volume_inventory(volume_sizes),
+        "images": get_image_inventory(),
+        "networks": get_network_inventory(),
+        "containers": get_container_inventory(),
+    }
+
+
+@app.get("/inventory")
+def get_inventory(sizes: bool = False):
+    return build_inventory(sizes)
+
+
+stack_backup = StackBackup(
+    docker_client=client,
+    host_name=HOST_NAME,
+    inventory_provider=lambda: build_inventory(sizes=True),
+)
+
+
+@app.get("/backup")
+def backup_status():
+    return stack_backup.snapshot()
+
+
+@app.post("/backup/run")
+def backup_run():
+    if not stack_backup.configured:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "backup not configured; set BACKUP_REPO and GITHUB_TOKEN"
+            ),
+        )
+
+    stack_backup.trigger()
+
+    return {"success": True, "triggered": True}
 
 
 def get_container_or_404(container_id: str):

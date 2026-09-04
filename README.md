@@ -45,6 +45,14 @@ The API supports:
 
 The `homelab-agent` container is protected from destructive control operations through its own API.
 
+### Stack Inventory
+
+Homelab Agent reports a rebuild manifest of the host's Docker named volumes, images, networks, and per-container deployment shape (image, restart policy, ports, mounts) through `GET /inventory`. This lets a central job snapshot what each host needs to be recreated after a failure. See [Stack Inventory](#stack-inventory) below.
+
+### Configuration Backup
+
+On a schedule (default every 12 hours), Homelab Agent discovers the Compose projects on its host, copies their definition files with secrets redacted, writes `inventory.json`, and pushes `machines/<HOST_NAME>/` to a private GitHub repository. Each agent only writes its own host folder, so every machine in a fleet can back up to one repo. See [Configuration Backup](#configuration-backup-1) below.
+
 ## GPU Autodetection
 
 Homelab Agent automatically searches for GPUs available to the container instead of assuming a specific GPU vendor.
@@ -153,6 +161,8 @@ The rest of the agent continues operating normally.
 - Docker
 - Access to the host Docker socket
 - A trusted private network
+- For configuration backup: a read-only host filesystem mount and a
+  GitHub token (see [Configuration Backup](#configuration-backup-1))
 
 Homelab Agent communicates with the host Docker daemon through:
 
@@ -328,6 +338,215 @@ Initial collection time depends on:
 - Host performance
 - Metrics available for each container
 
+## Stack Inventory
+
+```http
+GET /inventory
+```
+
+Returns a manifest of everything on the host that has to be recreated after
+a rebuild: Docker **named volumes**, **images**, **networks**, and each
+container's deployment shape (image, restart policy, published ports,
+mounts). It contains no data bytes and no secrets (container environment is
+not included), so it is safe to commit to a configuration repository.
+
+Pass `?sizes=true` to include volume sizes. This calls the Docker
+`system df` API and can take several seconds on a busy host, so it is off by
+default.
+
+Example:
+
+```bash
+curl "http://localhost:8123/inventory?sizes=true"
+```
+
+```json
+{
+  "host": "server-1",
+  "generated_at": 1787764791.11,
+  "sizes_included": true,
+  "volumes": [
+    {
+      "name": "uptime-kuma_data",
+      "driver": "local",
+      "mountpoint": "/var/lib/docker/volumes/uptime-kuma_data/_data",
+      "created_at": "2026-01-01T12:00:00Z",
+      "compose_project": "uptime-kuma",
+      "compose_volume": "data",
+      "options": {},
+      "size_bytes": 5242880
+    }
+  ],
+  "images": [
+    {
+      "id": "sha256:...",
+      "tags": ["louislam/uptime-kuma:1"],
+      "digests": ["louislam/uptime-kuma@sha256:..."],
+      "size_bytes": 419430400,
+      "created": "2026-01-01T00:00:00Z"
+    }
+  ],
+  "networks": [
+    {
+      "name": "uptime-kuma_default",
+      "driver": "bridge",
+      "scope": "local",
+      "internal": false,
+      "subnets": ["172.20.0.0/16"],
+      "compose_project": "uptime-kuma"
+    }
+  ],
+  "containers": [
+    {
+      "name": "uptime-kuma",
+      "image": "louislam/uptime-kuma:1",
+      "image_id": "sha256:...",
+      "restart_policy": "unless-stopped",
+      "compose": {
+        "project": "uptime-kuma",
+        "service": "uptime-kuma",
+        "working_dir": "/home/user/docker/uptime-kuma",
+        "config_files": "/home/user/docker/uptime-kuma/docker-compose.yml"
+      },
+      "ports": { "3001/tcp": ["3001"] },
+      "mounts": [
+        {
+          "type": "volume",
+          "source": "uptime-kuma_data",
+          "target": "/app/data",
+          "rw": true
+        }
+      ]
+    }
+  ]
+}
+```
+
+The `generated_at` timestamp changes on every request; a consumer that
+commits this file should strip it so an unchanged host produces no diff.
+
+## Configuration Backup
+
+Homelab Agent can keep a private Git repository up to date with every
+Compose stack on its host, so a machine that dies can be rebuilt from the
+repo.
+
+### What it does, every cycle
+
+1. Discovers Compose projects from the running containers' Docker labels
+   (`com.docker.compose.project.*`), plus any directories listed in
+   `STACK_DIRS`.
+2. Reads each project's Compose file(s) and any sibling `*.yml` / `*.yaml`
+   / `*.json` from the host filesystem (mounted read-only into the
+   container).
+3. Redacts assignments whose name contains `PASSWORD`, `SECRET`, `TOKEN`,
+   `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, and credentials embedded in
+   URLs. Files matching a private-key or GitHub-token pattern are skipped
+   entirely. `.env` files, keys, databases, logs, and data directories are
+   never copied.
+4. Writes `inventory.json` (the manifest from `GET /inventory`).
+5. Clones/updates the repo, replaces `machines/<HOST_NAME>/` with the
+   fresh copy, commits, and pushes. On a push race with another host it
+   re-fetches and retries.
+
+It does **not** back up the contents of volumes or bind mounts. Use
+`inventory.json` as the checklist for restoring those from a separate
+encrypted backup.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `BACKUP_REPO` | *(unset)* | `owner/repo` of the private backup repository. Backup stays idle until set. |
+| `GITHUB_TOKEN` | *(unset)* | Fine-grained PAT with **Contents: read and write** on that repo only. |
+| `BACKUP_INTERVAL_HOURS` | `12` | Hours between runs (minimum 5 minutes). |
+| `BACKUP_BRANCH` | `main` | Branch to commit to. |
+| `HOST_ROOT` | `/host` | Where the host filesystem is mounted in the container. |
+| `STACK_DIRS` | *(unset)* | Extra host directories to scan for stopped projects, `:`-separated. |
+| `BACKUP_ENABLED` | `true` | Set `false` to disable the worker entirely. |
+| `BACKUP_RUN_ON_START` | `true` | Run once shortly after startup instead of waiting a full interval. |
+| `BACKUP_WORKDIR` | `/data/repo` | Repo checkout path inside the container. Mount a volume to avoid re-cloning on restart. |
+| `GIT_AUTHOR_NAME` | `homelab-agent` | Commit author name. |
+| `GIT_AUTHOR_EMAIL` | `homelab-agent@users.noreply.github.com` | Commit author email. |
+
+The token is passed to `git` per-command as an HTTP auth header; it is not
+written into `.git/config` and is masked out of error messages.
+
+### Create the token
+
+1. GitHub → Settings → Developer settings → **Fine-grained personal access
+   tokens** → Generate new token.
+2. **Resource owner**: your account. **Repository access**: Only select
+   repositories → the private backup repo.
+3. **Permissions** → Repository permissions → **Contents: Read and write**.
+   Nothing else is needed.
+4. Copy the token and pass it as `GITHUB_TOKEN`. The same token works for
+   every host.
+
+### Run command (with backup)
+
+```bash
+docker volume create homelab-agent-repo
+
+docker run -d \
+  --name homelab-agent \
+  --restart unless-stopped \
+  -p 8123:8123 \
+  -e HOST_NAME=server-1 \
+  -e BACKUP_REPO=your-user/homelab \
+  -e GITHUB_TOKEN=github_pat_xxx \
+  -e BACKUP_INTERVAL_HOURS=12 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /:/host:ro \
+  -v homelab-agent-repo:/data \
+  homelab-agent
+```
+
+`-v /:/host:ro` gives the agent read-only access to the Compose files
+wherever they live on the host. Restrict it to `-v /opt/stacks:/host/opt/stacks:ro`
+(and set `STACK_DIRS`) if you prefer a narrower mount.
+
+### Check it
+
+```bash
+curl http://localhost:8123/backup
+```
+
+```json
+{
+  "enabled": true,
+  "configured": true,
+  "repo": "your-user/homelab",
+  "branch": "main",
+  "interval_hours": 12.0,
+  "host_folder": "machines/server-1",
+  "running": false,
+  "last_run_at": 1787764791.1,
+  "last_success_at": 1787764795.4,
+  "last_result": "pushed a1b2c3d4e5",
+  "last_error": null,
+  "last_commit": "a1b2c3d4e5f6...",
+  "projects": 7
+}
+```
+
+Force a run immediately:
+
+```bash
+curl -X POST http://localhost:8123/backup/run
+```
+
+### Restore a host
+
+```bash
+git clone https://github.com/your-user/homelab.git
+cd homelab/machines/<host>
+for stack in */; do (cd "$stack" && docker compose up -d); done
+```
+
+Then restore volume data separately, using `inventory.json` as the list of
+volumes and image tags to expect.
+
 ## Start Container
 
 ```http
@@ -500,6 +719,7 @@ Hardware-specific metrics are returned when available.
 ```text
 homelab-agent/
 ├── main.py
+├── stack_backup.py
 ├── requirements.txt
 ├── Dockerfile
 ├── .gitignore
@@ -532,6 +752,23 @@ Homelab Agent should currently only be used on a trusted network such as:
 Firewall rules should restrict API access to trusted systems.
 
 Authentication and more granular authorization are potential future improvements.
+
+### Backup credential and host mount
+
+When configuration backup is enabled the agent also holds:
+
+- A `GITHUB_TOKEN` with write access to the backup repository. Use a
+  fine-grained PAT scoped to that one repo with only **Contents: read and
+  write**. It is kept in memory, passed to `git` as a per-command header,
+  and masked from logs.
+- A read-only mount of the host filesystem (`-v /:/host:ro`) so it can read
+  Compose files. It is never mounted read-write. Narrow it to the
+  directories that hold your stacks if you prefer.
+
+Secret values in Compose files are redacted before anything is committed,
+and files that look like private keys or tokens are skipped, but review the
+first few commits to confirm nothing sensitive slips through for your
+setup.
 
 ## Updating
 
