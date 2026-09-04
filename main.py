@@ -10,6 +10,7 @@ import docker
 from fastapi import FastAPI, HTTPException
 
 from stack_backup import StackBackup
+from register import Registrar
 
 app = FastAPI()
 
@@ -17,6 +18,8 @@ client = docker.from_env()
 
 HOST_NAME = os.getenv("HOST_NAME", "unknown")
 PROTECTED_CONTAINERS = {"homelab-agent"}
+
+registrar = Registrar(HOST_NAME)
 
 
 container_cache = {
@@ -720,6 +723,7 @@ def get_container_inventory():
 def startup_event():
     start_cache_worker()
     stack_backup.start()
+    registrar.start()
 
 @app.get("/")
 def root():

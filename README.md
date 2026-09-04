@@ -53,6 +53,13 @@ Homelab Agent reports a rebuild manifest of the host's Docker named volumes, ima
 
 On a schedule (default every 12 hours), Homelab Agent discovers the Compose projects on its host, copies their definition files with secrets redacted, writes `inventory.json`, and pushes `machines/<HOST_NAME>/` to a private GitHub repository. Each agent only writes its own host folder, so every machine in a fleet can back up to one repo. See [Configuration Backup](#configuration-backup-1) below.
 
+### Dashboard Registration
+
+If `DASHBOARD_URL` is set, Homelab Agent registers itself with a
+homelab-dashboard instance on startup and on a heartbeat, so a new machine
+appears on the dashboard without editing any dashboard configuration. See
+[Dashboard Registration](#dashboard-registration-1) below.
+
 ## GPU Autodetection
 
 Homelab Agent automatically searches for GPUs available to the container instead of assuming a specific GPU vendor.
@@ -764,12 +771,68 @@ For example, the same agent can run on:
 
 Hardware-specific metrics are returned when available.
 
+## Dashboard Registration
+
+A homelab-dashboard instance normally has to be told about every agent it
+should poll. Homelab Agent can skip that step: set `DASHBOARD_URL` and the
+agent announces itself instead.
+
+### What it does
+
+On startup, and again every `REGISTER_INTERVAL` seconds, the agent sends:
+
+```json
+{ "name": "server-1", "url": "http://server-1:8123" }
+```
+
+to `POST {DASHBOARD_URL}/api/nodes`. The dashboard adds or refreshes that
+entry and starts polling it on its next update cycle (a couple of
+seconds) — nothing on the dashboard needs to change when a new machine
+joins the fleet. If a heartbeat is missed for a while the dashboard marks
+the node stale, and drops it after a longer period of silence (for
+example, the agent's container was removed).
+
+Registration is best-effort: if the dashboard is briefly unreachable, the
+agent logs it and retries on the next interval.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DASHBOARD_URL` | *(unset)* | Base URL of the dashboard API, e.g. `http://dashboard:8081` (through its nginx `/api/` proxy) or `http://dashboard-api:8000` if reachable directly. Registration stays disabled until this is set. |
+| `AGENT_URL` | `http://<HOST_NAME>:8123` | The address the dashboard should use to reach *this* agent. Override if the hostname the dashboard resolves differs from `HOST_NAME` (e.g. a different Tailscale MagicDNS name, or a LAN IP). |
+| `REGISTER_TOKEN` | *(unset)* | Sent as `X-Register-Token` if the dashboard's own `REGISTER_TOKEN` is set. Must match. |
+| `REGISTER_INTERVAL` | `60` | Seconds between heartbeats (minimum 15). |
+
+`HOST_NAME` must be set to something other than the default `unknown` for
+registration to run, and should match the `job` label the machine's
+node_exporter is scraped under in Prometheus — that is how the dashboard
+lines up an agent's containers with that machine's host metrics.
+
+### Run command (with registration)
+
+```bash
+docker run -d \
+  --name homelab-agent \
+  --restart unless-stopped \
+  -p 8123:8123 \
+  -e HOST_NAME=server-1 \
+  -e DASHBOARD_URL=http://dashboard:8081 \
+  -e REGISTER_TOKEN=changeme \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  homelab-agent
+```
+
+That, plus pointing Prometheus at `server-1`'s node_exporter, is the whole
+process for adding a machine — no dashboard redeploy or config edit.
+
 ## Project Structure
 
 ```text
 homelab-agent/
 ├── main.py
 ├── stack_backup.py
+├── register.py
 ├── requirements.txt
 ├── Dockerfile
 ├── .gitignore
