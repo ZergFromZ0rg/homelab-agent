@@ -302,6 +302,7 @@ def build_container_snapshot():
                     get_container_stats(container),
                 ),
                 "size": get_container_size(container),
+                "ports": _container_ports(container),
             })
 
         except Exception as error:
@@ -547,6 +548,23 @@ def get_container_stats(container):
 
 
 
+def _container_ports(container):
+    host_config = container.attrs.get("HostConfig") or {}
+    ports = {}
+
+    for target, bindings in (host_config.get("PortBindings") or {}).items():
+        host_ports = sorted({
+            binding.get("HostPort")
+            for binding in (bindings or [])
+            if binding.get("HostPort")
+        })
+
+        if host_ports:
+            ports[target] = host_ports
+
+    return ports
+
+
 def _compose_labels(labels):
     labels = labels or {}
 
@@ -672,16 +690,7 @@ def get_container_inventory():
             (host_config.get("RestartPolicy") or {}).get("Name") or ""
         )
 
-        ports = {}
-
-        for target, bindings in (
-            host_config.get("PortBindings") or {}
-        ).items():
-            ports[target] = sorted({
-                binding.get("HostPort")
-                for binding in (bindings or [])
-                if binding.get("HostPort")
-            })
+        ports = _container_ports(container)
 
         mounts = []
 

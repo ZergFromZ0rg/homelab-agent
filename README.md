@@ -326,11 +326,22 @@ Example:
         "writable_bytes": 1048576,
         "rootfs_bytes": 209715200,
         "image_bytes": 104857600
+      },
+      "ports": {
+        "3000/tcp": ["3000"]
       }
     }
   ]
 }
 ```
+
+### `ports`
+
+Published host ports only (`docker run -p`), keyed by the container-side
+port. A port that's `EXPOSE`d but not published to the host is omitted.
+Empty (`{}`) if the container publishes nothing. A consumer can use the
+first entry to link to whatever web UI the container serves, e.g.
+`http://<HOST_NAME>:<port>`.
 
 ### `updated_at`
 
