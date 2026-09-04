@@ -32,26 +32,69 @@ COMPOSE_NAMES = {
 }
 
 EXCLUDE_DIRS = {
-    ".git",
-    "data",
-    "database",
-    "logs",
-    "node_modules",
-    "__pycache__",
+    ".git", ".github", ".gitlab", ".hg", ".svn",
+    ".venv", "venv", "virtualenv", "site-packages",
+    "node_modules", "bower_components", "vendor",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".next", ".nuxt", ".svelte-kit", ".cache", ".terraform",
+    "dist", "build", "target", "out", "coverage",
+    "data", "database", "db", "datadir", "logs", "log",
 }
 
-COPY_SUFFIXES = {".yml", ".yaml", ".json"}
+EXCLUDE_DIR_SUFFIXES = (".dist-info", ".egg-info")
+
+# Build metadata and lockfiles are never deployment configuration.
+EXCLUDE_FILES = {
+    "package.json", "package-lock.json", "npm-shrinkwrap.json",
+    "yarn.lock", "pnpm-lock.yaml", "bun.lockb",
+    "composer.json", "composer.lock",
+    "poetry.lock", "pdm.lock", "uv.lock", "cargo.lock",
+    "gemfile.lock", "go.sum",
+    "tsconfig.json", "jsconfig.json",
+}
+
+COMPOSE_SUFFIXES = {".yml", ".yaml"}
+JSON_MAX_DEPTH = 3
 
 MAX_FILE_BYTES = 512 * 1024
-WALK_MAX_DEPTH = 6
+WALK_MAX_DEPTH = 4
 
 _SECRET_LINE = re.compile(
-    r"^(\s*-?\s*)"
-    r"([A-Za-z0-9_]*"
-    r"(?:PASSWORD|PASSWD|SECRET|TOKEN|API_KEY|PRIVATE_KEY|ACCESS_KEY)"
+    r"^(?P<prefix>\s*-?\s*)"
+    r"(?P<name>[A-Za-z0-9_]*"
+    r"(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY)"
     r"[A-Za-z0-9_]*)"
-    r"(\s*[:=]\s*)"
-    r".*$",
+    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<value>.*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# Values that are plainly not secrets even under a sensitive-looking name.
+_KEEP_VALUE = re.compile(
+    r"""^(?:
+        ["']?-?\d[\d_.eE+-]*["']?
+        | true | false | null | none | ~ | yes | no
+        | \$?\{[^}]+\}
+        | \$[A-Za-z_]\w*
+        | ["']\s*["']
+    )$""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Names that contain a sensitive word but denote counts, paths, or headers.
+_NAME_NOT_SECRET = re.compile(
+    r"MAX_TOKENS?|NUM_TOKENS|_TOKENS(?:_|\b)|TOKEN_HEADER|TOKEN_NAME"
+    r"|TOKEN_URL|TOKEN_PATH|TOKEN_TTL|TOKEN_LIMIT|TOKEN_EXPIR"
+    r"|PUBLIC_KEY|KEY_PATH|KEY_FILE|KEYMAP|HOTKEY",
+    re.IGNORECASE,
+)
+
+# Bare keys common in app config (e.g. homepage widgets: "key: <api key>").
+_SECRET_BARE = re.compile(
+    r"^(?P<prefix>\s*-?\s*)"
+    r"(?P<name>key|apikey|api_key|pass|pwd|passwd|password|secret|token)"
+    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<value>.*)$",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -63,10 +106,48 @@ _DANGER = re.compile(
 )
 
 
+def _redact_assignment(match):
+    name = match.group("name")
+    value = match.group("value").strip()
+
+    if (
+        not value
+        or _KEEP_VALUE.match(value)
+        or _NAME_NOT_SECRET.search(name)
+    ):
+        return match.group(0)
+
+    return f"{match.group('prefix')}{name}{match.group('sep')}REDACTED"
+
+
 def _redact(text):
-    text = _SECRET_LINE.sub(r"\1\2\3REDACTED", text)
+    text = _SECRET_LINE.sub(_redact_assignment, text)
+    text = _SECRET_BARE.sub(_redact_assignment, text)
     text = _SECRET_URL.sub(r"\1REDACTED:REDACTED@", text)
     return text
+
+
+def _wants_file(filename, depth):
+    lowered = filename.lower()
+
+    if lowered in EXCLUDE_FILES:
+        return False
+
+    suffix = os.path.splitext(lowered)[1]
+
+    if suffix in COMPOSE_SUFFIXES:
+        return True
+
+    return suffix == ".json" and depth <= JSON_MAX_DEPTH
+
+
+def _prune_dirs(names):
+    return [
+        name
+        for name in names
+        if name not in EXCLUDE_DIRS
+        and not name.lower().endswith(EXCLUDE_DIR_SUFFIXES)
+    ]
 
 
 def _sanitize(name):
@@ -272,7 +353,7 @@ class StackBackup:
                 continue
 
             for root, dirs, files in os.walk(container_dir):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                dirs[:] = _prune_dirs(dirs)
 
                 if root[len(container_dir):].count(os.sep) >= WALK_MAX_DEPTH:
                     dirs[:] = []
@@ -383,15 +464,15 @@ class StackBackup:
 
         if wd_container and os.path.isdir(wd_container):
             for root, dirs, files in os.walk(wd_container):
-                dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                dirs[:] = _prune_dirs(dirs)
 
-                if root[len(wd_container):].count(os.sep) >= WALK_MAX_DEPTH:
+                depth = root[len(wd_container):].count(os.sep)
+
+                if depth >= WALK_MAX_DEPTH:
                     dirs[:] = []
 
                 for filename in files:
-                    suffix = os.path.splitext(filename)[1].lower()
-
-                    if suffix not in COPY_SUFFIXES:
+                    if not _wants_file(filename, depth):
                         continue
 
                     full = os.path.join(root, filename)

@@ -436,14 +436,16 @@ repo.
 1. Discovers Compose projects from the running containers' Docker labels
    (`com.docker.compose.project.*`), plus any directories listed in
    `STACK_DIRS`.
-2. Reads each project's Compose file(s) and any sibling `*.yml` / `*.yaml`
-   / `*.json` from the host filesystem (mounted read-only into the
-   container).
+2. Copies each project's Compose file(s) plus sibling `*.yml` / `*.yaml`
+   and shallow `*.json` from the host filesystem (mounted read-only into
+   the container). `.env`, keys, databases, logs, `data/`,
+   `node_modules/`, `.venv/`, `.github/`, build output, lockfiles, and
+   `package.json` are skipped.
 3. Redacts assignments whose name contains `PASSWORD`, `SECRET`, `TOKEN`,
-   `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, and credentials embedded in
-   URLs. Files matching a private-key or GitHub-token pattern are skipped
-   entirely. `.env` files, keys, databases, logs, and data directories are
-   never copied.
+   `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY` (or a bare `key:` / `pass:`),
+   unless the value is a number, boolean, or `${VAR}` reference. URL
+   credentials are redacted too; files matching a private-key or
+   GitHub-token pattern are skipped entirely.
 4. Writes `inventory.json` (the manifest from `GET /inventory`).
 5. Clones/updates the repo, replaces `machines/<HOST_NAME>/` with the
    fresh copy, commits, and pushes. On a push race with another host it
@@ -452,6 +454,10 @@ repo.
 It does **not** back up the contents of volumes or bind mounts. Use
 `inventory.json` as the checklist for restoring those from a separate
 encrypted backup.
+
+Redaction keys off variable names, so a secret stored under an
+unrecognized name (for example a provider name like `openweathermap:` in a
+homepage config) is **not** caught. Review the first commit from each host.
 
 ### Configuration
 
