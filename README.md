@@ -729,6 +729,7 @@ homelab-agent/
 ├── requirements.txt
 ├── Dockerfile
 ├── .gitignore
+├── LICENSE
 └── README.md
 ```
 
