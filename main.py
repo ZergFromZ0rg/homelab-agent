@@ -7,10 +7,12 @@ import glob
 from pathlib import Path
 import docker
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 
 from stack_backup import StackBackup
 from register import Registrar
+from deploy import CreateContainerRequest, PolicyError, deploy
 
 app = FastAPI()
 
@@ -18,6 +20,17 @@ client = docker.from_env()
 
 HOST_NAME = os.getenv("HOST_NAME", "unknown")
 PROTECTED_CONTAINERS = {"homelab-agent"}
+
+# When set, the mutating container routes (create / start / stop / restart /
+# delete) require this value in an ``X-Agent-Token`` header. Leave unset on
+# a trusted/Tailscale-only network; set it before the agent's API is
+# reachable from anywhere the dashboard host isn't.
+AGENT_TOKEN = os.getenv("AGENT_TOKEN", "").strip()
+
+
+def require_agent_token(x_agent_token: str | None = Header(default=None)) -> None:
+    if AGENT_TOKEN and x_agent_token != AGENT_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid agent token")
 
 registrar = Registrar(HOST_NAME)
 
@@ -828,8 +841,60 @@ def get_container_or_404(container_id: str):
     return container
 
 
+@app.post("/containers")
+def create_container(
+    request: CreateContainerRequest,
+    x_agent_token: str | None = Header(default=None),
+):
+    require_agent_token(x_agent_token)
+
+    try:
+        return deploy(client, request)
+
+    except PolicyError as error:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error": str(error),
+                "stage": error.stage,
+            },
+        )
+
+    except docker.errors.DockerException as error:
+        return JSONResponse(
+            status_code=502,
+            content={"success": False, "error": str(error), "stage": "create"},
+        )
+
+
+@app.delete("/containers/{container_id}")
+def delete_container(
+    container_id: str,
+    x_agent_token: str | None = Header(default=None),
+):
+    require_agent_token(x_agent_token)
+
+    container = get_container_or_404(container_id)
+    name = container.name
+
+    try:
+        container.remove(force=True)
+
+    except docker.errors.APIError as error:
+        return JSONResponse(
+            status_code=502,
+            content={"success": False, "error": str(error)},
+        )
+
+    return {"success": True, "container": name, "action": "delete"}
+
+
 @app.post("/containers/{container_id}/start")
-def start_container(container_id: str):
+def start_container(
+    container_id: str, x_agent_token: str | None = Header(default=None)
+):
+    require_agent_token(x_agent_token)
     container = get_container_or_404(container_id)
     container.start()
 
@@ -841,7 +906,10 @@ def start_container(container_id: str):
 
 
 @app.post("/containers/{container_id}/stop")
-def stop_container(container_id: str):
+def stop_container(
+    container_id: str, x_agent_token: str | None = Header(default=None)
+):
+    require_agent_token(x_agent_token)
     container = get_container_or_404(container_id)
     container.stop()
 
@@ -853,7 +921,10 @@ def stop_container(container_id: str):
 
 
 @app.post("/containers/{container_id}/restart")
-def restart_container(container_id: str):
+def restart_container(
+    container_id: str, x_agent_token: str | None = Header(default=None)
+):
+    require_agent_token(x_agent_token)
     container = get_container_or_404(container_id)
     container.restart()
 

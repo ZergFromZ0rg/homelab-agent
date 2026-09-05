@@ -42,8 +42,19 @@ The API supports:
 - Start
 - Stop
 - Restart
+- Create (pull an image and run a container from a spec — `POST /containers`)
+- Delete (`DELETE /containers/{id}`)
 
 The `homelab-agent` container is protected from destructive control operations through its own API.
+
+`POST /containers` is meant for a scheduler (e.g. homelab-dashboard's Deploy
+tab) to place a container on this host. It runs a policy check before Docker
+is touched — protected names, an optional registry allowlist, and host
+bind-mounts restricted to an allowlist (named volumes always allowed, the
+Docker socket never). See [Creating containers](#creating-containers).
+
+When `AGENT_TOKEN` is set, every mutating container route (create, start,
+stop, restart, delete) requires it in an `X-Agent-Token` header.
 
 ### Stack Inventory
 
@@ -614,6 +625,66 @@ curl -X POST http://localhost:8123/backup/run
 ```
 
 Confirm `machines/<host>/` in the repo matches the restored machine.
+
+## Creating containers
+
+```http
+POST /containers
+```
+
+Pulls the image (unless `"pull": false`) and runs a container. Body:
+
+```json
+{
+  "image": "lscr.io/linuxserver/jellyfin:latest",
+  "name": "jellyfin",
+  "env": { "PUID": "1000", "TZ": "UTC" },
+  "ports": [ { "container": 8096, "host": 8096, "proto": "tcp" } ],
+  "volumes": [ { "source": "jellyfin-config", "target": "/config", "read_only": false } ],
+  "restart_policy": "unless-stopped",
+  "resources": { "cpus": 2.0, "memory_mb": 2048 },
+  "labels": { "deployed-by": "homelab-dashboard" },
+  "pull": true
+}
+```
+
+Only `image` is required. `resources.cpus` maps to `--cpus`, `memory_mb` to
+`--memory`. Success:
+
+```json
+{ "success": true, "id": "3f2a1b4c5d6e", "name": "jellyfin", "image_digest": "sha256:..." }
+```
+
+A rejected request returns `400` (or `502` for a Docker daemon error) with:
+
+```json
+{ "success": false, "error": "host path '/etc' is not under ALLOWED_HOST_PATHS ...", "stage": "policy" }
+```
+
+`stage` is `policy` (failed the pre-check), `pull`, or `create`.
+
+| Env var | Default | |
+| --- | --- | --- |
+| `AGENT_TOKEN` | *(unset)* | Required in `X-Agent-Token` on every mutating container route when set. |
+| `ALLOWED_REGISTRIES` | *(unset — any)* | Comma list, e.g. `lscr.io,docker.io,ghcr.io`. An image whose registry isn't listed is rejected. |
+| `ALLOWED_HOST_PATHS` | *(unset — none)* | Comma list of host path prefixes that may be bind-mounted. Named volumes are always allowed; the Docker socket never is. |
+| `DEPLOY_PULL_TIMEOUT` | `600` | Seconds allowed for an image pull. |
+
+```bash
+curl -X POST http://localhost:8123/containers \
+  -H 'content-type: application/json' \
+  -H 'x-agent-token: <AGENT_TOKEN>' \
+  -d '{"image":"traefik/whoami","name":"whoami","ports":[{"container":80,"host":18080}]}'
+```
+
+## Deleting containers
+
+```http
+DELETE /containers/{container_id}
+```
+
+Force-removes the container (protected names rejected with `403`). Returns
+`{ "success": true, "container": "...", "action": "delete" }`.
 
 ## Start Container
 
