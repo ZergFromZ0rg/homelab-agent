@@ -43,6 +43,11 @@ container_cache = {
 
 cache_lock = threading.Lock()
 
+# Set by the create/delete routes so the cache worker rebuilds its snapshot
+# right away instead of on its next 2s tick — the dashboard then sees a
+# just-deployed container without the extra lag.
+cache_wake = threading.Event()
+
 
 previous_io = {}
 
@@ -346,7 +351,8 @@ def cache_worker():
                 f"{error}"
             )
 
-        time.sleep(2)
+        cache_wake.wait(timeout=2)
+        cache_wake.clear()
 
 
 def start_cache_worker():
@@ -850,7 +856,9 @@ def create_container(
     require_agent_token(x_agent_token)
 
     try:
-        return deploy(client, request)
+        result = deploy(client, request)
+        cache_wake.set()
+        return result
 
     except PolicyError as error:
         return JSONResponse(
@@ -888,6 +896,7 @@ def delete_container(
             content={"success": False, "error": str(error)},
         )
 
+    cache_wake.set()
     return {"success": True, "container": name, "action": "delete"}
 
 
