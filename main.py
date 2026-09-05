@@ -310,6 +310,7 @@ def build_container_snapshot():
                     container.name
                     in PROTECTED_CONTAINERS
                 ),
+                "deployed_by": (container.labels or {}).get("deployed-by"),
                 "stats": add_io_rates(
                     container.id,
                     get_container_stats(container),
