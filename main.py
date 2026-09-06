@@ -11,6 +11,7 @@ import docker
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
+from log import log, audit
 from stack_backup import StackBackup
 from register import Registrar
 import deploy
@@ -339,10 +340,7 @@ def build_container_snapshot():
             })
 
         except Exception as error:
-            print(
-                f"Snapshot error for "
-                f"{container.name}: {error}"
-            )
+            log.debug("snapshot error for %s: %s", container.name, error)
 
     return containers
 
@@ -360,10 +358,7 @@ def cache_worker():
                 container_cache["updated_at"] = time.time()
 
         except Exception as error:
-            print(
-                f"Container cache update failed: "
-                f"{error}"
-            )
+            log.warning("container cache update failed: %s", error)
 
         cache_wake.wait(timeout=2)
         cache_wake.clear()
@@ -491,9 +486,7 @@ def get_container_size(container):
             container.image.attrs.get("Size", 0) or 0
         )
     except Exception as error:
-        print(
-            f"Image size lookup failed for {container.name}: {error}"
-        )
+        log.debug("image size lookup failed for %s: %s", container.name, error)
 
     try:
         url = client.api._url(
@@ -518,9 +511,7 @@ def get_container_size(container):
         }
 
     except Exception as error:
-        print(
-            f"Container size lookup failed for {container.name}: {error}"
-        )
+        log.debug("container size lookup failed for %s: %s", container.name, error)
 
         return {
             "writable_bytes": 0,
@@ -619,7 +610,7 @@ def get_volume_sizes():
         data = client.df()
 
     except Exception as error:
-        print(f"Volume size lookup failed: {error}")
+        log.debug("volume size lookup failed: %s", error)
         return {}
 
     sizes = {}
@@ -868,13 +859,16 @@ def create_container(
     x_agent_token: str | None = Header(default=None),
 ):
     require_agent_token(x_agent_token)
+    audit.info("create container: image=%s name=%s", request.image, request.name)
 
     try:
         result = deploy.deploy(client, request)
         cache_wake.set()
+        audit.info("created %s (%s)", result.get("name"), result.get("id"))
         return result
 
     except PolicyError as error:
+        audit.warning("rejected create %s: %s", request.image, error)
         return JSONResponse(
             status_code=400,
             content={
@@ -885,6 +879,7 @@ def create_container(
         )
 
     except docker.errors.DockerException as error:
+        audit.warning("create %s failed: %s", request.image, error)
         return JSONResponse(
             status_code=502,
             content={"success": False, "error": str(error), "stage": "create"},
@@ -897,13 +892,18 @@ def create_stack(
     x_agent_token: str | None = Header(default=None),
 ):
     require_agent_token(x_agent_token)
+    audit.info("deploy stack: %s", request.name)
 
     try:
         result = deploy_stack(client, request)
         cache_wake.set()
+        audit.info(
+            "stack %s up (%d services)", request.name, len(result.get("services", []))
+        )
         return result
 
     except PolicyError as error:
+        audit.warning("rejected stack %s: %s", request.name, error)
         return JSONResponse(
             status_code=400,
             content={
@@ -926,6 +926,7 @@ def delete_stack(
     x_agent_token: str | None = Header(default=None),
 ):
     require_agent_token(x_agent_token)
+    audit.info("remove stack: %s (volumes=%s)", project, volumes)
 
     try:
         result = remove_stack(client, project, volumes=volumes)
@@ -933,6 +934,7 @@ def delete_stack(
         return result
 
     except PolicyError as error:
+        audit.warning("rejected stack removal %r: %s", project, error)
         return JSONResponse(
             status_code=400,
             content={"success": False, "error": str(error), "stage": error.stage},
@@ -953,13 +955,22 @@ def delete_container(
         container.remove(force=True)
 
     except docker.errors.APIError as error:
+        audit.warning("delete %s failed: %s", name, error)
         return JSONResponse(
             status_code=502,
             content={"success": False, "error": str(error)},
         )
 
     cache_wake.set()
+    audit.info("deleted container %s", name)
     return {"success": True, "container": name, "action": "delete"}
+
+
+def _control(container_id: str, action: str) -> dict:
+    container = get_container_or_404(container_id)
+    getattr(container, action)()
+    audit.info("%s container %s", action, container.name)
+    return {"success": True, "container": container.name, "action": action}
 
 
 @app.post("/containers/{container_id}/start")
@@ -967,14 +978,7 @@ def start_container(
     container_id: str, x_agent_token: str | None = Header(default=None)
 ):
     require_agent_token(x_agent_token)
-    container = get_container_or_404(container_id)
-    container.start()
-
-    return {
-        "success": True,
-        "container": container.name,
-        "action": "start",
-    }
+    return _control(container_id, "start")
 
 
 @app.post("/containers/{container_id}/stop")
@@ -982,14 +986,7 @@ def stop_container(
     container_id: str, x_agent_token: str | None = Header(default=None)
 ):
     require_agent_token(x_agent_token)
-    container = get_container_or_404(container_id)
-    container.stop()
-
-    return {
-        "success": True,
-        "container": container.name,
-        "action": "stop",
-    }
+    return _control(container_id, "stop")
 
 
 @app.post("/containers/{container_id}/restart")
@@ -997,11 +994,4 @@ def restart_container(
     container_id: str, x_agent_token: str | None = Header(default=None)
 ):
     require_agent_token(x_agent_token)
-    container = get_container_or_404(container_id)
-    container.restart()
-
-    return {
-        "success": True,
-        "container": container.name,
-        "action": "restart",
-    }
+    return _control(container_id, "restart")

@@ -13,6 +13,8 @@ import time
 import urllib.error
 import urllib.request
 
+from log import log
+
 
 def _env_int(name: str, default: int, minimum: int) -> int:
     try:
@@ -38,17 +40,11 @@ class Registrar:
 
     def start(self) -> None:
         if not self.enabled:
-            print(
-                "dashboard self-registration disabled "
-                "(set DASHBOARD_URL to enable)"
-            )
+            log.info("dashboard self-registration disabled (set DASHBOARD_URL)")
             return
 
         if not self.host_name or self.host_name == "unknown":
-            print(
-                "dashboard self-registration skipped: "
-                "set HOST_NAME to match the machine's Prometheus job"
-            )
+            log.warning("dashboard self-registration skipped: set HOST_NAME")
             return
 
         thread = threading.Thread(target=self._loop, daemon=True)
@@ -79,6 +75,6 @@ class Registrar:
             try:
                 self._register_once()
             except (urllib.error.URLError, OSError, ValueError) as error:
-                print(f"dashboard registration failed: {error}")
+                log.warning("dashboard registration failed: %s", error)
 
             time.sleep(self.interval)

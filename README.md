@@ -1009,6 +1009,15 @@ The registry allowlist is a *registry* allowlist, not an image allowlist.
 And the control/delete routes act on any container on the host, not only
 scheduler-managed ones.
 
+### Logging
+
+The agent logs to stdout (`LOG_LEVEL`, default `INFO`). Every container /
+stack mutation and every policy rejection goes to the `audit` logger:
+
+```bash
+docker logs homelab-agent 2>&1 | grep ' audit '
+```
+
 ### Backup credential and host mount
 
 When configuration backup is enabled the agent also holds:

@@ -19,6 +19,8 @@ import tempfile
 import threading
 import time
 
+from log import log
+
 
 class BackupError(Exception):
     pass
@@ -232,13 +234,12 @@ class StackBackup:
 
     def start(self):
         if not self.enabled:
-            print("stack backup disabled (BACKUP_ENABLED=false)")
+            log.info("stack backup disabled (BACKUP_ENABLED=false)")
             return
 
         if not self.configured:
-            print(
-                "stack backup idle: set BACKUP_REPO and GITHUB_TOKEN "
-                "to enable pushing"
+            log.info(
+                "stack backup idle: set BACKUP_REPO and GITHUB_TOKEN to enable"
             )
 
         thread = threading.Thread(target=self._loop, daemon=True)
@@ -282,11 +283,11 @@ class StackBackup:
             self._status["last_result"] = result
             self._status["last_error"] = None
             self._status["last_success_at"] = time.time()
-            print(f"stack backup: {result}")
+            log.info("stack backup: %s", result)
 
         except Exception as error:  # noqa: BLE001
             self._status["last_error"] = str(error)
-            print(f"stack backup failed: {error}")
+            log.warning("stack backup failed: %s", error)
 
         finally:
             self._status["running"] = False
@@ -441,10 +442,7 @@ class StackBackup:
                 return
 
             if _DANGER.search(content):
-                print(
-                    f"stack backup: skipped {relative} "
-                    "(matched a private key / token pattern)"
-                )
+                log.info("stack backup: skipped %s (key/token pattern)", relative)
                 return
 
             destination = os.path.join(target, relative)
