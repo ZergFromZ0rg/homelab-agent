@@ -4,6 +4,8 @@ A lightweight, portable Docker host agent for collecting live container metrics,
 
 Homelab Agent is designed to run across multiple Linux Docker hosts and expose a consistent API to a central dashboard, monitoring system, or other application.
 
+To stand up the agent alongside [homelab-dashboard](https://github.com/ZergFromZ0rg/homelab-dashboard) and Prometheus from scratch, follow that repo's [deployment guide](https://github.com/ZergFromZ0rg/homelab-dashboard/blob/main/docs/deployment.md).
+
 ## Features
 
 ### Container Monitoring
