@@ -13,6 +13,12 @@ from fastapi.responses import JSONResponse
 from stack_backup import StackBackup
 from register import Registrar
 from deploy import CreateContainerRequest, PolicyError, deploy
+from stack_deploy import (
+    CreateStackRequest,
+    deploy_stack,
+    list_stacks,
+    remove_stack,
+)
 
 app = FastAPI()
 
@@ -316,6 +322,9 @@ def build_container_snapshot():
                     in PROTECTED_CONTAINERS
                 ),
                 "deployed_by": (container.labels or {}).get("deployed-by"),
+                "compose_project": (container.labels or {}).get(
+                    "com.docker.compose.project"
+                ),
                 "stats": add_io_rates(
                     container.id,
                     get_container_stats(container),
@@ -874,6 +883,54 @@ def create_container(
         return JSONResponse(
             status_code=502,
             content={"success": False, "error": str(error), "stage": "create"},
+        )
+
+
+@app.post("/stacks")
+def create_stack(
+    request: CreateStackRequest,
+    x_agent_token: str | None = Header(default=None),
+):
+    require_agent_token(x_agent_token)
+
+    try:
+        result = deploy_stack(client, request)
+        cache_wake.set()
+        return result
+
+    except PolicyError as error:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error": str(error),
+                "stage": error.stage,
+            },
+        )
+
+
+@app.get("/stacks")
+def get_stacks():
+    return {"host": HOST_NAME, "stacks": list_stacks(client)}
+
+
+@app.delete("/stacks/{project}")
+def delete_stack(
+    project: str,
+    volumes: bool = False,
+    x_agent_token: str | None = Header(default=None),
+):
+    require_agent_token(x_agent_token)
+
+    try:
+        result = remove_stack(client, project, volumes=volumes)
+        cache_wake.set()
+        return result
+
+    except PolicyError as error:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "error": str(error), "stage": error.stage},
         )
 
 

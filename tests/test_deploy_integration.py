@@ -126,3 +126,61 @@ def test_name_collision(client, cleanup):
     second = client.post("/containers", json={"image": IMAGE, "name": name})
     assert second.status_code == 400
     assert second.json()["stage"] == "create"
+
+
+@pytest.fixture
+def stack_cleanup():
+    made = []
+    yield made
+    import subprocess
+
+    for name in made:
+        subprocess.run(
+            ["docker", "compose", "-p", name, "down", "-v", "--remove-orphans"],
+            capture_output=True,
+            check=False,
+        )
+
+
+COMPOSE = """
+services:
+  a:
+    image: traefik/whoami:latest
+    ports:
+      - "{port_a}:80"
+  b:
+    image: traefik/whoami:latest
+"""
+
+
+def test_stack_up_list_down(client, stack_cleanup, tmp_path, monkeypatch):
+    monkeypatch.setattr("stack_deploy.STACK_DIR", tmp_path)
+    if not __import__("shutil").which("docker"):
+        pytest.skip("docker CLI not on PATH")
+
+    name = f"itest-{uuid.uuid4().hex[:8]}"
+    stack_cleanup.append(name)
+    port_a = random.randint(21000, 29000)
+
+    resp = client.post(
+        "/stacks",
+        json={"name": name, "compose_yaml": COMPOSE.format(port_a=port_a)},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"] is True
+    assert body["project"] == name
+    assert {s["name"].rsplit("-", 1)[0].replace(f"{name}-", "") for s in body["services"]} == {"a", "b"}
+
+    listed = client.get("/stacks").json()["stacks"]
+    mine = next(s for s in listed if s["project"] == name)
+    assert len(mine["services"]) == 2
+
+    resp = client.request("DELETE", f"/stacks/{name}?volumes=1")
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
+
+    gone = _wait_until(
+        lambda: not any(s["project"] == name for s in client.get("/stacks").json()["stacks"])
+    )
+    assert gone

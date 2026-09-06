@@ -44,6 +44,8 @@ The API supports:
 - Restart
 - Create (pull an image and run a container from a spec — `POST /containers`)
 - Delete (`DELETE /containers/{id}`)
+- Compose stacks (`POST /stacks` runs `docker compose up` from YAML;
+  `DELETE /stacks/{project}` tears it down)
 
 The `homelab-agent` container is protected from destructive control operations through its own API.
 
@@ -685,6 +687,36 @@ DELETE /containers/{container_id}
 
 Force-removes the container (protected names rejected with `403`). Returns
 `{ "success": true, "container": "...", "action": "delete" }`.
+
+## Compose stacks
+
+```http
+POST   /stacks              {name, compose_yaml, env}
+GET    /stacks
+DELETE /stacks/{project}?volumes=1
+```
+
+`POST /stacks` writes the compose file to `STACK_DIR/<name>/` and runs
+`docker compose -p <name> up -d` (the image ships the Compose plugin and
+talks to the host daemon over the mounted socket). `check_stack_policy`
+walks every service first and rejects `build:`, `privileged`, `cap_add`,
+`devices`, `network_mode: host`, `pid: host`, images outside
+`ALLOWED_REGISTRIES`, and bind mounts outside `ALLOWED_HOST_PATHS` — named
+volumes only. Success:
+
+```json
+{ "success": true, "project": "media", "services": [ { "name": "media-web-1", "id": "…", "status": "running" } ] }
+```
+
+`GET /stacks` lists the Compose projects that have containers on this host
+(discovered from the `com.docker.compose.project` label, which is also
+reported per-container in `/containers`). `DELETE /stacks/{project}` runs
+`docker compose down` (`?volumes=1` adds `--volumes`).
+
+| Env var | Default | |
+| --- | --- | --- |
+| `STACK_DIR` | `/data/stacks` | Where project files are written. Put it on a volume. |
+| `STACK_COMPOSE_TIMEOUT` | `900` | Seconds for a compose up/down. |
 
 ## Start Container
 
