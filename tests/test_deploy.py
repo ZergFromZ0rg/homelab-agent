@@ -122,6 +122,46 @@ def test_docker_socket_never_allowed(monkeypatch):
         )
 
 
+def test_mounting_socket_parent_dir_rejected(monkeypatch):
+    # Allowing /run and mounting the whole directory hands over the socket.
+    monkeypatch.setattr(deploy, "ALLOWED_HOST_PATHS", ["/run", "/", "/var/run"])
+    for parent in ("/run", "/var/run", "/"):
+        with pytest.raises(PolicyError):
+            check_policy(req(volumes=[{"source": parent, "target": "/x"}]))
+
+
+def test_invalid_container_name_rejected():
+    with pytest.raises(PolicyError):
+        check_policy(req(name="../evil"))
+    with pytest.raises(PolicyError):
+        check_policy(req(name="has spaces"))
+
+
+def test_reserved_labels_rejected():
+    with pytest.raises(PolicyError):
+        check_policy(req(labels={"com.docker.compose.project": "x"}))
+
+
+def test_reserved_labels_stripped_from_run():
+    client = FakeClient()
+    deploy.deploy(client, req(labels={"role": "web"}))
+    _, kwargs = client.run_calls[0]
+    assert kwargs["labels"]["role"] == "web"
+    assert not any(k.startswith("com.docker.") for k in kwargs["labels"])
+
+
+def test_symlink_out_of_allowed_dir_rejected(monkeypatch, tmp_path):
+    allowed = tmp_path / "appdata"
+    allowed.mkdir()
+    escape = allowed / "escape"
+    escape.symlink_to("/etc")
+    monkeypatch.setattr(deploy, "ALLOWED_HOST_PATHS", [str(allowed)])
+
+    check_policy(req(volumes=[{"source": str(allowed / "ok"), "target": "/c"}]))
+    with pytest.raises(PolicyError):
+        check_policy(req(volumes=[{"source": str(escape), "target": "/c"}]))
+
+
 # ---- deploy ---------------------------------------------------------
 
 

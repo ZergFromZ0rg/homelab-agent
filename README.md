@@ -667,9 +667,11 @@ A rejected request returns `400` (or `502` for a Docker daemon error) with:
 
 | Env var | Default | |
 | --- | --- | --- |
-| `AGENT_TOKEN` | *(unset)* | Required in `X-Agent-Token` on every mutating container route when set. |
-| `ALLOWED_REGISTRIES` | *(unset — any)* | Comma list, e.g. `lscr.io,docker.io,ghcr.io`. An image whose registry isn't listed is rejected. |
-| `ALLOWED_HOST_PATHS` | *(unset — none)* | Comma list of host path prefixes that may be bind-mounted. Named volumes are always allowed; the Docker socket never is. |
+| `AGENT_TOKEN` | *(unset)* | Required in `X-Agent-Token` on every mutating route when set (constant-time compare). |
+| `ALLOWED_REGISTRIES` | *(unset — any)* | Comma list, e.g. `lscr.io,docker.io,ghcr.io`. An image whose registry isn't listed is rejected. Not an *image* allowlist. |
+| `ALLOWED_HOST_PATHS` | *(unset — none)* | Comma list of host path prefixes that may be bind-mounted (named volumes always pass; the socket and any dir containing it never do). Symlinks are resolved when visible. Only list dirs your workloads can't write to. |
+| `ALLOWED_DEVICES` | *(unset — none)* | Comma list of host device path prefixes a container may be given, e.g. `/dev/dri` for GPU/QSV transcode. |
+| `PROTECTED_CONTAINER_NAMES` | `homelab-agent` | Comma list the control/delete/deploy routes refuse to touch. Set this if the agent container isn't named `homelab-agent`. |
 | `DEPLOY_PULL_TIMEOUT` | `600` | Seconds allowed for an image pull. |
 
 ```bash
@@ -956,30 +958,56 @@ homelab-agent/
 
 ## Security
 
-> **Warning:** Homelab Agent currently does not provide authentication.
+The agent mounts `/var/run/docker.sock` and talks to the host daemon as
+root. Anyone who can reach a mutating route (`POST /containers`, `POST
+/stacks`, the control and delete routes) can create and control containers
+on the host. Treat access to the API as equivalent to root on the host.
 
-The agent mounts:
+### Network boundary
 
-```text
-/var/run/docker.sock
-```
+Do **not** expose port 8123 to the public internet or an untrusted LAN.
+Run the agent so its port is reachable only over a trusted overlay:
 
-Access to the Docker socket provides extremely powerful control over the host Docker daemon.
+- Bind it to the Tailscale/WireGuard interface (`--host 100.x.y.z` on the
+  uvicorn command, or a `ports:` mapping like `100.x.y.z:8123:8123`), not
+  `0.0.0.0`.
+- Set `AGENT_TOKEN` (matched on the dashboard side) so a stray request on
+  the same overlay still can't deploy. The check is constant-time.
 
-Anyone who can access the Homelab Agent API may be able to issue supported Docker control operations.
+### Deploy/stack policy
 
-### Do not expose port 8123 directly to the public internet.
+`POST /containers` and `POST /stacks` accept specs from the dashboard
+scheduler and run a policy check *before Docker is touched*
+(`deploy.check_policy` / `stack_deploy.check_stack_policy`):
 
-Homelab Agent should currently only be used on a trusted network such as:
+- **Single containers**: only image / env / ports / volumes / restart /
+  resource-limits / labels are in the request model at all. Container name
+  is charset-validated; `com.docker.*` and `org.opencontainers.*` labels
+  are rejected.
+- **Compose stacks** are checked against an *allowlist* of service keys —
+  anything not on the list (`privileged`, `cap_add`, `security_opt` other
+  than `no-new-privileges`, `userns_mode`, `devices` without an allowlist,
+  `volumes_from`, `extra_hosts`, `group_add`, host/`container:`/`service:`
+  namespaces for `network_mode`/`pid`/`ipc`/`uts`/`cgroup`, `build:`, …) is
+  rejected. Top-level keys are allowlisted too, so `secrets:`/`configs:`
+  with a `file:` host path don't slip through.
+- **Volumes**: named volumes always pass. A bind mount (a source that
+  starts `/`, `./`, `../` or `~`) must resolve — symlinks included, when
+  the agent can see the path — under an `ALLOWED_HOST_PATHS` prefix, and
+  never onto the docker socket or a directory that contains it (`/`,
+  `/run`, `/var/run`, …). A named-volume *definition* that is really a bind
+  (`driver_opts: {o: bind, device: /}`) is caught the same way.
+- **Devices**: `/dev/*` passthrough is denied unless the host path is under
+  an `ALLOWED_DEVICES` prefix (set `ALLOWED_DEVICES=/dev/dri` for GPU/QSV
+  transcode).
 
-- A private homelab LAN
-- A private VPN
-- A Tailscale network
-- Another appropriately secured internal network
-
-Firewall rules should restrict API access to trusted systems.
-
-Authentication and more granular authorization are potential future improvements.
+The policy is a real boundary but not a sandbox. In particular: an
+`ALLOWED_HOST_PATHS` prefix that a deployed container can write to lets
+that container plant a symlink and escape the prefix on a *later* deploy —
+so only allowlist directories your workloads don't get write access to.
+The registry allowlist is a *registry* allowlist, not an image allowlist.
+And the control/delete routes act on any container on the host, not only
+scheduler-managed ones.
 
 ### Backup credential and host mount
 

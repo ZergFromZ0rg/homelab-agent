@@ -2,6 +2,7 @@ import os
 import time
 import threading
 import subprocess
+import secrets
 import shutil
 import glob
 from pathlib import Path
@@ -12,7 +13,8 @@ from fastapi.responses import JSONResponse
 
 from stack_backup import StackBackup
 from register import Registrar
-from deploy import CreateContainerRequest, PolicyError, deploy
+import deploy
+from deploy import CreateContainerRequest, PolicyError
 from stack_deploy import (
     CreateStackRequest,
     deploy_stack,
@@ -25,17 +27,20 @@ app = FastAPI()
 client = docker.from_env()
 
 HOST_NAME = os.getenv("HOST_NAME", "unknown")
-PROTECTED_CONTAINERS = {"homelab-agent"}
+# Containers the control routes refuse to touch (start/stop/restart/delete)
+# and the deploy routes refuse to recreate. Configurable via
+# PROTECTED_CONTAINER_NAMES; defaults to the agent's own name.
+PROTECTED_CONTAINERS = deploy.PROTECTED_NAMES
 
 # When set, the mutating container routes (create / start / stop / restart /
-# delete) require this value in an ``X-Agent-Token`` header. Leave unset on
-# a trusted/Tailscale-only network; set it before the agent's API is
-# reachable from anywhere the dashboard host isn't.
+# delete, and the stack routes) require this value in an ``X-Agent-Token``
+# header. Leave unset only when the agent's port is reachable *only* over a
+# trusted overlay (Tailscale, WireGuard) — on a plain LAN, set it.
 AGENT_TOKEN = os.getenv("AGENT_TOKEN", "").strip()
 
 
 def require_agent_token(x_agent_token: str | None = Header(default=None)) -> None:
-    if AGENT_TOKEN and x_agent_token != AGENT_TOKEN:
+    if AGENT_TOKEN and not secrets.compare_digest(x_agent_token or "", AGENT_TOKEN):
         raise HTTPException(status_code=401, detail="invalid agent token")
 
 registrar = Registrar(HOST_NAME)
@@ -865,7 +870,7 @@ def create_container(
     require_agent_token(x_agent_token)
 
     try:
-        result = deploy(client, request)
+        result = deploy.deploy(client, request)
         cache_wake.set()
         return result
 
