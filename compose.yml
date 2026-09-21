@@ -1,0 +1,83 @@
+# Reference deployment for one node. Copy this file and a .env beside it
+# (see .env.example), then `docker compose up -d --build`.
+#
+# Why a compose file rather than the `docker run` lines in the README: a
+# long run command has to be retyped correctly every time the container is
+# recreated, and a flag dropped on a recreate fails quietly — a missing
+# `--gpus all` turns full GPU telemetry into a bare "NVIDIA GPU 10DE:xxxx"
+# with no util, VRAM or temperature, and nothing says why.
+
+services:
+  homelab-agent:
+    build: .
+    image: homelab-agent
+    container_name: homelab-agent
+    restart: unless-stopped
+
+    ports:
+      # On a plain LAN, bind to the tailnet address instead of every
+      # interface: "100.x.y.z:8123:8123". See Security in the README.
+      - "${AGENT_BIND:-0.0.0.0}:8123:8123"
+
+    environment:
+      # Must match the Prometheus job_name for this host, or the dashboard
+      # can't line the agent's containers up with the host's metrics.
+      HOST_NAME: ${HOST_NAME:?set HOST_NAME in .env}
+
+      # Gates every mutating route, and GET /connections. Same value as the
+      # dashboard's AGENT_TOKEN.
+      AGENT_TOKEN: ${AGENT_TOKEN:-}
+
+      # Registration — the agent tells the dashboard it exists.
+      # REGISTER_TOKEN must match the dashboard's API_TOKEN.
+      DASHBOARD_URL: ${DASHBOARD_URL:-}
+      AGENT_URL: ${AGENT_URL:-}
+      REGISTER_TOKEN: ${REGISTER_TOKEN:-}
+
+      # Configuration backup.
+      BACKUP_REPO: ${BACKUP_REPO:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-12}
+      STACK_DIRS: ${STACK_DIRS:-}
+
+      # Deploy policy. Empty ALLOWED_HOST_PATHS means named volumes only,
+      # which is the safe default — widen it deliberately.
+      ALLOWED_REGISTRIES: ${ALLOWED_REGISTRIES:-}
+      ALLOWED_HOST_PATHS: ${ALLOWED_HOST_PATHS:-}
+      ALLOWED_DEVICES: ${ALLOWED_DEVICES:-}
+
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+    volumes:
+      # The host daemon. This is the agent's real privilege boundary.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # The host filesystem, read-only: the backup worker reads Compose
+      # files from wherever they live, and GET /connections finds the
+      # host's conntrack table underneath it with nothing else to mount.
+      # Narrow it to your stack directory (plus STACK_DIRS) if you'd rather
+      # — then add the single-file conntrack mount below.
+      - /:/host:ro
+
+      # Only needed when the mount above is narrowed so it no longer
+      # includes /proc. Harmless to leave enabled either way.
+      # - /proc/net/nf_conntrack:/host/nf_conntrack:ro
+
+      # Backup working tree, so a restart doesn't re-clone the repo.
+      - agent-data:/data
+
+    # ---- NVIDIA hosts ----------------------------------------------------
+    # Uncomment the line below AND add these two to the environment block
+    # above (a service can only have one `environment:` key):
+    #
+    #     NVIDIA_VISIBLE_DEVICES: all
+    #     NVIDIA_DRIVER_CAPABILITIES: all
+    #
+    # All three are needed together. With the runtime but not the variables
+    # — or the other way round — the agent still PCI-detects the card but
+    # reports no utilisation, VRAM, temperature, fan or power, and the
+    # dashboard has no way to tell you that's why.
+    # runtime: nvidia
+
+volumes:
+  agent-data:

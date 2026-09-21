@@ -58,7 +58,7 @@ def test_returns_the_aggregated_table(client):
 
 def test_says_what_to_mount_when_the_table_is_missing(client, monkeypatch, tmp_path):
     monkeypatch.setenv("CONNTRACK_FILE", str(tmp_path / "absent"))
-    monkeypatch.setattr(connections, "DEFAULT_PATHS", ())
+    monkeypatch.setattr(connections, "default_paths", tuple)
     connections.reset_cache()
 
     body = client.get("/connections").json()

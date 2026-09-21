@@ -182,7 +182,7 @@ def test_snapshot_reads_a_mounted_table(tmp_path, monkeypatch):
 
 def test_snapshot_reports_a_missing_table_instead_of_failing(monkeypatch, tmp_path):
     monkeypatch.setenv("CONNTRACK_FILE", str(tmp_path / "nope"))
-    monkeypatch.setattr(connections, "DEFAULT_PATHS", ())
+    monkeypatch.setattr(connections, "default_paths", tuple)
 
     result = connections.snapshot("bigboy")
 
@@ -271,3 +271,57 @@ def test_an_unreplied_udp_flow_keeps_its_zero_reply():
     flow = connections.parse_line(MULTICAST_UNREPLIED)
     assert flow["unreplied"] is True
     assert flow["orig"]["bytes"] == 200 and flow["reply"]["bytes"] == 0
+
+
+def test_the_backup_features_host_mount_is_found_without_extra_config(monkeypatch, tmp_path):
+    """A host already mounted for backups (-v /:/host:ro) puts the real
+    table at <HOST_ROOT>/proc/1/net/nf_conntrack. Nothing else to mount."""
+    host_root = tmp_path / "host"
+    table = host_root / "proc" / "1" / "net" / "nf_conntrack"
+    table.parent.mkdir(parents=True)
+    table.write_text(ACCOUNTED_TCP)
+
+    monkeypatch.setenv("HOST_ROOT", str(host_root))
+
+    assert connections.source_path() == table
+
+
+def test_pid_one_is_used_not_proc_net(monkeypatch):
+    """/proc/net is a symlink to /proc/self/net, so a bind-mounted
+    /host/proc/net would resolve back to this process's namespace."""
+    monkeypatch.setenv("HOST_ROOT", "/host")
+    paths = connections.default_paths()
+
+    assert "/host/proc/1/net/nf_conntrack" in paths
+    assert "/host/proc/net/nf_conntrack" not in paths
+
+
+def test_the_narrow_mount_wins_over_the_host_filesystem(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOST_ROOT", str(tmp_path))
+    assert connections.default_paths()[0] == "/host/nf_conntrack"
+
+
+def test_an_empty_table_in_our_own_namespace_reads_as_not_set_up(monkeypatch, tmp_path):
+    empty = tmp_path / "nf_conntrack"
+    empty.write_text("")
+
+    monkeypatch.setattr(connections, "OWN_NAMESPACE_PATH", str(empty))
+    monkeypatch.setattr(connections, "default_paths", lambda: (str(empty),))
+
+    result = connections.snapshot("bigboy")
+
+    assert result["available"] is False
+    assert "own network namespace" in result["reason"]
+
+
+def test_a_mounted_table_that_is_empty_still_reports_available(monkeypatch, tmp_path):
+    """Only the *fallback* path is treated as suspicious when empty \u2014 a
+    deliberately mounted table with nothing in it is just a quiet host."""
+    empty = tmp_path / "nf_conntrack"
+    empty.write_text("")
+    monkeypatch.setenv("CONNTRACK_FILE", str(empty))
+
+    result = connections.snapshot("bigboy")
+
+    assert result["available"] is True
+    assert result["flows_total"] == 0

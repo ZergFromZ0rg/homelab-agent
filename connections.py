@@ -50,14 +50,35 @@ from pathlib import Path
 
 from log import log
 
-# In preference order. The explicit env wins, then the narrow single-file
-# mount, then the whole-procfs fallback, then this container's own table
-# (right only when the agent runs with the host's network namespace).
-DEFAULT_PATHS = (
-    "/host/nf_conntrack",
-    "/host/proc/1/net/nf_conntrack",
-    "/proc/net/nf_conntrack",
-)
+# This container's own conntrack table. It exists and is readable, but in
+# the agent's network namespace it is all but empty — so finding it here is
+# only meaningful when the agent runs with the host's networking. Tried
+# last, and an empty result from it is reported as "not set up" rather than
+# "nothing is happening", because the two are indistinguishable otherwise.
+OWN_NAMESPACE_PATH = "/proc/net/nf_conntrack"
+
+
+def default_paths() -> tuple[str, ...]:
+    """Where to look, in preference order.
+
+    Note the middle two: if the agent already has the host filesystem
+    mounted for the **backup** feature (``-v /:/host:ro``, HOST_ROOT), then
+    the host's table is *already* in this container and nothing further
+    needs mounting. It has to be addressed as PID 1's copy — ``/proc/net``
+    is a symlink to ``/proc/self/net``, so a bind-mounted ``/host/proc/net``
+    would resolve back to this process's namespace and hand us the empty
+    table again.
+    """
+    host_root = os.getenv("HOST_ROOT", "/host").rstrip("/") or "/host"
+
+    return (
+        # The narrow, purpose-made mount.
+        "/host/nf_conntrack",
+        # Free if the backup feature's host mount is already there.
+        f"{host_root}/proc/1/net/nf_conntrack",
+        "/host/proc/1/net/nf_conntrack",
+        OWN_NAMESPACE_PATH,
+    )
 
 L4_PROTOCOLS = {
     "tcp", "udp", "icmp", "icmpv6", "sctp", "dccp", "udplite", "gre", "unknown",
@@ -91,7 +112,7 @@ def cache_seconds() -> float:
 
 def source_path() -> Path | None:
     """The first conntrack table we can actually read, or None."""
-    candidates = [os.getenv("CONNTRACK_FILE", "").strip(), *DEFAULT_PATHS]
+    candidates = [os.getenv("CONNTRACK_FILE", "").strip(), *default_paths()]
 
     for candidate in candidates:
         if not candidate:
@@ -316,6 +337,25 @@ def _build(host: str) -> dict:
         return {**base, "reason": f"could not read {path}: {error}"}
 
     flows = parse(text)
+
+    # Falling back to this container's own table and finding it empty means
+    # one of two things, and we can't tell which: the agent isn't sharing
+    # the host's network namespace (overwhelmingly likely), or the host
+    # genuinely has no tracked flows. Reporting "0 conversations" would
+    # look like a working feature on a quiet host, so say it isn't set up.
+    if str(path) == OWN_NAMESPACE_PATH and not flows:
+        return {
+            **base,
+            "reason": (
+                "conntrack table is empty here — the agent has its own "
+                "network namespace, so mount the host's table in "
+                "(-v /proc/net/nf_conntrack:/host/nf_conntrack:ro). Already "
+                "mounting the host filesystem for backups? Then it's found "
+                "automatically and this means the host really has no "
+                "tracked flows."
+            ),
+        }
+
     peers, total = aggregate(flows, max_peers())
 
     return {
