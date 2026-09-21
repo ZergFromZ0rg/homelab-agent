@@ -937,6 +937,53 @@ def start_rebuild(
         raise HTTPException(status_code=409, detail=str(error))
 
 
+@app.post("/rebuild/self")
+def rebuild_self(x_agent_token: str | None = Header(default=None)):
+    """Rebuild this agent's own Compose project.
+
+    Exists so a caller doesn't have to work out which container the agent
+    is. It knows — its own container id is its hostname — and guessing by
+    name from the outside breaks the moment someone renames it.
+
+    Always a self-rebuild, so the job comes back ``handed_off``: the work
+    is passed to a throwaway container because this process is about to be
+    replaced by it.
+    """
+    require_agent_token(x_agent_token)
+
+    if not rebuild.enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="rebuilds are off on this host; set REBUILD_ENABLED=1 on its agent",
+        )
+
+    own_id = os.getenv("HOSTNAME", "").strip()
+    if not own_id:
+        raise HTTPException(
+            status_code=400,
+            detail="this agent can't identify its own container (no HOSTNAME)",
+        )
+
+    container = find_container_or_404(own_id)
+    target = rebuild.target_for(container.labels)
+
+    if target is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "this agent isn't running from a Compose project in a git "
+                "checkout, so there's nothing to pull and rebuild"
+            ),
+        )
+
+    try:
+        return rebuild.start(client, target, pull=target["can_pull"])
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
 @app.get("/rebuild")
 def list_rebuilds(x_agent_token: str | None = Header(default=None)):
     require_agent_token(x_agent_token)

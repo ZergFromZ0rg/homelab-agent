@@ -183,3 +183,61 @@ def test_the_control_routes_still_refuse_a_protected_container(client, monkeypat
 
     assert resp.status_code == 403
     assert "protected" in resp.json()["detail"]
+
+
+def test_rebuild_self_finds_its_own_container(client, monkeypatch, tmp_path):
+    """The caller shouldn't have to know which container the agent is;
+    guessing by name breaks as soon as someone renames it."""
+    monkeypatch.setenv("REBUILD_ENABLED", "1")
+    monkeypatch.setenv("HOSTNAME", "abc123")
+
+    git_dir = tmp_path / "srv" / "agent" / ".git"
+    git_dir.mkdir(parents=True)
+    git_dir.joinpath("config").write_text(
+        '[remote "origin"]\n\turl = https://github.com/zerg/homelab-agent.git\n'
+    )
+
+    agent = a_container(project="homelab-agent", working_dir="/srv/agent")
+    agent.labels["com.docker.compose.project"] = "homelab-agent"
+    looked_up = []
+    monkeypatch.setattr(
+        main, "find_container_or_404",
+        lambda cid: looked_up.append(cid) or agent,
+    )
+    monkeypatch.setattr(
+        rebuild, "self_project", lambda client: "homelab-agent"
+    )
+
+    helper = mock.MagicMock()
+    helper.short_id = "h1"
+    main.client.containers.run.return_value = helper
+
+    job = client.post("/rebuild/self").json()
+
+    assert looked_up == ["abc123"], "it looks itself up by its own hostname"
+    assert job["replaces_self"] is True
+    assert job["state"] == "handed_off"
+
+
+def test_rebuild_self_needs_the_host_to_have_opted_in(client, monkeypatch):
+    monkeypatch.setenv("HOSTNAME", "abc123")
+    assert client.post("/rebuild/self").status_code == 403
+
+
+def test_rebuild_self_is_token_gated(client, monkeypatch):
+    monkeypatch.setattr(main, "AGENT_TOKEN", "sekret")
+    assert client.post("/rebuild/self").status_code == 401
+
+
+def test_rebuild_self_on_an_agent_not_run_from_a_checkout(client, monkeypatch, tmp_path):
+    monkeypatch.setenv("REBUILD_ENABLED", "1")
+    monkeypatch.setenv("HOSTNAME", "abc123")
+
+    plain = a_container(project=None, working_dir=None)
+    plain.labels = {}
+    monkeypatch.setattr(main, "find_container_or_404", lambda cid: plain)
+
+    resp = client.post("/rebuild/self")
+
+    assert resp.status_code == 400
+    assert "nothing to pull" in resp.json()["detail"]

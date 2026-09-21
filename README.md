@@ -1312,6 +1312,7 @@ fails.
 | Route | |
 | --- | --- |
 | `POST /rebuild` | `{"container": "<id or name>", "pull": true}` → a job |
+| `POST /rebuild/self` | rebuild *this agent* — it finds its own container, so the caller doesn't have to guess which one it is |
 | `GET /rebuild` | `{"enabled": bool, "jobs": [...]}` |
 | `GET /rebuild/{job_id}` | one job |
 
