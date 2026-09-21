@@ -325,3 +325,187 @@ def test_a_mounted_table_that_is_empty_still_reports_available(monkeypatch, tmp_
 
     assert result["available"] is True
     assert result["flows_total"] == 0
+
+
+# ---- container attribution ------------------------------------------------
+
+# Docker masquerades outbound: the container's own address is still the
+# original source.
+OUTBOUND = (
+    "ipv4     2 tcp      6 431999 ESTABLISHED src=172.18.0.5 dst=140.82.121.4 "
+    "sport=44444 dport=443 packets=9 bytes=900 src=140.82.121.4 "
+    "dst=192.168.1.10 sport=443 dport=44444 packets=7 bytes=7000 "
+    "[ASSURED] mark=0 use=1"
+)
+# Docker DNATs inbound: the container's address only shows up in the reply.
+INBOUND = (
+    "ipv4     2 tcp      6 431999 ESTABLISHED src=192.168.1.40 dst=192.168.1.10 "
+    "sport=51000 dport=8096 packets=620 bytes=51200 src=172.18.0.7 "
+    "dst=192.168.1.40 sport=8096 dport=51000 packets=3010 bytes=4294967296 "
+    "[ASSURED] mark=0 use=1"
+)
+# Same bridge, no NAT at all.
+CONTAINER_TO_CONTAINER = (
+    "ipv4     2 tcp      6 431999 ESTABLISHED src=172.18.0.7 dst=172.18.0.9 "
+    "sport=55000 dport=5432 packets=40 bytes=4000 src=172.18.0.9 "
+    "dst=172.18.0.7 sport=5432 dport=55000 packets=40 bytes=9000 "
+    "[ASSURED] mark=0 use=1"
+)
+
+CONTAINERS = [
+    {"id": "aaa111", "name": "gitsync", "ips": ["172.18.0.5"], "ports": {}},
+    {"id": "bbb222", "name": "jellyfin", "ips": ["172.18.0.7"],
+     "ports": {(8096, "tcp"): True}},
+    {"id": "ccc333", "name": "postgres", "ips": ["172.18.0.9"], "ports": {}},
+]
+
+
+def index():
+    return connections.build_index(CONTAINERS)
+
+
+def only(text):
+    peers, _ = connections.aggregate(connections.parse(text), 50, index())
+    return peers[0]
+
+
+def test_outbound_is_matched_on_the_masqueraded_source():
+    row = only(OUTBOUND)
+
+    assert row["container"] == "gitsync" and row["container_id"] == "aaa111"
+    assert row["direction"] == "out"
+    assert row["peer"] == "140.82.121.4" and row["peer_port"] == 443
+    # Sent by the container, received by it.
+    assert row["tx_bytes"] == 900 and row["rx_bytes"] == 7000
+
+
+def test_inbound_is_matched_on_the_dnatted_reply_source():
+    row = only(INBOUND)
+
+    assert row["container"] == "jellyfin"
+    assert row["direction"] == "in"
+    assert row["peer"] == "192.168.1.40"
+    # The swap that matters: conntrack counted 4 GB in the *reply*, which
+    # is the host sending. Reporting orig/reply as rx/tx would invert it.
+    assert row["tx_bytes"] == 4294967296
+    assert row["rx_bytes"] == 51200
+
+
+def test_inbound_falls_back_to_the_published_port():
+    """Some setups don't leave the container address in the reply tuple."""
+    no_reply_ip = INBOUND.replace("src=172.18.0.7", "src=192.168.1.10")
+    peers, _ = connections.aggregate(connections.parse(no_reply_ip), 50, index())
+
+    assert peers[0]["container"] == "jellyfin"
+    assert peers[0]["direction"] == "in"
+
+
+def test_a_published_port_of_a_different_protocol_does_not_match():
+    udp_index = connections.build_index(
+        [{"id": "d4", "name": "dns", "ips": [], "ports": {(8096, "udp"): True}}]
+    )
+    peers, _ = connections.aggregate(connections.parse(INBOUND), 50, udp_index)
+    assert peers[0]["container"] is None
+
+
+def test_both_ends_are_named_when_both_are_containers():
+    row = only(CONTAINER_TO_CONTAINER)
+
+    assert row["container"] == "jellyfin"
+    assert row["peer_container"] == "postgres"
+    assert row["direction"] == "out"
+    assert row["peer_port"] == 5432
+
+
+def test_host_traffic_is_left_unattributed():
+    row = only(ACCOUNTED_TCP)  # 10.0.0.5 -> 1.1.1.1, no container involved
+
+    assert row["container"] is None and row["direction"] is None
+    assert row["rx_bytes"] is None and row["tx_bytes"] is None
+    # The raw endpoints are still there.
+    assert row["src"] == "10.0.0.5" and row["dst"] == "1.1.1.1"
+
+
+def test_rx_tx_accumulate_across_the_flows_of_one_conversation():
+    peers, _ = connections.aggregate(
+        connections.parse("\n".join([INBOUND] * 3)), 50, index()
+    )
+    assert peers[0]["flows"] == 3
+    assert peers[0]["tx_bytes"] == 4294967296 * 3
+    assert peers[0]["rx_bytes"] == 51200 * 3
+
+
+def test_without_an_index_nothing_is_attributed():
+    peers, _ = connections.aggregate(connections.parse(INBOUND), 50, None)
+    assert peers[0]["container"] is None
+    assert peers[0]["peer"] is None
+
+
+def test_container_map_reads_addresses_and_published_ports():
+    class FakeContainer:
+        short_id = "bbb222"
+        name = "jellyfin"
+        attrs = {
+            "NetworkSettings": {
+                "Networks": {"media_default": {"IPAddress": "172.18.0.7"}},
+                "IPAddress": "",
+            },
+            "HostConfig": {
+                "PortBindings": {"8096/tcp": [{"HostPort": "8096"}]}
+            },
+        }
+
+    class FakeClient:
+        containers = type("C", (), {"list": staticmethod(lambda: [FakeContainer()])})()
+
+    (entry,) = connections.container_map(FakeClient())
+
+    assert entry["name"] == "jellyfin"
+    assert entry["ips"] == ["172.18.0.7"]
+    assert entry["ports"] == {(8096, "tcp"): True}
+
+
+def test_container_map_survives_one_broken_container():
+    class Bad:
+        short_id = "x"
+        name = "bad"
+
+        @property
+        def attrs(self):
+            raise RuntimeError("gone")
+
+    class Good:
+        short_id = "y"
+        name = "good"
+        attrs = {"NetworkSettings": {"Networks": {}}, "HostConfig": {}}
+
+    class FakeClient:
+        containers = type("C", (), {"list": staticmethod(lambda: [Bad(), Good()])})()
+
+    names = [c["name"] for c in connections.container_map(FakeClient())]
+    assert names == ["good"]
+
+
+def test_snapshot_reports_whether_attribution_ran(tmp_path, monkeypatch):
+    table = tmp_path / "nf_conntrack"
+    table.write_text(INBOUND)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+
+    assert connections.snapshot("bigboy")["attributed"] is False
+
+
+def test_a_failing_docker_client_does_not_take_the_table_with_it(tmp_path, monkeypatch):
+    table = tmp_path / "nf_conntrack"
+    table.write_text(INBOUND)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+
+    class Boom:
+        @property
+        def containers(self):
+            raise RuntimeError("daemon gone")
+
+    result = connections.snapshot("bigboy", Boom())
+
+    assert result["available"] is True
+    assert result["attributed"] is False
+    assert result["peers"][0]["container"] is None

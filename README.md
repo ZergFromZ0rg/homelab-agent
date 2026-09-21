@@ -988,6 +988,7 @@ address. One read-only route isn't worth rewriting that.
   "flows_total": 3412,
   "conversations_total": 214,
   "truncated": true,
+  "attributed": true,
   "peers": [
     {
       "proto": "tcp",
@@ -1001,20 +1002,48 @@ address. One read-only route isn't worth rewriting that.
       "orig_packets": 620,
       "reply_packets": 3010000,
       "states": ["ESTABLISHED"],
-      "container": null,
-      "container_id": null
+      "container": "jellyfin",
+      "container_id": "bbb222",
+      "peer_container": null,
+      "direction": "in",
+      "peer": "192.168.1.40",
+      "peer_port": 8096,
+      "rx_bytes": 51200,
+      "tx_bytes": 4294967296
     }
   ]
 }
 ```
 
 `src`/`dst` are the endpoints as conntrack records them: `src` opened the
-connection. `orig_bytes` flowed `src` → `dst`, `reply_bytes` came back.
-Which end is *this host* isn't knowable from the table alone — guessing it
-from address ranges gets inbound LAN connections backwards — so the rows
-are reported as-is. `container` and `container_id` are placeholders for the
-attribution pass that maps flows onto containers by Docker subnet and
-published port; they are always `null` today.
+connection, `orig_bytes` flowed `src` → `dst`, `reply_bytes` came back.
+That's a fact about the flow, not about this host, so it is always
+reported as-is.
+
+**Container attribution** adds the host's own view on top. Docker rewrites
+addresses in both directions, and the rewrite is the signal:
+
+* **outbound** traffic is masqueraded, so the container's own address is
+  still the original source;
+* **inbound** traffic to a published port is DNAT'd, so the container's
+  address appears as the *reply's* source — the original destination is
+  the host. Matching a published host port catches this too, for setups
+  where the reply tuple doesn't carry the container address.
+
+When one end is recognised, the row gains `container`, `container_id`,
+`direction` (`in`/`out`), `peer`, `peer_port`, and `rx_bytes`/`tx_bytes`
+from **this host's** point of view. That last pair matters: conntrack
+counts bytes per direction of the *connection*, so for an inbound flow the
+reply counter is the host sending. Reading `orig`/`reply` as receive/send
+would report a 4 GB upload as a 4 GB download.
+
+`peer_container` is set when both ends are containers on a shared network,
+so `jellyfin → postgres` reads as such.
+
+Traffic that belongs to no container — something on the host itself — keeps
+its raw endpoints with every attributed field `null`. `"attributed":
+false` at the top level means the pass didn't run at all (the Docker
+daemon was unreachable); the table is still returned.
 
 When the table isn't readable the route still answers `200`, with the fix:
 
@@ -1028,9 +1057,10 @@ When the table isn't readable the route still answers `200`, with the fix:
 
 ### What it can't tell you
 
-Which *process* owns a flow. conntrack doesn't record it; that needs the
-socket tables and `pid: host`. Per-container throughput totals are already
-on each container in `GET /containers`.
+Which *process* owns a flow, for traffic that isn't a container's.
+conntrack doesn't record it; that needs the socket tables and `pid: host`.
+Per-container throughput totals are already on each container in
+`GET /containers`.
 
 ### Configuration
 

@@ -826,7 +826,7 @@ def get_connections(x_agent_token: str | None = Header(default=None)):
     host that hasn't opted in reports that rather than erroring.
     """
     require_agent_token(x_agent_token)
-    return connections.snapshot(HOST_NAME)
+    return connections.snapshot(HOST_NAME, client)
 
 
 @app.get("/backup")

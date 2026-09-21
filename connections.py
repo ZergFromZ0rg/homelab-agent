@@ -227,7 +227,7 @@ def has_accounting(flows: list[dict]) -> bool:
     return any(flow["orig"]["bytes"] is not None for flow in flows)
 
 
-def aggregate(flows: list[dict], limit: int) -> tuple[list[dict], int]:
+def aggregate(flows: list[dict], limit: int, index: dict | None = None) -> tuple[list[dict], int]:
     """Collapse flows onto the conversation they belong to.
 
     A browser opens six connections to the same host; a torrent client
@@ -235,13 +235,20 @@ def aggregate(flows: list[dict], limit: int) -> tuple[list[dict], int]:
     port) turns that back into one row per conversation, which is the unit
     someone reading this actually cares about.
 
-    Deliberately *not* resolved into "local" and "remote" here. Which end
-    is this host isn't knowable from the table alone, and guessing it from
-    address ranges gets inbound LAN connections backwards. The endpoints
-    are reported as conntrack sees them; naming the local side is what the
-    container-attribution pass adds.
+    The endpoints stay as conntrack recorded them — ``src`` opened the
+    connection — because that is a fact about the flow rather than about
+    this host. ``attribute`` adds the host's own view on top when it can
+    recognise one end as a container: ``direction``, ``peer``, and
+    ``rx_bytes``/``tx_bytes`` the right way round. Without an ``index``
+    (or for flows that belong to no container) those stay null.
     """
     grouped: dict[tuple, dict] = {}
+
+    empty_attribution = {
+        "container": None, "container_id": None, "peer_container": None,
+        "direction": None, "peer": None, "peer_port": None,
+        "rx_bytes": None, "tx_bytes": None,
+    }
 
     for flow in flows:
         orig = flow["orig"]
@@ -249,6 +256,10 @@ def aggregate(flows: list[dict], limit: int) -> tuple[list[dict], int]:
 
         row = grouped.get(key)
         if row is None:
+            # Attribution depends only on the key, so it's the same for
+            # every flow in a group — work it out once.
+            attributed = attribute(flow, index) if index else dict(empty_attribution)
+
             row = grouped[key] = {
                 "proto": flow["proto"],
                 "family": flow["family"],
@@ -261,10 +272,9 @@ def aggregate(flows: list[dict], limit: int) -> tuple[list[dict], int]:
                 "orig_packets": None,
                 "reply_packets": None,
                 "states": set(),
-                # Filled in by the container-attribution pass; present now
-                # so the dashboard's shape doesn't change under it.
-                "container": None,
-                "container_id": None,
+                **{k: v for k, v in attributed.items() if not k.endswith("_bytes")},
+                "rx_bytes": None,
+                "tx_bytes": None,
             }
 
         row["flows"] += 1
@@ -278,6 +288,19 @@ def aggregate(flows: list[dict], limit: int) -> tuple[list[dict], int]:
                     continue
                 current = row[f"{prefix}_{field}"]
                 row[f"{prefix}_{field}"] = value if current is None else current + value
+
+        if row["direction"]:
+            # Same swap as attribute(), applied to the running totals.
+            sent, received = (
+                (flow["orig"]["bytes"], flow["reply"]["bytes"])
+                if row["direction"] == "out"
+                else (flow["reply"]["bytes"], flow["orig"]["bytes"])
+            )
+            for field, value in (("tx_bytes", sent), ("rx_bytes", received)):
+                if value is None:
+                    continue
+                current = row[field]
+                row[field] = value if current is None else current + value
 
     rows = list(grouped.values())
     for row in rows:
@@ -296,10 +319,136 @@ def aggregate(flows: list[dict], limit: int) -> tuple[list[dict], int]:
     return rows[:limit], len(rows)
 
 
+def container_map(client) -> list[dict]:
+    """Every container's addresses and published ports, which is all the
+    attribution below needs. Read straight from the daemon rather than the
+    agent's container cache so ``GET /containers`` keeps its payload."""
+    containers = []
+
+    for container in client.containers.list():
+        try:
+            settings = container.attrs.get("NetworkSettings") or {}
+
+            ips = {
+                network.get("IPAddress")
+                for network in (settings.get("Networks") or {}).values()
+                if network and network.get("IPAddress")
+            }
+            if settings.get("IPAddress"):  # legacy single-network shape
+                ips.add(settings["IPAddress"])
+
+            containers.append({
+                "id": container.short_id,
+                "name": container.name,
+                "ips": sorted(ips),
+                "ports": _published_ports(container),
+            })
+
+        except Exception as error:  # noqa: BLE001 - one bad container
+            log.debug("connection attribution skipped %s: %s", container.name, error)
+
+    return containers
+
+
+def _published_ports(container) -> dict:
+    """``{(host_port, proto): True}`` for everything this container
+    publishes to the host."""
+    host_config = container.attrs.get("HostConfig") or {}
+    published = {}
+
+    for target, bindings in (host_config.get("PortBindings") or {}).items():
+        proto = target.split("/")[-1] if "/" in target else "tcp"
+        for binding in bindings or []:
+            port = binding.get("HostPort")
+            if port:
+                try:
+                    published[(int(port), proto)] = True
+                except ValueError:
+                    continue
+
+    return published
+
+
+def build_index(containers: list[dict]) -> dict:
+    """Two lookups: container IP -> container, and published (port, proto)
+    -> container."""
+    by_ip, by_port = {}, {}
+
+    for container in containers:
+        entry = {"container": container["name"], "container_id": container["id"]}
+        for ip in container.get("ips") or []:
+            by_ip[ip] = entry
+        for key in container.get("ports") or {}:
+            by_port[key] = entry
+
+    return {"by_ip": by_ip, "by_port": by_port}
+
+
+def attribute(flow: dict, index: dict) -> dict:
+    """Work out which container a flow belongs to, and with that, which end
+    of it is this host.
+
+    Docker rewrites addresses in both directions, and the rewrite is the
+    signal:
+
+    * **outbound** (container to the world) is masqueraded, so the original
+      source is still the container's own address.
+    * **inbound** (the world to a published port) is DNAT'd, so the
+      container's address appears as the *reply's* source — the original
+      destination is the host.
+
+    Matching a published host port catches the inbound case on setups where
+    the reply tuple doesn't carry the container address.
+
+    Knowing which end is the container is also what makes ``rx``/``tx``
+    meaningful: conntrack counts bytes per direction of the *connection*,
+    not of the host, so the two are swapped for an inbound flow.
+    """
+    orig, reply = flow["orig"], flow["reply"]
+    by_ip, by_port = index["by_ip"], index["by_port"]
+
+    local = by_ip.get(orig["src"])
+    if local:
+        direction = "out"
+        peer, peer_port = orig["dst"], orig["dport"]
+        tx, rx = orig["bytes"], reply["bytes"]
+    else:
+        local = by_ip.get(reply["src"]) or by_port.get((orig["dport"], flow["proto"]))
+        if local:
+            direction = "in"
+            peer, peer_port = orig["src"], orig["dport"]
+            rx, tx = orig["bytes"], reply["bytes"]
+        else:
+            return {
+                "container": None,
+                "container_id": None,
+                "peer_container": None,
+                "direction": None,
+                "peer": None,
+                "peer_port": None,
+                "rx_bytes": None,
+                "tx_bytes": None,
+            }
+
+    # Container to container on a shared network — name both ends.
+    other = by_ip.get(orig["dst"] if direction == "out" else orig["src"])
+
+    return {
+        "container": local["container"],
+        "container_id": local["container_id"],
+        "peer_container": other["container"] if other else None,
+        "direction": direction,
+        "peer": peer,
+        "peer_port": peer_port,
+        "rx_bytes": rx,
+        "tx_bytes": tx,
+    }
+
+
 _cache: dict = {"at": 0.0, "data": None}
 
 
-def snapshot(host: str = "", *, now: float | None = None) -> dict:
+def snapshot(host: str = "", client=None, *, now: float | None = None) -> dict:
     """What GET /connections returns. Never raises — an unreadable table is
     a reportable state, not an error."""
     now = time.time() if now is None else now
@@ -308,12 +457,12 @@ def snapshot(host: str = "", *, now: float | None = None) -> dict:
     if cached is not None and now - _cache["at"] < cache_seconds():
         return cached
 
-    result = _build(host)
+    result = _build(host, client)
     _cache.update(at=now, data=result)
     return result
 
 
-def _build(host: str) -> dict:
+def _build(host: str, client=None) -> dict:
     base = {"host": host, "updated_at": time.time(), "available": False}
 
     if not enabled():
@@ -356,7 +505,14 @@ def _build(host: str) -> dict:
             ),
         }
 
-    peers, total = aggregate(flows, max_peers())
+    index = None
+    if client is not None:
+        try:
+            index = build_index(container_map(client))
+        except Exception as error:  # noqa: BLE001 - attribution is a bonus
+            log.warning("container attribution unavailable: %s", error)
+
+    peers, total = aggregate(flows, max_peers(), index)
 
     return {
         **base,
@@ -366,6 +522,7 @@ def _build(host: str) -> dict:
         "flows_total": len(flows),
         "conversations_total": total,
         "truncated": total > len(peers),
+        "attributed": index is not None,
         "peers": peers,
     }
 
