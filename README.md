@@ -1225,22 +1225,39 @@ target.
 The working directory is read through the same host mount everything else
 here uses (`HOST_ROOT`, `/host` by default).
 
-### Rebuilding the agent itself
+### It always runs in a throwaway container
 
-`docker compose up -d --build` on the project holding this agent would
-kill the process running it, halfway through. So when the target project
-is the agent's own, the work is handed to a throwaway container instead:
+Every rebuild, not just the agent's own:
 
 ```bash
-docker run --rm -d -v /var/run/docker.sock:/var/run/docker.sock \
+docker run -d -v /var/run/docker.sock:/var/run/docker.sock \
   -v <project>:<project> -w <project> \
-  <this agent's image> sh -c 'git pull --ff-only origin && docker compose up -d --build'
+  <this agent's image> \
+  sh -c "git -c safe.directory=<project> pull --ff-only origin && docker compose up -d --build"
 ```
 
 It uses this agent's own image, which already carries git, the Docker CLI
-and the Compose plugin, so there is nothing extra to pull. The job comes
-back `handed_off` rather than `done`: from that point the agent is being
-replaced, so the outcome is only visible when it comes back online.
+and the Compose plugin, so there is nothing extra to pull.
+
+Running the ordinary ones in this process instead looks simpler and is
+wrong. The agent sees the host filesystem under `HOST_ROOT`, so it would
+run compose from `/host/srv/thing` while the daemon on the other end of
+the socket knows that project as `/srv/thing`. Compose resolves a
+service's relative bind mounts against the directory it ran in, so
+`./data:/data` would reach the daemon as `/host/srv/thing/data` — a path
+that doesn't exist on the host, which Docker would then create as an
+empty directory. The containers come up with empty volumes and nothing
+reports an error.
+
+`safe.directory` isn't optional either: the checkout belongs to whoever
+owns it on the host, this runs as root, and git has refused to touch a
+repo owned by another user since 2.35.2.
+
+**Rebuilding the agent's own project** is the one case that can't report
+back — `compose up` kills the process waiting for it. That job returns
+`handed_off` rather than `done`, and the helper removes itself, since
+nothing will be left to clean it up. The outcome shows up as the agent
+coming back online.
 
 ### Jobs
 

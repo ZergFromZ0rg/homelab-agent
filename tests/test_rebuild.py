@@ -115,12 +115,25 @@ def wait_for(job_id, timeout=3.0):
     raise AssertionError("job never finished")
 
 
-def fake_client(project=None):
+def fake_client(project=None, exit_code=0, logs=b"", run_error=None):
+    """A docker client whose containers.run() returns a helper that exits
+    with `exit_code`."""
     client = mock.MagicMock()
-    container = mock.MagicMock()
-    container.labels = {"com.docker.compose.project": project} if project else {}
-    container.image.tags = ["homelab-agent"]
-    client.containers.get.return_value = container
+
+    own = mock.MagicMock()
+    own.labels = {"com.docker.compose.project": project} if project else {}
+    own.image.tags = ["homelab-agent"]
+    client.containers.get.return_value = own
+
+    helper = mock.MagicMock()
+    helper.short_id = "helper01"
+    helper.wait.return_value = {"StatusCode": exit_code}
+    helper.logs.return_value = logs
+    client.containers.run.return_value = helper
+    if run_error is not None:
+        client.containers.run.side_effect = run_error
+
+    client._helper = helper
     return client
 
 
@@ -133,152 +146,150 @@ def target(tmp_path, name="media"):
     }
 
 
+def helper_kwargs(client):
+    _, kwargs = client.containers.run.call_args
+    return kwargs
+
+
+def helper_script(client):
+    return helper_kwargs(client)["command"][-1]
+
+
 def test_a_rebuild_pulls_then_builds(tmp_path, monkeypatch):
-    checkout(tmp_path)
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client(logs=b"built\n")
 
-    calls = []
-
-    def fake_run(args, cwd, timeout):
-        calls.append((args, cwd))
-        return {"command": " ".join(args), "exit_code": 0, "output": "", "seconds": 0.1}
-
-    monkeypatch.setattr(rebuild, "_run", fake_run)
-
-    job = rebuild.start(fake_client(), target(tmp_path))
-    finished = wait_for(job["id"])
+    finished = wait_for(rebuild.start(client, target(tmp_path))["id"])
 
     assert finished["state"] == "done"
-    assert [c[0] for c in calls] == [
-        ["git", "pull", "--ff-only", "origin"],
-        ["docker", "compose", "up", "-d", "--build"],
-    ]
-    assert calls[0][1] == str(tmp_path / "srv" / "media")
+    # "git pull" is no longer contiguous — safe.directory sits between them.
+    script = helper_script(client)
+    assert script.index("pull --ff-only origin") < script.index("docker compose up")
+    assert script.startswith("git ")
+    assert "docker compose up -d --build" in script
+    assert finished["steps"][0]["output"] == "built\n"
 
 
 def test_the_pull_can_be_skipped(tmp_path, monkeypatch):
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
-    calls = []
-    monkeypatch.setattr(
-        rebuild, "_run",
-        lambda args, cwd, timeout: calls.append(args) or
-        {"command": "", "exit_code": 0, "output": "", "seconds": 0},
-    )
+    client = fake_client()
 
-    job = rebuild.start(fake_client(), target(tmp_path), pull=False)
-    wait_for(job["id"])
+    wait_for(rebuild.start(client, target(tmp_path), pull=False)["id"])
 
-    assert calls == [["docker", "compose", "up", "-d", "--build"]]
+    assert "git" not in helper_script(client)
 
 
-def test_a_failed_pull_stops_before_building(tmp_path, monkeypatch):
+def test_git_is_told_the_checkout_is_safe_to_touch(tmp_path, monkeypatch):
+    """The helper runs as root against a checkout owned by whoever owns it
+    on the host. Git has refused that since 2.35.2, so every pull would
+    fail on "dubious ownership" without this."""
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
-    calls = []
+    client = fake_client()
 
-    def fake_run(args, cwd, timeout):
-        calls.append(args)
-        return {"command": " ".join(args), "exit_code": 1,
-                "output": "diverged from origin", "seconds": 0.1}
+    wait_for(rebuild.start(client, target(tmp_path))["id"])
 
-    monkeypatch.setattr(rebuild, "_run", fake_run)
+    assert "-c safe.directory=/srv/media" in helper_script(client)
 
-    finished = wait_for(rebuild.start(fake_client(), target(tmp_path))["id"])
+
+def test_a_failing_rebuild_keeps_its_output(tmp_path, monkeypatch):
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client(exit_code=1, logs=b"no space left on device\n")
+
+    finished = wait_for(rebuild.start(client, target(tmp_path))["id"])
 
     assert finished["state"] == "failed"
-    assert finished["error"] == "git pull failed"
-    assert len(calls) == 1
-    assert "diverged" in finished["steps"][0]["output"]
+    assert "exited 1" in finished["error"]
+    assert "no space left" in finished["steps"][0]["output"]
 
 
-def test_a_failed_build_is_reported_with_its_output(tmp_path, monkeypatch):
+def test_the_helper_sees_the_project_at_its_real_host_path(tmp_path, monkeypatch):
+    """Not the HOST_ROOT-prefixed one. Compose resolves a service's
+    relative bind mounts against the directory it runs in, and the daemon
+    on the other end of the socket only knows the real path."""
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client()
 
-    def fake_run(args, cwd, timeout):
-        failed = args[0] == "docker"
-        return {"command": " ".join(args), "exit_code": 1 if failed else 0,
-                "output": "no space left on device" if failed else "", "seconds": 0}
+    wait_for(rebuild.start(client, target(tmp_path))["id"])
 
-    monkeypatch.setattr(rebuild, "_run", fake_run)
+    kwargs = helper_kwargs(client)
+    assert kwargs["working_dir"] == "/srv/media"
+    assert "/srv/media" in kwargs["volumes"]
+    assert kwargs["volumes"]["/srv/media"]["bind"] == "/srv/media"
+    assert "/var/run/docker.sock" in kwargs["volumes"]
+    assert str(tmp_path) not in str(kwargs["volumes"])
 
-    finished = wait_for(rebuild.start(fake_client(), target(tmp_path))["id"])
 
-    assert finished["state"] == "failed" and finished["error"] == "compose up failed"
-    assert "no space left" in finished["steps"][-1]["output"]
+def test_an_ordinary_rebuild_is_cleaned_up_after_its_output_is_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client()
+
+    wait_for(rebuild.start(client, target(tmp_path))["id"])
+
+    assert helper_kwargs(client)["auto_remove"] is False
+    client._helper.remove.assert_called_once()
 
 
 def test_only_one_rebuild_at_a_time(tmp_path, monkeypatch):
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
-    monkeypatch.setattr(
-        rebuild, "_run",
-        lambda args, cwd, timeout: time.sleep(0.2) or
-        {"command": "", "exit_code": 0, "output": "", "seconds": 0},
-    )
+    client = fake_client()
+    client._helper.wait.side_effect = lambda **kw: time.sleep(0.2) or {"StatusCode": 0}
 
-    first = rebuild.start(fake_client(), target(tmp_path))
+    first = rebuild.start(client, target(tmp_path))
 
     with pytest.raises(RuntimeError, match="already running"):
-        rebuild.start(fake_client(), target(tmp_path, "other"))
+        rebuild.start(client, target(tmp_path, "other"))
 
     wait_for(first["id"], timeout=5)
+
+
+def test_a_helper_that_will_not_start_fails_the_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client(run_error=RuntimeError("no such image"))
+
+    finished = wait_for(rebuild.start(client, target(tmp_path))["id"])
+
+    assert finished["state"] == "failed"
+    assert "no such image" in finished["error"]
+
+
+def test_a_helper_that_vanishes_fails_the_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client()
+    client._helper.wait.side_effect = RuntimeError("timed out")
+
+    finished = wait_for(rebuild.start(client, target(tmp_path))["id"])
+
+    assert finished["state"] == "failed"
+    assert "lost track" in finished["error"]
 
 
 # ---- rebuilding the agent itself -----------------------------------------
 
 
-def test_replacing_this_agent_is_handed_to_a_helper(tmp_path, monkeypatch):
-    """compose up would kill the process running it, so it can't be us."""
+def test_replacing_this_agent_does_not_wait_for_a_result(tmp_path, monkeypatch):
+    """compose up would kill the process waiting for it."""
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
     monkeypatch.setenv("HOSTNAME", "abc123")
-
     client = fake_client(project="homelab")
-    client.containers.run.return_value = mock.MagicMock(short_id="helper01")
 
-    direct = []
-    monkeypatch.setattr(rebuild, "_run", lambda *a, **k: direct.append(a) or {})
-
-    job = rebuild.start(client, target(tmp_path, "homelab"))
-    finished = wait_for(job["id"])
+    finished = wait_for(rebuild.start(client, target(tmp_path, "homelab"))["id"])
 
     assert finished["replaces_self"] is True
     assert finished["state"] == "handed_off"
-    assert direct == []  # nothing was run in this process
-
-    _, kwargs = client.containers.run.call_args
-    assert kwargs["detach"] is True and kwargs["remove"] is True
-    assert kwargs["working_dir"] == "/srv/homelab"
-    assert "/var/run/docker.sock" in kwargs["volumes"]
-    script = kwargs["command"][-1]
-    assert "git pull --ff-only origin" in script
-    assert "docker compose up -d --build" in script
+    client._helper.wait.assert_not_called()
+    # Nobody will be left to clean it up.
+    assert helper_kwargs(client)["auto_remove"] is True
 
 
 def test_another_project_on_the_same_host_is_not_a_self_rebuild(tmp_path, monkeypatch):
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
     monkeypatch.setenv("HOSTNAME", "abc123")
-    monkeypatch.setattr(
-        rebuild, "_run",
-        lambda *a, **k: {"command": "", "exit_code": 0, "output": "", "seconds": 0},
-    )
-
     client = fake_client(project="homelab")
+
     finished = wait_for(rebuild.start(client, target(tmp_path, "media"))["id"])
 
     assert finished["replaces_self"] is False
     assert finished["state"] == "done"
-    client.containers.run.assert_not_called()
-
-
-def test_a_helper_that_will_not_start_fails_the_job(tmp_path, monkeypatch):
-    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
-    monkeypatch.setenv("HOSTNAME", "abc123")
-
-    client = fake_client(project="homelab")
-    client.containers.run.side_effect = RuntimeError("no such image")
-
-    finished = wait_for(rebuild.start(client, target(tmp_path, "homelab"))["id"])
-
-    assert finished["state"] == "failed"
-    assert "no such image" in finished["error"]
 
 
 def test_the_helper_runs_this_agents_own_image_by_default(monkeypatch):
@@ -287,6 +298,17 @@ def test_the_helper_runs_this_agents_own_image_by_default(monkeypatch):
 
     monkeypatch.setenv("REBUILD_HELPER_IMAGE", "docker:cli")
     assert rebuild.helper_image(fake_client()) == "docker:cli"
+
+
+def test_no_entrypoint_override_is_needed(tmp_path, monkeypatch):
+    """The agent image sets CMD, not ENTRYPOINT, so `command` replaces it
+    outright. Passing entrypoint="" as well was cargo cult."""
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client()
+
+    wait_for(rebuild.start(client, target(tmp_path))["id"])
+
+    assert "entrypoint" not in helper_kwargs(client)
 
 
 # ---- job bookkeeping ------------------------------------------------------
@@ -299,30 +321,8 @@ def test_status_of_an_unknown_job_is_none():
 def test_finished_jobs_are_kept_but_capped(tmp_path, monkeypatch):
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
     monkeypatch.setattr(rebuild, "MAX_JOBS", 3)
-    monkeypatch.setattr(
-        rebuild, "_run",
-        lambda *a, **k: {"command": "", "exit_code": 0, "output": "", "seconds": 0},
-    )
 
     for _ in range(5):
         wait_for(rebuild.start(fake_client(), target(tmp_path))["id"])
 
     assert len(rebuild.recent()) <= 3
-
-
-def test_run_captures_output_and_exit_code(tmp_path):
-    step = rebuild._run(["sh", "-c", "echo hello; exit 3"], str(tmp_path), 10)
-
-    assert step["exit_code"] == 3
-    assert "hello" in step["output"]
-    assert step["command"] == "sh -c 'echo hello; exit 3'"
-
-
-def test_run_reports_a_missing_binary_rather_than_raising(tmp_path):
-    step = rebuild._run(["definitely-not-a-binary"], str(tmp_path), 10)
-    assert step["exit_code"] == 127
-
-
-def test_run_reports_a_timeout(tmp_path):
-    step = rebuild._run(["sh", "-c", "sleep 5"], str(tmp_path), 1)
-    assert step["exit_code"] == 124 and "timed out" in step["output"]

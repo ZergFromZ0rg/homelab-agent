@@ -2,6 +2,7 @@
 route tests, so these run without a daemon."""
 
 import sys
+import time
 from unittest import mock
 
 import pytest
@@ -67,10 +68,12 @@ def test_starting_a_rebuild_returns_a_job_to_poll(client, monkeypatch, tmp_path)
     monkeypatch.setenv("REBUILD_ENABLED", "1")
     (tmp_path / "srv" / "media" / ".git").mkdir(parents=True)
     monkeypatch.setattr(main, "get_container_or_404", lambda cid: a_container())
-    monkeypatch.setattr(
-        rebuild, "_run",
-        lambda *a, **k: {"command": "", "exit_code": 0, "output": "", "seconds": 0},
-    )
+
+    helper = mock.MagicMock()
+    helper.short_id = "helper01"
+    helper.wait.return_value = {"StatusCode": 0}
+    helper.logs.return_value = b"ok\n"
+    main.client.containers.run.return_value = helper
 
     job = client.post("/rebuild", json={"container": "jellyfin"}).json()
 
@@ -78,6 +81,14 @@ def test_starting_a_rebuild_returns_a_job_to_poll(client, monkeypatch, tmp_path)
 
     polled = client.get(f"/rebuild/{job['id']}")
     assert polled.status_code == 200 and polled.json()["id"] == job["id"]
+
+    # The working directory the helper is given is the host's real one,
+    # not the HOST_ROOT-prefixed path the agent reads through.
+    deadline = time.monotonic() + 3
+    while main.client.containers.run.call_args is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    _, kwargs = main.client.containers.run.call_args
+    assert kwargs["working_dir"] == "/srv/media"
 
 
 def test_an_unknown_job_is_a_404(client, monkeypatch):

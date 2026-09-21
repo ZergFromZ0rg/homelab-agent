@@ -61,7 +61,11 @@ ask HOST_NAME "Host name (must equal its Prometheus job_name)" "$(hostname -s 2>
 runtime=$(current AGENT_RUNTIME)
 
 if [ -z "$runtime" ]; then
-  if [ -e /dev/nvidiactl ] || command -v nvidia-smi >/dev/null 2>&1; then
+  if ! docker info >/dev/null 2>&1; then
+    echo "Can't talk to Docker (not running, or you're not in the docker"
+    echo "  group), so the GPU check is being skipped. Re-run this later if"
+    echo "  this host has an NVIDIA card."
+  elif [ -e /dev/nvidiactl ] || command -v nvidia-smi >/dev/null 2>&1; then
     if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
       runtime=nvidia
       count=$(nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' ')

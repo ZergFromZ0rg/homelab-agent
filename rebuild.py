@@ -16,7 +16,7 @@ working directory are all on its labels) whose working directory is a git
 repo. Nothing else is rebuildable, because there'd be nothing to pull.
 
   REBUILD_ENABLED       "1" to turn the route on. Off by default.
-  REBUILD_TIMEOUT       seconds for the whole pull + build (default 1800).
+  REBUILD_TIMEOUT       seconds to wait for a rebuild (default 1800).
   REBUILD_HELPER_IMAGE  image for the self-rebuild helper below; defaults
                         to this agent's own image, which already carries
                         git, the Docker CLI and the Compose plugin.
@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import os
 import shlex
-import subprocess
 import threading
 import time
 import uuid
@@ -81,36 +80,6 @@ def target_for(labels: dict | None) -> dict | None:
         "service": labels.get("com.docker.compose.service"),
         "working_dir": working_dir,
         "path": str(local),
-    }
-
-
-def _run(args: list[str], cwd: str, timeout: int) -> dict:
-    """One step of a rebuild, captured whole. Output is what the person who
-    pressed the button needs to see when it fails."""
-    started = time.time()
-
-    try:
-        done = subprocess.run(
-            args,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            check=False,
-        )
-        output = (done.stdout or "") + (done.stderr or "")
-        code = done.returncode
-
-    except subprocess.TimeoutExpired:
-        output, code = f"timed out after {timeout}s", 124
-    except OSError as error:
-        output, code = str(error), 127
-
-    return {
-        "command": shlex.join(args),
-        "exit_code": code,
-        "output": output[-8000:],
-        "seconds": round(time.time() - started, 1),
     }
 
 
@@ -244,61 +213,65 @@ def _add_step(job: dict, step: dict) -> None:
         job["steps"].append(step)
 
 
+def _script(job: dict) -> str:
+    """The shell the helper runs.
+
+    ``safe.directory`` is not optional: the checkout belongs to whoever
+    owns it on the host, this runs as root, and git has refused to touch a
+    repo owned by another user since 2.35.2. Without it every pull fails
+    with "detected dubious ownership" before anything is fetched.
+
+    ``--ff-only`` so a checkout that has diverged from its remote stops
+    and says so rather than merging or leaving conflicts behind.
+    """
+    parts = []
+
+    if job["pull"]:
+        quoted = shlex.quote(job["working_dir"])
+        parts.append(f"git -c safe.directory={quoted} pull --ff-only origin")
+
+    parts.append("docker compose up -d --build")
+
+    return " && ".join(parts)
+
+
 def _run_job(client, job: dict) -> None:
     try:
-        if job["replaces_self"]:
-            _hand_off(client, job)
-        else:
-            _rebuild_here(job)
-
+        _rebuild(client, job)
     except Exception as error:  # noqa: BLE001 - the thread must not die silently
         _finish(job, "failed", str(error))
 
 
-def _rebuild_here(job: dict) -> None:
-    """The normal path: run the pull and the build ourselves."""
-    path = str(host_path(job["working_dir"]))
+def _rebuild(client, job: dict) -> None:
+    """Every rebuild goes through a throwaway container, including the
+    ones that don't replace this agent.
 
-    if job["pull"]:
-        # --ff-only: a deployment checkout that has diverged from the
-        # remote should stop and say so, not merge or conflict.
-        step = _run(["git", "pull", "--ff-only", "origin"], path, TIMEOUT)
-        _add_step(job, step)
-        if step["exit_code"] != 0:
-            _finish(job, "failed", "git pull failed")
-            return
+    Doing the ordinary ones here instead looks simpler and is wrong. The
+    agent sees the host filesystem under ``HOST_ROOT``, so it would run
+    compose from ``/host/srv/thing`` while the daemon it is talking to
+    knows that project as ``/srv/thing``. Compose resolves a service's
+    relative bind mounts against the directory it was run from, so
+    ``./data:/data`` would be handed to the daemon as ``/host/srv/thing/
+    data`` — a path that doesn't exist on the host, which Docker would
+    then helpfully create as an empty directory. The containers come up
+    with empty volumes and nothing reports an error.
 
-    step = _run(["docker", "compose", "up", "-d", "--build"], path, TIMEOUT)
-    _add_step(job, step)
-
-    if step["exit_code"] != 0:
-        _finish(job, "failed", "compose up failed")
-        return
-
-    _finish(job, "done")
-
-
-def _hand_off(client, job: dict) -> None:
-    """The self-rebuild path.
-
-    The agent cannot run this itself — ``compose up`` would kill the
-    process doing the running. Instead a throwaway container does it, with
-    the Docker socket and the project directory mounted. It outlives this
-    agent by design, so the job is marked ``handed_off`` rather than
-    ``done``: from here the outcome is only visible once the new agent is
-    up.
+    The helper has the project bind-mounted at its real path, so every
+    path resolves exactly as it would in a shell on the host.
     """
+    script = _script(job)
     working_dir = job["working_dir"]
-    script = "git pull --ff-only origin && " if job["pull"] else ""
-    script += "docker compose up -d --build"
+    started = time.time()
 
     try:
         container = client.containers.run(
             helper_image(client),
             command=["sh", "-c", script],
-            entrypoint="",
             detach=True,
-            remove=True,
+            # A self-rebuild kills this agent before it can clean up, so
+            # that one removes itself. For the rest we come back for the
+            # exit code and the log first.
+            auto_remove=job["replaces_self"],
             working_dir=working_dir,
             volumes={
                 "/var/run/docker.sock": {
@@ -313,18 +286,44 @@ def _hand_off(client, job: dict) -> None:
         _finish(job, "failed", f"could not start the rebuild helper: {error}")
         return
 
+    if job["replaces_self"]:
+        _add_step(job, {
+            "command": script,
+            "exit_code": None,
+            "output": (
+                f"handed off to helper container {container.short_id}; this "
+                "agent is about to be replaced, so the result won't appear "
+                "here — watch for it coming back online"
+            ),
+            "seconds": round(time.time() - started, 1),
+        })
+        _finish(job, "handed_off")
+        return
+
+    try:
+        result = container.wait(timeout=TIMEOUT)
+        code = result.get("StatusCode", 1) if isinstance(result, dict) else 1
+        output = container.logs().decode("utf-8", "replace")
+
+    except Exception as error:  # noqa: BLE001
+        _finish(job, "failed", f"lost track of the rebuild helper: {error}")
+        return
+
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception as error:  # noqa: BLE001 - best effort
+            log.debug("could not remove rebuild helper: %s", error)
+
     _add_step(job, {
-        "command": f"docker run --rm {helper_image(client)} sh -c {shlex.quote(script)}",
-        "exit_code": None,
-        "output": (
-            f"handed off to helper container {container.short_id}; this agent "
-            "is about to be replaced, so the result won't appear here — watch "
-            "for it coming back online"
-        ),
-        "seconds": 0.0,
+        "command": script,
+        "exit_code": code,
+        "output": output[-8000:],
+        "seconds": round(time.time() - started, 1),
     })
 
-    _finish(job, "handed_off")
+    _finish(job, "done" if code == 0 else "failed",
+            None if code == 0 else f"rebuild exited {code}")
 
 
 def summary_for(labels: dict | None) -> dict | None:
