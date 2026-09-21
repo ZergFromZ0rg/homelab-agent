@@ -46,6 +46,11 @@ services:
       ALLOWED_HOST_PATHS: ${ALLOWED_HOST_PATHS:-}
       ALLOWED_DEVICES: ${ALLOWED_DEVICES:-}
 
+      # Rebuild-from-the-dashboard. Off unless set to 1, because it runs
+      # `git pull` and `docker compose --build` — whatever the repo says,
+      # as root on the host. See Rebuilding in the README.
+      REBUILD_ENABLED: ${REBUILD_ENABLED:-}
+
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
     volumes:

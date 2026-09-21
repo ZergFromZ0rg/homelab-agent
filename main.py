@@ -16,6 +16,7 @@ from stack_backup import StackBackup
 from register import Registrar
 import connections
 import deploy
+import rebuild
 from deploy import CreateContainerRequest, PolicyError
 from stack_deploy import (
     CreateStackRequest,
@@ -338,6 +339,7 @@ def build_container_snapshot():
                 ),
                 "size": get_container_size(container),
                 "ports": _container_ports(container),
+                "rebuild": rebuild.summary_for(container.labels),
             })
 
         except Exception as error:
@@ -813,6 +815,66 @@ stack_backup = StackBackup(
     host_name=HOST_NAME,
     inventory_provider=lambda: build_inventory(sizes=True),
 )
+
+
+@app.post("/rebuild")
+def start_rebuild(
+    request: dict | None = None,
+    x_agent_token: str | None = Header(default=None),
+):
+    """Pull and rebuild the Compose project a container belongs to.
+
+    Off unless REBUILD_ENABLED is set: ``git pull`` runs repo hooks and
+    ``--build`` runs the Dockerfile, so this is arbitrary code execution on
+    the host by design and a host has to opt in to it.
+
+    Returns a job to poll — a build takes minutes.
+    """
+    require_agent_token(x_agent_token)
+
+    if not rebuild.enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="rebuilds are off on this host; set REBUILD_ENABLED=1 on its agent",
+        )
+
+    body = request or {}
+    container_id = str(body.get("container") or "").strip()
+    if not container_id:
+        raise HTTPException(status_code=400, detail="container is required")
+
+    container = get_container_or_404(container_id)
+    target = rebuild.target_for(container.labels)
+
+    if target is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{container.name} isn't a Compose project in a git checkout, "
+                "so there's nothing to pull and rebuild"
+            ),
+        )
+
+    try:
+        return rebuild.start(client, target, pull=body.get("pull", True))
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
+@app.get("/rebuild")
+def list_rebuilds(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return {"enabled": rebuild.enabled(), "jobs": rebuild.recent()}
+
+
+@app.get("/rebuild/{job_id}")
+def rebuild_status(job_id: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+
+    job = rebuild.status(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown rebuild job")
+    return job
 
 
 @app.get("/connections")

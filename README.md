@@ -76,6 +76,13 @@ direction — by reading the conntrack table. Free with the backup feature's
 host mount, one extra read-only mount without it; see
 [Network Connections](#network-connections-1) below.
 
+### Rebuild from the Dashboard
+
+`POST /rebuild` pulls a Compose project's git checkout and brings it back
+up with `--build`, so an agent (or anything else) can be updated from the
+dashboard instead of over SSH. **Off unless `REBUILD_ENABLED=1`** — see
+[Rebuilding](#rebuilding) below.
+
 ### Dashboard Registration
 
 If `DASHBOARD_URL` is set, Homelab Agent registers itself with a
@@ -1143,6 +1150,102 @@ requires `X-Agent-Token` whenever `AGENT_TOKEN` is set.
 curl -H "X-Agent-Token: your-shared-secret" http://bigboy:8123/connections
 ```
 
+## Rebuilding
+
+`POST /rebuild` runs, in the project's directory:
+
+```bash
+git pull --ff-only origin
+docker compose up -d --build
+```
+
+`--ff-only` matters: a deployment checkout that has diverged from its
+remote should stop and say so rather than merge or leave conflicts behind.
+
+### This one is not policy-bounded, and is off by default
+
+Every other mutating route works against an allowlist — which registries,
+which host paths, which compose keys — because the agent talks to the host
+daemon as root. This route deliberately punches through that: `git pull`
+runs whatever hooks the repo carries and `--build` runs whatever the
+Dockerfile says. It is arbitrary code execution on the host, by design.
+
+So it is **off unless `REBUILD_ENABLED=1`**. A host that hasn't opted in
+answers `403` and says so, and its containers report no rebuild target, so
+the dashboard shows no button for them. Every attempt is written to the
+`audit` logger either way.
+
+### What can be rebuilt
+
+Any container Compose started whose project directory is a git checkout.
+Compose records the project, the service and the working directory on
+every container it starts, so there's nothing to configure — the agent
+reads the labels and checks for a `.git`. Containers started any other
+way, or whose directory isn't a checkout, have nothing to pull and get no
+target.
+
+The working directory is read through the same host mount everything else
+here uses (`HOST_ROOT`, `/host` by default).
+
+### Rebuilding the agent itself
+
+`docker compose up -d --build` on the project holding this agent would
+kill the process running it, halfway through. So when the target project
+is the agent's own, the work is handed to a throwaway container instead:
+
+```bash
+docker run --rm -d -v /var/run/docker.sock:/var/run/docker.sock \
+  -v <project>:<project> -w <project> \
+  <this agent's image> sh -c 'git pull --ff-only origin && docker compose up -d --build'
+```
+
+It uses this agent's own image, which already carries git, the Docker CLI
+and the Compose plugin, so there is nothing extra to pull. The job comes
+back `handed_off` rather than `done`: from that point the agent is being
+replaced, so the outcome is only visible when it comes back online.
+
+### Jobs
+
+A pull and build takes minutes, so `POST /rebuild` returns a job and the
+caller polls it. One at a time per host — a second request while one is
+running is a `409`.
+
+```json
+{
+  "id": "9f2c1a4b8e70",
+  "project": "homelab",
+  "service": "homelab-agent",
+  "working_dir": "/home/zerg/homelab/homelab-agent",
+  "pull": true,
+  "replaces_self": true,
+  "state": "running",
+  "steps": [
+    {"command": "git pull --ff-only origin", "exit_code": 0, "output": "Already up to date.\n", "seconds": 0.4}
+  ],
+  "error": null
+}
+```
+
+`state` is `running`, `done`, `failed`, or `handed_off`. Each step keeps
+its last 8 KB of combined output, which is what you want when a build
+fails.
+
+| Route | |
+| --- | --- |
+| `POST /rebuild` | `{"container": "<id or name>", "pull": true}` → a job |
+| `GET /rebuild` | `{"enabled": bool, "jobs": [...]}` |
+| `GET /rebuild/{job_id}` | one job |
+
+All three require `X-Agent-Token` when `AGENT_TOKEN` is set.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `REBUILD_ENABLED` | *(off)* | `1` turns the routes on. Nothing else here does anything until it is set. |
+| `REBUILD_TIMEOUT` | `1800` | Seconds for the whole pull + build. |
+| `REBUILD_HELPER_IMAGE` | *(this agent's image)* | Image for the self-rebuild helper. |
+
 ## Dashboard Registration
 
 A homelab-dashboard instance normally has to be told about every agent it
@@ -1205,6 +1308,7 @@ homelab-agent/
 ├── main.py
 ├── connections.py
 ├── sockets.py
+├── rebuild.py
 ├── stack_backup.py
 ├── register.py
 ├── requirements.txt
