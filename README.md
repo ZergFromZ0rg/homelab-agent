@@ -254,6 +254,35 @@ docker build -t homelab-agent .
 
 ## Running the Agent
 
+### One command (from the dashboard)
+
+The dashboard's Servers tab has an **Add a node** panel with this command,
+its own address already filled in:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ZergFromZ0rg/homelab-agent/main/install.sh | sh -s -- \
+  --dashboard http://your-dashboard:8081 --rebuild
+```
+
+`install.sh` checks for Docker, clones this repo to `~/homelab-agent`,
+writes a `.env`, detects an NVIDIA card *and* whether Docker actually has
+the runtime registered, and starts the agent. It then registers itself and
+appears on the dashboard within a minute.
+
+Re-running it is safe: an existing checkout is updated rather than
+replaced, and an existing `.env` keeps every value you don't pass. A
+failed `git pull` on a re-run is reported and not fatal — a network blip
+shouldn't leave a working node stopped.
+
+| Flag | |
+| --- | --- |
+| `--dashboard URL` | register with this dashboard |
+| `--token TOKEN` | the dashboard's `API_TOKEN`, if it has one |
+| `--name NAME` | defaults to the hostname; **must match the Prometheus `job_name`** |
+| `--agent-url URL` | how the dashboard reaches this agent (default `http://<name>:8123`) |
+| `--rebuild` | allow the dashboard to pull and rebuild projects here |
+| `--dir PATH` | where to put the checkout |
+
 ### With Compose (recommended)
 
 `compose.yml` in this repo is a complete single-node deployment: the
@@ -1390,6 +1419,7 @@ homelab-agent/
 ├── sockets.py
 ├── rebuild.py
 ├── setup.sh
+├── install.sh
 ├── stack_backup.py
 ├── register.py
 ├── requirements.txt
