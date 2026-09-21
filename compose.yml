@@ -51,6 +51,11 @@ services:
       # as root on the host. See Rebuilding in the README.
       REBUILD_ENABLED: ${REBUILD_ENABLED:-}
 
+      # Harmless on a host with no NVIDIA card; they only do anything when
+      # the runtime below is nvidia.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
     volumes:
@@ -64,25 +69,21 @@ services:
       # — then add the single-file conntrack mount below.
       - /:/host:ro
 
-      # Only needed when the mount above is narrowed so it no longer
-      # includes /proc. Harmless to leave enabled either way.
+      # Uncomment for the dashboard's Connections panel when you are NOT
+      # using the whole-filesystem mount above. Left off by default because
+      # a host without the nf_conntrack module loaded would fail to start
+      # with it on.
       # - /proc/net/nf_conntrack:/host/nf_conntrack:ro
 
       # Backup working tree, so a restart doesn't re-clone the repo.
       - agent-data:/data
 
-    # ---- NVIDIA hosts ----------------------------------------------------
-    # Uncomment the line below AND add these two to the environment block
-    # above (a service can only have one `environment:` key):
-    #
-    #     NVIDIA_VISIBLE_DEVICES: all
-    #     NVIDIA_DRIVER_CAPABILITIES: all
-    #
-    # All three are needed together. With the runtime but not the variables
-    # — or the other way round — the agent still PCI-detects the card but
-    # reports no utilisation, VRAM, temperature, fan or power, and the
-    # dashboard has no way to tell you that's why.
-    # runtime: nvidia
+    # NVIDIA hosts set AGENT_RUNTIME=nvidia in .env; everything else leaves
+    # it alone. This is a variable rather than a line to uncomment because
+    # losing it on a recreate is silent: the agent still PCI-detects the
+    # card and still reports a GPU, just with no utilisation, VRAM,
+    # temperature, fan or power — and nothing says why.
+    runtime: ${AGENT_RUNTIME:-runc}
 
 volumes:
   agent-data:

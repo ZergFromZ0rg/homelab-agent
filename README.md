@@ -237,11 +237,20 @@ cp .env.example .env     # set HOST_NAME, at minimum
 docker compose up -d --build
 ```
 
+The same file works on every host; what differs goes in `.env`. On a
+machine with an NVIDIA card and the container toolkit, that means one
+extra line:
+
+```ini
+AGENT_RUNTIME=nvidia
+```
+
 Prefer this over the `docker run` lines below if you expect to recreate
 the container. A flag dropped from a long run command fails quietly — a
 missing `--gpus all` turns full GPU telemetry into a bare
 `NVIDIA GPU 10DE:xxxx` with no utilisation, VRAM or temperature, and
-nothing tells you why.
+nothing tells you why. That is also why the runtime here is a variable
+rather than a line to comment out.
 
 ### Standard Docker Host
 
