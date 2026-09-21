@@ -53,9 +53,8 @@ def test_the_container_summary_is_silent_while_off(tmp_path, monkeypatch):
     assert rebuild.summary_for(labels()) is None
 
     monkeypatch.setenv("REBUILD_ENABLED", "1")
-    assert rebuild.summary_for(labels()) == {
-        "project": "media", "service": "jellyfin"
-    }
+    summary = rebuild.summary_for(labels())
+    assert summary["project"] == "media" and summary["service"] == "jellyfin"
 
 
 # ---- what counts as a target ---------------------------------------------
@@ -326,3 +325,104 @@ def test_finished_jobs_are_kept_but_capped(tmp_path, monkeypatch):
         wait_for(rebuild.start(fake_client(), target(tmp_path))["id"])
 
     assert len(rebuild.recent()) <= 3
+
+
+# ---- remotes the helper can and can't pull from ---------------------------
+
+
+def with_remote(tmp_path, url, name="media"):
+    project = tmp_path / "srv" / name
+    (project / ".git").mkdir(parents=True)
+    (project / ".git" / "config").write_text(
+        '[core]\n\trepositoryformatversion = 0\n'
+        f'[remote "origin"]\n\turl = {url}\n\tfetch = +refs/heads/*\n'
+    )
+    return project
+
+
+def test_an_https_remote_can_be_pulled(tmp_path, monkeypatch):
+    with_remote(tmp_path, "https://github.com/zerg/homelab-agent.git")
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+
+    target = rebuild.target_for(labels())
+
+    assert target["remote"] == "https://github.com/zerg/homelab-agent.git"
+    assert target["can_pull"] is True
+
+
+def test_an_ssh_remote_cannot(tmp_path, monkeypatch):
+    """The helper has no ssh binary and none of the host user's keys, so a
+    pull fails with 'cannot run ssh' before it reaches the network."""
+    with_remote(tmp_path, "git@github.com:zerg/homelab-dashboard.git")
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+
+    assert rebuild.target_for(labels())["can_pull"] is False
+
+
+def test_the_ssh_url_scheme_is_caught_too(tmp_path, monkeypatch):
+    with_remote(tmp_path, "ssh://git@github.com/zerg/thing.git")
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+
+    assert rebuild.target_for(labels())["can_pull"] is False
+
+
+def test_a_checkout_with_no_origin_cannot_be_pulled(tmp_path, monkeypatch):
+    project = tmp_path / "srv" / "media"
+    (project / ".git").mkdir(parents=True)
+    (project / ".git" / "config").write_text("[core]\n\tbare = false\n")
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+
+    target = rebuild.target_for(labels())
+
+    assert target["remote"] is None and target["can_pull"] is False
+
+
+def test_only_the_origin_remote_is_read(tmp_path, monkeypatch):
+    project = tmp_path / "srv" / "media"
+    (project / ".git").mkdir(parents=True)
+    (project / ".git" / "config").write_text(
+        '[remote "upstream"]\n\turl = git@github.com:someone/else.git\n'
+        '[remote "origin"]\n\turl = https://github.com/zerg/mine.git\n'
+    )
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+
+    assert rebuild.target_for(labels())["remote"] == "https://github.com/zerg/mine.git"
+
+
+def test_an_unreadable_git_config_is_not_fatal(tmp_path, monkeypatch):
+    project = tmp_path / "srv" / "media"
+    (project / ".git").mkdir(parents=True)  # a .git with no config at all
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+
+    target = rebuild.target_for(labels())
+
+    assert target is not None and target["can_pull"] is False
+
+
+def test_a_pull_that_cannot_work_is_refused_up_front(tmp_path, monkeypatch):
+    """Better than letting the helper fail on 'cannot run ssh'."""
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    target = {
+        "project": "homelab-dashboard", "service": "dashboard-web",
+        "working_dir": "/home/zerg/homelab-dashboard",
+        "path": str(tmp_path), "remote": "git@github.com:zerg/x.git",
+        "can_pull": False,
+    }
+
+    with pytest.raises(ValueError, match="no ssh keys"):
+        rebuild.start(fake_client(), target)
+
+    # The same target builds fine without the pull.
+    finished = wait_for(rebuild.start(fake_client(), target, pull=False)["id"])
+    assert finished["state"] == "done"
+
+
+def test_the_summary_tells_the_dashboard_whether_a_pull_will_work(tmp_path, monkeypatch):
+    with_remote(tmp_path, "git@github.com:zerg/x.git")
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    monkeypatch.setenv("REBUILD_ENABLED", "1")
+
+    summary = rebuild.summary_for(labels())
+
+    assert summary["can_pull"] is False
+    assert summary["remote"] == "git@github.com:zerg/x.git"

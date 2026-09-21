@@ -51,6 +51,43 @@ def host_path(absolute: str) -> Path:
     return Path(HOST_ROOT, absolute.lstrip("/"))
 
 
+# Transports the helper can actually attempt. It has git and CA
+# certificates; it does not have an ssh binary, and it has none of the
+# host user's keys or credential helpers, so an ssh remote fails with
+# "cannot run ssh: No such file or directory" before it reaches the
+# network. A private https remote will still fail on credentials — that
+# one can't be told apart from a public one without trying.
+PULLABLE_SCHEMES = ("http://", "https://")
+
+
+def origin_url(git_dir: Path) -> str | None:
+    """The origin remote from a checkout's config, read directly so this
+    works without shelling out to git."""
+    try:
+        config = (git_dir / "config").read_text(errors="replace")
+    except OSError:
+        return None
+
+    in_origin = False
+
+    for line in config.splitlines():
+        stripped = line.strip()
+
+        if stripped.startswith("["):
+            in_origin = stripped.replace(" ", "").lower() == '[remote"origin"]'
+            continue
+
+        if in_origin and stripped.lower().startswith("url"):
+            _, _, value = stripped.partition("=")
+            return value.strip() or None
+
+    return None
+
+
+def can_pull(url: str | None) -> bool:
+    return bool(url) and url.lower().startswith(PULLABLE_SCHEMES)
+
+
 def target_for(labels: dict | None) -> dict | None:
     """What could be rebuilt for a container, from its Compose labels.
 
@@ -75,11 +112,15 @@ def target_for(labels: dict | None) -> dict | None:
     except OSError:
         return None
 
+    remote = origin_url(local / ".git")
+
     return {
         "project": project,
         "service": labels.get("com.docker.compose.service"),
         "working_dir": working_dir,
         "path": str(local),
+        "remote": remote,
+        "can_pull": can_pull(remote),
     }
 
 
@@ -162,6 +203,14 @@ def helper_image(client) -> str:
 
 def start(client, target: dict, *, pull: bool = True) -> dict:
     """Kick off a rebuild. Returns the job immediately."""
+    if pull and not target.get("can_pull", True):
+        raise ValueError(
+            f"can't pull {target['project']}: its origin is "
+            f"{target.get('remote') or 'not set'}, and the rebuild helper "
+            "has no ssh keys. Use an https remote, or rebuild without "
+            "pulling."
+        )
+
     with _lock:
         if _running():
             raise RuntimeError("a rebuild is already running on this host")
@@ -336,4 +385,13 @@ def summary_for(labels: dict | None) -> dict | None:
     if target is None:
         return None
 
-    return {"project": target["project"], "service": target.get("service")}
+    return {
+        "project": target["project"],
+        "service": target.get("service"),
+        "remote": target["remote"],
+        # False for an ssh remote: the helper has no ssh binary and none of
+        # your keys, so a pull would fail before reaching the network. The
+        # dashboard uses this to ask for a build without a pull rather than
+        # offering one that can't work.
+        "can_pull": target["can_pull"],
+    }

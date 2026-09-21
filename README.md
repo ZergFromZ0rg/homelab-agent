@@ -1253,6 +1253,30 @@ reports an error.
 owns it on the host, this runs as root, and git has refused to touch a
 repo owned by another user since 2.35.2.
 
+### Remotes it can pull from
+
+The helper has git and CA certificates. It does **not** have an `ssh`
+binary, or any of the host user's keys or credential helpers. So an `ssh`
+remote (`git@github.com:you/thing.git` or `ssh://…`) fails with `cannot
+run ssh: No such file or directory` before it reaches the network.
+
+Rather than let that happen, every target reports the remote it found and
+whether it can be pulled:
+
+```json
+{"project": "homelab-dashboard", "service": "dashboard-web",
+ "remote": "git@github.com:zerg/homelab-dashboard.git", "can_pull": false}
+```
+
+`POST /rebuild` with `pull: true` against such a target is a `400` naming
+the remote, and the dashboard's button sends `pull: false` for it
+automatically and says why. The project still builds — from whatever is
+checked out — it just won't fetch first. Switch the remote to `https://`
+if you want the pull.
+
+A *private* `https` remote will still fail, on credentials rather than
+transport; that one can't be told apart from a public one without trying.
+
 **Rebuilding the agent's own project** is the one case that can't report
 back — `compose up` kills the process waiting for it. That job returns
 `handed_off` rather than `done`, and the helper removes itself, since

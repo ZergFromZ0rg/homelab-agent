@@ -887,6 +887,10 @@ def start_rebuild(
 
     try:
         return rebuild.start(client, target, pull=body.get("pull", True))
+    except ValueError as error:
+        # A pull that can't work on this remote. Naming the remote makes it
+        # obvious why, which "cannot run ssh" never did.
+        raise HTTPException(status_code=400, detail=str(error))
     except RuntimeError as error:
         raise HTTPException(status_code=409, detail=str(error))
 

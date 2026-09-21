@@ -66,7 +66,11 @@ def test_a_container_without_a_git_checkout_is_refused(client, monkeypatch):
 
 def test_starting_a_rebuild_returns_a_job_to_poll(client, monkeypatch, tmp_path):
     monkeypatch.setenv("REBUILD_ENABLED", "1")
-    (tmp_path / "srv" / "media" / ".git").mkdir(parents=True)
+    git_dir = tmp_path / "srv" / "media" / ".git"
+    git_dir.mkdir(parents=True)
+    git_dir.joinpath("config").write_text(
+        '[remote "origin"]\n\turl = https://github.com/zerg/media.git\n'
+    )
     monkeypatch.setattr(main, "get_container_or_404", lambda cid: a_container())
 
     helper = mock.MagicMock()
@@ -112,3 +116,29 @@ def test_every_rebuild_route_is_token_gated(client, monkeypatch):
 
     headers = {"X-Agent-Token": "sekret"}
     assert client.get("/rebuild", headers=headers).status_code == 200
+
+
+def test_a_pull_from_an_ssh_remote_is_a_readable_400(client, monkeypatch, tmp_path):
+    """What the dashboard repo actually hit: the old failure was the
+    helper dying on "cannot run ssh" with no explanation."""
+    monkeypatch.setenv("REBUILD_ENABLED", "1")
+    git_dir = tmp_path / "srv" / "media" / ".git"
+    git_dir.mkdir(parents=True)
+    git_dir.joinpath("config").write_text(
+        '[remote "origin"]\n\turl = git@github.com:zerg/media.git\n'
+    )
+    monkeypatch.setattr(main, "get_container_or_404", lambda cid: a_container())
+
+    resp = client.post("/rebuild", json={"container": "jellyfin"})
+
+    assert resp.status_code == 400
+    assert "ssh keys" in resp.json()["detail"]
+
+    # Without the pull it starts normally.
+    helper = mock.MagicMock()
+    helper.wait.return_value = {"StatusCode": 0}
+    helper.logs.return_value = b""
+    main.client.containers.run.return_value = helper
+
+    ok = client.post("/rebuild", json={"container": "jellyfin", "pull": False})
+    assert ok.status_code == 200
