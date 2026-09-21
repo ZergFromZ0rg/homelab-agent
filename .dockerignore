@@ -1,0 +1,15 @@
+# The image copies its modules in by name, so this is mostly about not
+# shipping the build context around.
+
+.git
+.gitignore
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+tests
+README.md
+.env
+.env.example
+compose.yml
+compose.override.yml

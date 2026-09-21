@@ -276,23 +276,53 @@ def get_drm_gpu_stats():
 
 
 def get_gpu_stats():
-    gpus = get_nvidia_gpu_stats()
+    """Every GPU on this host, from whichever source can see it.
+
+    ``nvidia-smi`` gives the full picture — utilisation, VRAM, temperature,
+    power, fan — for every NVIDIA card, so a multi-GPU or SLI box is
+    covered by it alone. It is only present when the container has the
+    NVIDIA runtime.
+
+    The DRM scan reads ``/sys/class/drm``, which Docker mounts into every
+    container by default, so AMD and Intel cards need no configuration at
+    all. It costs detail: vendor, PCI id and temperature, no utilisation.
+
+    Both run. Previously the DRM scan was only a fallback, which meant a
+    host with an NVIDIA card *and* an AMD one reported only the NVIDIA
+    ones. Cards nvidia-smi already described are dropped from the DRM
+    side so they aren't listed twice.
+    """
+    nvidia = get_nvidia_gpu_stats() or []
+    drm = get_drm_gpu_stats() or []
+
+    # nvidia-smi has already described every NVIDIA card in full detail.
+    extra = [gpu for gpu in drm if gpu["vendor"] != "nvidia"] if nvidia else drm
+
+    gpus = nvidia + extra
 
     if not gpus:
-        gpus = get_drm_gpu_stats()
+        return {"available": False, "count": 0, "devices": []}
 
-    if not gpus:
-        return {
-            "available": False,
-            "count": 0,
-            "devices": [],
-        }
+    # An NVIDIA card that only the DRM scan can see means this container
+    # has no NVIDIA runtime: the card is there, but everything worth
+    # knowing about it isn't. That used to be indistinguishable from a
+    # quiet GPU, so it went unnoticed for weeks at a time.
+    runtime_missing = not nvidia and any(gpu["vendor"] == "nvidia" for gpu in drm)
 
-    return {
-        "available": True,
-        "count": len(gpus),
-        "devices": gpus,
-    }
+    for gpu in gpus:
+        if runtime_missing and gpu["vendor"] == "nvidia":
+            gpu["runtime_missing"] = True
+
+    stats = {"available": True, "count": len(gpus), "devices": gpus}
+
+    if runtime_missing:
+        stats["hint"] = (
+            "NVIDIA card detected but this container has no NVIDIA runtime, "
+            "so utilisation, VRAM, power and fan are unavailable. Set "
+            "AGENT_RUNTIME=nvidia (compose) or --gpus all (docker run)."
+        )
+
+    return stats
 
 
 def build_container_snapshot():

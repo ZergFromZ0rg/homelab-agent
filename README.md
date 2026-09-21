@@ -92,7 +92,37 @@ appears on the dashboard without editing any dashboard configuration. See
 
 ## GPU Autodetection
 
-Homelab Agent automatically searches for GPUs available to the container instead of assuming a specific GPU vendor.
+Homelab Agent reports every GPU it can see, from two sources at once:
+
+- **`nvidia-smi`** — utilisation, VRAM, temperature, power and fan, one
+  entry per card, so a multi-GPU or SLI host is covered by this alone. It
+  is only present inside the container when the NVIDIA runtime is
+  (`AGENT_RUNTIME=nvidia`, or `--gpus all`).
+- **`/sys/class/drm`** — vendor, PCI id and temperature for AMD, Intel and
+  NVIDIA cards alike. Docker mounts `/sys` into every container, so **AMD
+  and Intel GPUs need no configuration at all.**
+
+Both run, and NVIDIA cards that `nvidia-smi` already described are dropped
+from the DRM results rather than listed twice. A host with an NVIDIA card
+*and* an AMD one reports both — it used to report only the NVIDIA ones,
+because the DRM scan was a fallback that never ran once `nvidia-smi`
+answered.
+
+**If an NVIDIA card is visible only to the DRM scan**, the container has
+no NVIDIA runtime. That is a specific, fixable state, and it says so
+rather than leaving you with a GPU block full of blanks:
+
+```json
+{
+  "available": true, "count": 1,
+  "hint": "NVIDIA card detected but this container has no NVIDIA runtime, so utilisation, VRAM, power and fan are unavailable. Set AGENT_RUNTIME=nvidia (compose) or --gpus all (docker run).",
+  "devices": [{"vendor": "nvidia", "name": "NVIDIA GPU 10DE:2187", "runtime_missing": true, "temperature_c": 41.0, "utilization_percent": null}]
+}
+```
+
+The dashboard shows that hint on the host card. Before it existed, the
+only symptom was a card reporting no numbers, which looks exactly like an
+idle one — a `--gpus` flag lost on a recreate went unnoticed for weeks.
 
 The API exposes GPU information using a vendor-neutral structure:
 
@@ -233,17 +263,16 @@ free), a named volume for the backup working tree, and every environment
 variable wired to a `.env`.
 
 ```bash
-cp .env.example .env     # set HOST_NAME, at minimum
+./setup.sh
 docker compose up -d --build
 ```
 
-The same file works on every host; what differs goes in `.env`. On a
-machine with an NVIDIA card and the container toolkit, that means one
-extra line:
+`setup.sh` writes the `.env`: it detects the GPU, defaults `HOST_NAME` to
+the machine's hostname, and asks about the dashboard and the tokens,
+keeping any answers already in the file. Re-run it any time. Or copy
+`.env.example` and fill it in by hand — it's the same four or five lines.
 
-```ini
-AGENT_RUNTIME=nvidia
-```
+The same `compose.yml` works on every host; what differs goes in `.env`.
 
 Prefer this over the `docker run` lines below if you expect to recreate
 the container. A flag dropped from a long run command fails quietly — a
@@ -1318,6 +1347,7 @@ homelab-agent/
 ├── connections.py
 ├── sockets.py
 ├── rebuild.py
+├── setup.sh
 ├── stack_backup.py
 ├── register.py
 ├── requirements.txt
