@@ -509,3 +509,110 @@ def test_a_failing_docker_client_does_not_take_the_table_with_it(tmp_path, monke
     assert result["available"] is True
     assert result["attributed"] is False
     assert result["peers"][0]["container"] is None
+
+
+# ---- process names for host traffic ---------------------------------------
+
+
+def test_host_flows_get_a_process_name(tmp_path, monkeypatch):
+    """The conntrack row belongs to no container, so it falls through to
+    the socket tables: 10.0.0.5:51234 -> 1.1.1.1:443."""
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+
+    monkeypatch.setattr(
+        connections.sockets, "read_sockets",
+        lambda *a, **k: [{
+            "proto": "tcp", "local_ip": "10.0.0.5", "local_port": 51234,
+            "remote_ip": "1.1.1.1", "remote_port": 443, "inode": 4242,
+        }],
+    )
+    monkeypatch.setattr(
+        connections.sockets, "owners",
+        lambda wanted, *a, **k: {4242: {"pid": 991, "process": "curl"}},
+    )
+
+    result = connections.snapshot("bigboy")
+
+    assert result["processes"] is True
+    assert result["peers"][0]["process"] == "curl"
+    assert result["peers"][0]["pid"] == 991
+
+
+def test_containers_are_not_looked_up_in_the_socket_tables(tmp_path, monkeypatch):
+    """Already named by attribution — no reason to walk every process."""
+    table = tmp_path / "nf_conntrack"
+    table.write_text(INBOUND)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+
+    called = []
+    monkeypatch.setattr(
+        connections.sockets, "read_sockets",
+        lambda *a, **k: called.append(1) or [],
+    )
+
+    class FakeClient:
+        containers = type("C", (), {"list": staticmethod(lambda: [])})()
+
+    monkeypatch.setattr(connections, "container_map", lambda client: CONTAINERS)
+
+    result = connections.snapshot("bigboy", FakeClient())
+
+    assert result["peers"][0]["container"] == "jellyfin"
+    assert result["peers"][0]["process"] is None
+    assert called == []
+
+
+def test_an_unmatched_host_flow_keeps_a_null_process(tmp_path, monkeypatch):
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+
+    monkeypatch.setattr(
+        connections.sockets, "read_sockets",
+        lambda *a, **k: [{
+            "proto": "tcp", "local_ip": "10.0.0.5", "local_port": 9,
+            "remote_ip": "9.9.9.9", "remote_port": 9, "inode": 1,
+        }],
+    )
+    monkeypatch.setattr(connections.sockets, "owners", lambda *a, **k: {})
+
+    peer = connections.snapshot("bigboy")["peers"][0]
+    assert peer["process"] is None and peer["pid"] is None
+
+
+def test_unreadable_socket_tables_report_processes_false(tmp_path, monkeypatch):
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+    monkeypatch.setattr(connections.sockets, "read_sockets", lambda *a, **k: [])
+
+    result = connections.snapshot("bigboy")
+
+    assert result["processes"] is False
+    assert result["available"] is True  # the table itself is still fine
+
+
+def test_process_naming_can_be_switched_off(tmp_path, monkeypatch):
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+    monkeypatch.setenv("CONNECTIONS_PROCESSES", "0")
+
+    called = []
+    monkeypatch.setattr(
+        connections.sockets, "read_sockets", lambda *a, **k: called.append(1) or []
+    )
+
+    assert connections.snapshot("bigboy")["processes"] is False
+    assert called == []
+
+
+def test_the_representative_flow_does_not_leak_into_the_response(tmp_path, monkeypatch):
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+    monkeypatch.setattr(connections.sockets, "read_sockets", lambda *a, **k: [])
+
+    assert "_flow" not in connections.snapshot("bigboy")["peers"][0]

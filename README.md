@@ -1041,9 +1041,45 @@ would report a 4 GB upload as a 4 GB download.
 so `jellyfin → postgres` reads as such.
 
 Traffic that belongs to no container — something on the host itself — keeps
-its raw endpoints with every attributed field `null`. `"attributed":
-false` at the top level means the pass didn't run at all (the Docker
+its raw endpoints with every attributed field `null`, and is instead
+matched to the **process** that owns it (below). `"attributed": false` at
+the top level means the container pass didn't run at all (the Docker
 daemon was unreachable); the table is still returned.
+
+### Process names, for what isn't a container
+
+Rows no container claimed get `process` and `pid`, joined through the
+socket inode: `/proc/net/{tcp,tcp6,udp,udp6}` gives the socket behind a
+local port, and `/proc/<pid>/fd/*` says which process is holding it.
+
+```json
+{
+  "proto": "tcp", "src": "192.168.1.10", "dst": "140.82.121.4",
+  "dport": 443, "flows": 2, "orig_bytes": 9000, "reply_bytes": 120000,
+  "container": null, "direction": null,
+  "process": "sshd", "pid": 812
+}
+```
+
+**No `pid: host` is needed** — the same host filesystem mount everything
+else here uses is enough. A bind-mounted procfs exposes every host PID
+regardless of this container's own PID namespace, and reading an fd
+symlink is just a readlink. As with conntrack, the socket tables are read
+as PID 1's copy, because `/proc/net` is a symlink to `/proc/self/net` and
+would otherwise give this container's empty tables.
+
+`"processes": false` means the lookup couldn't run: the socket tables
+weren't readable, or `CONNECTIONS_PROCESSES=0`. The conntrack table is
+returned either way.
+
+The fd walk is the expensive part of this endpoint — it reads every
+process's open file descriptors. It therefore runs **only when there are
+unattributed rows to name**, so on a host where everything is
+containerised nothing is read at all, and it stops as soon as every inode
+it is looking for is accounted for.
+
+Only established TCP sockets are considered. A listening socket has no
+peer, so there is no flow for it to explain.
 
 When the table isn't readable the route still answers `200`, with the fix:
 
@@ -1057,10 +1093,14 @@ When the table isn't readable the route still answers `200`, with the fix:
 
 ### What it can't tell you
 
-Which *process* owns a flow, for traffic that isn't a container's.
-conntrack doesn't record it; that needs the socket tables and `pid: host`.
+Which process inside a container owns a flow — the container is named, but
+not the process within it, whose sockets live in its own namespace.
 Per-container throughput totals are already on each container in
 `GET /containers`.
+
+A flow whose socket has already closed also can't be named: conntrack
+keeps an entry for a while after the socket is gone, so a short-lived
+connection can outlive its inode.
 
 ### Configuration
 
@@ -1070,6 +1110,8 @@ Per-container throughput totals are already on each container in
 | `CONNTRACK_FILE` | unset | Explicit path, tried before `/host/nf_conntrack`, `/host/proc/1/net/nf_conntrack`, `/proc/net/nf_conntrack`. |
 | `CONNECTIONS_MAX_PEERS` | `50` | Rows returned. The rest are still counted in `conversations_total`. |
 | `CONNECTIONS_CACHE` | `5` | Seconds a parse is reused. A busy host carries tens of thousands of flows. |
+| `CONNECTIONS_PROCESSES` | `1` | `0` skips the process-name lookup and its walk of `/proc/<pid>/fd`. |
+| `HOST_PROC` | unset | Explicit path to the host's `/proc`, tried before `$HOST_ROOT/proc`. |
 
 ### Running it
 
@@ -1162,6 +1204,7 @@ process for adding a machine — no dashboard redeploy or config edit.
 homelab-agent/
 ├── main.py
 ├── connections.py
+├── sockets.py
 ├── stack_backup.py
 ├── register.py
 ├── requirements.txt

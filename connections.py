@@ -48,6 +48,7 @@ import re
 import time
 from pathlib import Path
 
+import sockets
 from log import log
 
 # This container's own conntrack table. It exists and is readable, but in
@@ -275,6 +276,13 @@ def aggregate(flows: list[dict], limit: int, index: dict | None = None) -> tuple
                 **{k: v for k, v in attributed.items() if not k.endswith("_bytes")},
                 "rx_bytes": None,
                 "tx_bytes": None,
+                # Filled in for unattributed rows from the socket tables.
+                "process": None,
+                "pid": None,
+                # One representative flow, for the socket lookup. Every
+                # flow in a group shares the key it matches on. Stripped
+                # before the row leaves this module.
+                "_flow": flow,
             }
 
         row["flows"] += 1
@@ -462,6 +470,48 @@ def snapshot(host: str = "", client=None, *, now: float | None = None) -> dict:
     return result
 
 
+def _name_host_processes(peers: list[dict]) -> bool:
+    """Fill in ``process``/``pid`` on the rows no container claimed.
+
+    Mutates ``peers`` and reports whether it managed to run at all. Only
+    the rows still unattributed are looked up, because the lookup walks
+    every process's open file descriptors — on a host where everything is
+    containerised there is nothing to do and nothing is read.
+    """
+    if not sockets.enabled():
+        return False
+
+    unclaimed = [p for p in peers if not p.get("container")]
+    if not unclaimed:
+        return True
+
+    try:
+        index = sockets.build_index(sockets.read_sockets())
+        if not index["by_port"]:
+            return False
+
+        wanted, per_row = set(), {}
+        for row in unclaimed:
+            inode = sockets.match(row["_flow"], index)
+            if inode is not None:
+                per_row[id(row)] = inode
+                wanted.add(inode)
+
+        found = sockets.owners(wanted)
+
+        for row in unclaimed:
+            owner = found.get(per_row.get(id(row)))
+            if owner:
+                row["process"] = owner["process"]
+                row["pid"] = owner["pid"]
+
+        return True
+
+    except OSError as error:
+        log.debug("process names unavailable: %s", error)
+        return False
+
+
 def _build(host: str, client=None) -> dict:
     base = {"host": host, "updated_at": time.time(), "available": False}
 
@@ -513,6 +563,9 @@ def _build(host: str, client=None) -> dict:
             log.warning("container attribution unavailable: %s", error)
 
     peers, total = aggregate(flows, max_peers(), index)
+    processes = _name_host_processes(peers)
+    for row in peers:
+        row.pop("_flow", None)
 
     return {
         **base,
@@ -523,6 +576,7 @@ def _build(host: str, client=None) -> dict:
         "conversations_total": total,
         "truncated": total > len(peers),
         "attributed": index is not None,
+        "processes": processes,
         "peers": peers,
     }
 
