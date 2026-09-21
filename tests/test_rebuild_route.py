@@ -56,7 +56,7 @@ def test_a_container_is_required(client, monkeypatch):
 
 def test_a_container_without_a_git_checkout_is_refused(client, monkeypatch):
     monkeypatch.setenv("REBUILD_ENABLED", "1")
-    monkeypatch.setattr(main, "get_container_or_404", lambda cid: a_container())
+    monkeypatch.setattr(main, "find_container_or_404", lambda cid: a_container())
 
     resp = client.post("/rebuild", json={"container": "jellyfin"})
 
@@ -71,7 +71,7 @@ def test_starting_a_rebuild_returns_a_job_to_poll(client, monkeypatch, tmp_path)
     git_dir.joinpath("config").write_text(
         '[remote "origin"]\n\turl = https://github.com/zerg/media.git\n'
     )
-    monkeypatch.setattr(main, "get_container_or_404", lambda cid: a_container())
+    monkeypatch.setattr(main, "find_container_or_404", lambda cid: a_container())
 
     helper = mock.MagicMock()
     helper.short_id = "helper01"
@@ -127,7 +127,7 @@ def test_a_pull_from_an_ssh_remote_is_a_readable_400(client, monkeypatch, tmp_pa
     git_dir.joinpath("config").write_text(
         '[remote "origin"]\n\turl = git@github.com:zerg/media.git\n'
     )
-    monkeypatch.setattr(main, "get_container_or_404", lambda cid: a_container())
+    monkeypatch.setattr(main, "find_container_or_404", lambda cid: a_container())
 
     resp = client.post("/rebuild", json={"container": "jellyfin"})
 
@@ -142,3 +142,44 @@ def test_a_pull_from_an_ssh_remote_is_a_readable_400(client, monkeypatch, tmp_pa
 
     ok = client.post("/rebuild", json={"container": "jellyfin", "pull": False})
     assert ok.status_code == 200
+
+
+def test_the_agents_own_container_can_be_rebuilt(client, monkeypatch, tmp_path):
+    """Protection stops the control routes stopping or deleting the agent.
+    It must not stop /rebuild — replacing the agent with a newer build is
+    the whole reason this route exists."""
+    monkeypatch.setenv("REBUILD_ENABLED", "1")
+    monkeypatch.setattr(main, "PROTECTED_CONTAINERS", {"homelab-agent"})
+
+    git_dir = tmp_path / "srv" / "agent" / ".git"
+    git_dir.mkdir(parents=True)
+    git_dir.joinpath("config").write_text(
+        '[remote "origin"]\n\turl = https://github.com/zerg/homelab-agent.git\n'
+    )
+
+    agent = a_container(project="homelab-agent", working_dir="/srv/agent")
+    agent.name = "homelab-agent"
+    monkeypatch.setattr(main, "find_container_or_404", lambda cid: agent)
+
+    helper = mock.MagicMock()
+    helper.wait.return_value = {"StatusCode": 0}
+    helper.logs.return_value = b""
+    main.client.containers.run.return_value = helper
+
+    resp = client.post("/rebuild", json={"container": "homelab-agent"})
+
+    assert resp.status_code == 200
+    assert resp.json()["project"] == "homelab-agent"
+
+
+def test_the_control_routes_still_refuse_a_protected_container(client, monkeypatch):
+    monkeypatch.setattr(main, "PROTECTED_CONTAINERS", {"homelab-agent"})
+
+    protected = mock.MagicMock()
+    protected.name = "homelab-agent"
+    monkeypatch.setattr(main.client.containers, "get", lambda cid: protected)
+
+    resp = client.post("/containers/homelab-agent/stop")
+
+    assert resp.status_code == 403
+    assert "protected" in resp.json()["detail"]

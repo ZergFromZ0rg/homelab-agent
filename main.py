@@ -873,7 +873,9 @@ def start_rebuild(
     if not container_id:
         raise HTTPException(status_code=400, detail="container is required")
 
-    container = get_container_or_404(container_id)
+    # Not get_container_or_404: that refuses protected containers, and the
+    # agent's own is protected. Rebuilding it is the point.
+    container = find_container_or_404(container_id)
     target = rebuild.target_for(container.labels)
 
     if target is None:
@@ -945,15 +947,28 @@ def backup_run():
     return {"success": True, "triggered": True}
 
 
-def get_container_or_404(container_id: str):
+def find_container_or_404(container_id: str):
+    """Look one up, protected or not."""
     try:
-        container = client.containers.get(container_id)
+        return client.containers.get(container_id)
 
     except docker.errors.NotFound:
         raise HTTPException(
             status_code=404,
             detail="Container not found",
         )
+
+
+def get_container_or_404(container_id: str):
+    """Look one up for the control routes, which must not touch a
+    protected container.
+
+    Protection means "don't stop, restart or delete this" — it is what
+    keeps the agent from killing itself on request. It deliberately does
+    *not* cover /rebuild, whose entire purpose for the agent's own
+    container is to replace it with a newer build.
+    """
+    container = find_container_or_404(container_id)
 
     if container.name in PROTECTED_CONTAINERS:
         raise HTTPException(
