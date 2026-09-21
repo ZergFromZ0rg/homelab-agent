@@ -17,6 +17,7 @@ from register import Registrar
 import connections
 import deploy
 import rebuild
+import version
 from deploy import CreateContainerRequest, PolicyError
 from stack_deploy import (
     CreateStackRequest,
@@ -792,11 +793,50 @@ def startup_event():
     stack_backup.start()
     registrar.start()
 
+def _own_working_dir() -> str | None:
+    """This agent's own checkout, as seen from inside the container.
+
+    Same labels the rebuild targets come from — if Compose started this
+    agent from a git checkout, that's the source it was built from and the
+    one a rebuild would pull.
+    """
+    own_id = os.getenv("HOSTNAME", "").strip()
+    if not own_id:
+        return None
+
+    try:
+        labels = (client.containers.get(own_id).labels or {})
+    except Exception as error:  # noqa: BLE001
+        log.debug("could not read this agent's own labels: %s", error)
+        return None
+
+    working_dir = labels.get("com.docker.compose.project.working_dir")
+    if not working_dir:
+        return None
+
+    return str(rebuild.host_path(working_dir))
+
+
 @app.get("/")
 def root():
     return {
         "status": "homelab agent online",
         "host": HOST_NAME,
+        "version": version.report(
+            client, _own_working_dir(), os.getenv("HOSTNAME", "").strip()
+        ),
+    }
+
+
+@app.get("/version")
+def agent_version():
+    """What this agent is running and whether it's current. Same block as
+    ``GET /`` carries, on its own for pollers that only want this."""
+    return {
+        "host": HOST_NAME,
+        **version.report(
+            client, _own_working_dir(), os.getenv("HOSTNAME", "").strip()
+        ),
     }
 
 
