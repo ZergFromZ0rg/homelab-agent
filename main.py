@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from log import log, audit
 from stack_backup import StackBackup
 from register import Registrar
+import connections
 import deploy
 from deploy import CreateContainerRequest, PolicyError
 from stack_deploy import (
@@ -812,6 +813,20 @@ stack_backup = StackBackup(
     host_name=HOST_NAME,
     inventory_provider=lambda: build_inventory(sizes=True),
 )
+
+
+@app.get("/connections")
+def get_connections(x_agent_token: str | None = Header(default=None)):
+    """Who this host is talking to, from the kernel conntrack table.
+
+    Token-gated even though it only reads — unlike /containers and
+    /inventory, this says which remote hosts this box reaches and when,
+    which is a different class of thing to hand out. Returns
+    ``available: false`` with a reason when the table isn't mounted, so a
+    host that hasn't opted in reports that rather than erroring.
+    """
+    require_agent_token(x_agent_token)
+    return connections.snapshot(HOST_NAME)
 
 
 @app.get("/backup")

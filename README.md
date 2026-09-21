@@ -68,7 +68,153 @@ Homelab Agent reports a rebuild manifest of the host's Docker named volumes, ima
 
 On a schedule (default every 12 hours), Homelab Agent discovers the Compose projects on its host, copies their definition files with secrets redacted, writes `inventory.json`, and pushes `machines/<HOST_NAME>/` to a private GitHub repository. Each agent only writes its own host folder, so every machine in a fleet can back up to one repo. See [Configuration Backup](#configuration-backup-1) below.
 
-### Dashboard Registration
+### Network Connections
+
+`GET /connections` reports who this host is actually talking to — remote
+address, port, protocol and, when the kernel is counting, bytes in each
+direction — by reading the conntrack table. Off until you mount that table
+in; see [Network Connections](#network-connections-1) below.
+
+### Network Connections
+
+Per-host and per-container throughput answers *how much*. This answers
+*who to*.
+
+`GET /connections` parses the kernel's conntrack table
+(`/proc/net/nf_conntrack`) and returns one row per conversation — grouped
+by protocol, both addresses and destination port, so a client holding six
+hundred connections open reads as one line rather than six hundred.
+
+**This needs two things the host doesn't do by default.**
+
+### 1. Mount the conntrack table
+
+conntrack is per network namespace. The agent runs in its own, where the
+table is all but empty, so the host's has to be mounted in. Narrowest
+first:
+
+```bash
+-v /proc/net/nf_conntrack:/host/nf_conntrack:ro
+```
+
+If that reads empty on your kernel, mount the host's procfs and read
+init's namespace instead — what node_exporter does with `--path.procfs`:
+
+```bash
+-v /proc:/host/proc:ro
+-e CONNTRACK_FILE=/host/proc/1/net/nf_conntrack
+```
+
+That second form hands this container every host process's `cmdline` and
+`environ`, which can contain other services' secrets. Prefer the first.
+
+Note that neither form changes how the agent itself is exposed — it keeps
+its own network namespace and its `-p 8123:8123` mapping, so the Tailscale
+binding advice in [Security](#security) still applies as written. Running
+the agent with `network_mode: host` would also work and is *not*
+recommended: it would rewrite that whole story for one read-only route.
+
+### 2. Turn on byte accounting
+
+Without this the kernel tracks flows but counts no bytes, and every row
+comes back with `null` volumes:
+
+```bash
+sudo sysctl -w net.netfilter.nf_conntrack_acct=1
+echo 'net.netfilter.nf_conntrack_acct=1' | sudo tee /etc/sysctl.d/99-conntrack-acct.conf
+```
+
+The response says whether this is on (`"accounting": true`), so the
+dashboard can tell you to flip it rather than showing a table of zeros.
+
+### Response
+
+```json
+{
+  "host": "bigboy",
+  "updated_at": 1758470000.0,
+  "available": true,
+  "source": "/host/nf_conntrack",
+  "accounting": true,
+  "flows_total": 3412,
+  "conversations_total": 214,
+  "truncated": true,
+  "peers": [
+    {
+      "proto": "tcp",
+      "family": "ipv4",
+      "src": "192.168.1.40",
+      "dst": "192.168.1.10",
+      "dport": 8096,
+      "flows": 4,
+      "orig_bytes": 51200,
+      "reply_bytes": 4294967296,
+      "orig_packets": 620,
+      "reply_packets": 3010000,
+      "states": ["ESTABLISHED"],
+      "container": null,
+      "container_id": null
+    }
+  ]
+}
+```
+
+`src`/`dst` are the endpoints as conntrack records them: `src` opened the
+connection. `orig_bytes` flowed `src` → `dst`, `reply_bytes` came back.
+Which end is *this host* isn't knowable from the table alone — guessing it
+from address ranges gets inbound LAN connections backwards — so the rows
+are reported as-is. `container` and `container_id` are placeholders for the
+attribution pass that maps flows onto containers by Docker subnet and
+published port; they are always `null` today.
+
+When the table isn't readable the route still answers `200`, with the fix:
+
+```json
+{
+  "host": "bigboy",
+  "available": false,
+  "reason": "conntrack table not readable — mount the host's in (-v /proc/net/nf_conntrack:/host/nf_conntrack:ro) or set CONNTRACK_FILE"
+}
+```
+
+### What it can't tell you
+
+Which *process* owns a flow. conntrack doesn't record it; that needs the
+socket tables and `pid: host`. Per-container throughput totals are already
+on each container in `GET /containers`.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CONNECTIONS_ENABLED` | `1` | `0` turns the route off entirely. |
+| `CONNTRACK_FILE` | unset | Explicit path, tried before `/host/nf_conntrack`, `/host/proc/1/net/nf_conntrack`, `/proc/net/nf_conntrack`. |
+| `CONNECTIONS_MAX_PEERS` | `50` | Rows returned. The rest are still counted in `conversations_total`. |
+| `CONNECTIONS_CACHE` | `5` | Seconds a parse is reused. A busy host carries tens of thousands of flows. |
+
+### Run command (with connections)
+
+```bash
+docker run -d \
+  --name homelab-agent \
+  --restart unless-stopped \
+  -p 8123:8123 \
+  -e HOST_NAME=bigboy \
+  -e AGENT_TOKEN=your-shared-secret \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /proc/net/nf_conntrack:/host/nf_conntrack:ro \
+  homelab-agent
+```
+
+Unlike `/containers` and `/inventory`, **this route is token-gated** — a
+who-talks-to-whom table is a different class of data to hand out, so it
+requires `X-Agent-Token` whenever `AGENT_TOKEN` is set.
+
+```bash
+curl -H "X-Agent-Token: your-shared-secret" http://bigboy:8123/connections
+```
+
+## Dashboard Registration
 
 If `DASHBOARD_URL` is set, Homelab Agent registers itself with a
 homelab-dashboard instance on startup and on a heartbeat, so a new machine
@@ -949,6 +1095,7 @@ process for adding a machine — no dashboard redeploy or config edit.
 ```text
 homelab-agent/
 ├── main.py
+├── connections.py
 ├── stack_backup.py
 ├── register.py
 ├── requirements.txt
