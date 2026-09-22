@@ -137,11 +137,15 @@ def fake_client(project=None, exit_code=0, logs=b"", run_error=None):
 
 
 def target(tmp_path, name="media"):
+    url = f"https://github.com/zerg/{name}.git"
     return {
         "project": name,
         "service": "jellyfin",
         "working_dir": f"/srv/{name}",
         "path": str(tmp_path / "srv" / name),
+        "remote": url,
+        "fetch_url": url,
+        "can_pull": True,
     }
 
 
@@ -161,9 +165,10 @@ def test_a_rebuild_pulls_then_builds(tmp_path, monkeypatch):
     finished = wait_for(rebuild.start(client, target(tmp_path))["id"])
 
     assert finished["state"] == "done"
-    # "git pull" is no longer contiguous — safe.directory sits between them.
+    # The pull names the url, not "origin" — see the ssh tests below.
     script = helper_script(client)
-    assert script.index("pull --ff-only origin") < script.index("docker compose up")
+    assert script.index("pull --ff-only") < script.index("docker compose up")
+    assert "https://github.com/zerg/media.git" in script
     assert script.startswith("git ")
     assert "docker compose up -d --build" in script
     assert finished["steps"][0]["output"] == "built\n"
@@ -350,20 +355,63 @@ def test_an_https_remote_can_be_pulled(tmp_path, monkeypatch):
     assert target["can_pull"] is True
 
 
-def test_an_ssh_remote_cannot(tmp_path, monkeypatch):
-    """The helper has no ssh binary and none of the host user's keys, so a
-    pull fails with 'cannot run ssh' before it reaches the network."""
+def test_an_ssh_remote_is_read_over_https_instead(tmp_path, monkeypatch):
+    """ssh is the right way for a person to push and the wrong thing to
+    hand a container. The same public repo is readable over https, and the
+    url is derivable, so nothing on the host has to change."""
     with_remote(tmp_path, "git@github.com:zerg/homelab-dashboard.git")
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
 
-    assert rebuild.target_for(labels())["can_pull"] is False
+    target = rebuild.target_for(labels())
+
+    assert target["remote"] == "git@github.com:zerg/homelab-dashboard.git"
+    assert target["fetch_url"] == "https://github.com/zerg/homelab-dashboard.git"
+    assert target["can_pull"] is True
 
 
-def test_the_ssh_url_scheme_is_caught_too(tmp_path, monkeypatch):
+def test_the_ssh_url_scheme_is_converted_too(tmp_path, monkeypatch):
     with_remote(tmp_path, "ssh://git@github.com/zerg/thing.git")
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
 
-    assert rebuild.target_for(labels())["can_pull"] is False
+    assert rebuild.target_for(labels())["fetch_url"] == (
+        "https://github.com/zerg/thing.git"
+    )
+
+
+def test_a_self_hosted_ssh_remote_converts_too():
+    assert rebuild.https_equivalent("git@gitlab.example.com:group/sub/proj.git") == (
+        "https://gitlab.example.com/group/sub/proj.git"
+    )
+
+
+def test_an_https_remote_is_left_alone():
+    url = "https://github.com/zerg/thing.git"
+    assert rebuild.https_equivalent(url) == url
+
+
+def test_something_that_is_not_a_url_is_not_guessed_at():
+    """Better no pull than a fabricated remote."""
+    assert rebuild.https_equivalent("/srv/local/repo") is None
+    assert rebuild.https_equivalent(None) is None
+    assert rebuild.can_pull("/srv/local/repo") is False
+
+
+def test_the_pull_command_names_the_url_not_origin(tmp_path, monkeypatch):
+    """Pulling from "origin" would use the ssh transport the remote is
+    configured with, which is the thing that can't work in here."""
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client()
+
+    target_with_ssh = {
+        **target(tmp_path),
+        "fetch_url": "https://github.com/zerg/media.git",
+    }
+    wait_for(rebuild.start(client, target_with_ssh)["id"])
+
+    script = helper_script(client)
+    assert "https://github.com/zerg/media.git" in script
+    assert "pull --ff-only origin" not in script
+    assert "rev-parse --abbrev-ref HEAD" in script
 
 
 def test_a_checkout_with_no_origin_cannot_be_pulled(tmp_path, monkeypatch):
@@ -400,29 +448,31 @@ def test_an_unreadable_git_config_is_not_fatal(tmp_path, monkeypatch):
 
 
 def test_a_pull_that_cannot_work_is_refused_up_front(tmp_path, monkeypatch):
-    """Better than letting the helper fail on 'cannot run ssh'."""
+    """A remote that isn't a fetchable URL at all — better to say so than
+    to let the helper fail halfway."""
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
-    target = {
-        "project": "homelab-dashboard", "service": "dashboard-web",
-        "working_dir": "/home/zerg/homelab-dashboard",
-        "path": str(tmp_path), "remote": "git@github.com:zerg/x.git",
+    unfetchable = {
+        "project": "local-thing", "service": "app",
+        "working_dir": "/srv/local", "path": str(tmp_path),
+        "remote": "/srv/mirror/local.git", "fetch_url": None,
         "can_pull": False,
     }
 
-    with pytest.raises(ValueError, match="no ssh keys"):
-        rebuild.start(fake_client(), target)
+    with pytest.raises(ValueError, match="can't fetch|http"):
+        rebuild.start(fake_client(), unfetchable)
 
     # The same target builds fine without the pull.
-    finished = wait_for(rebuild.start(fake_client(), target, pull=False)["id"])
+    finished = wait_for(rebuild.start(fake_client(), unfetchable, pull=False)["id"])
     assert finished["state"] == "done"
 
 
-def test_the_summary_tells_the_dashboard_whether_a_pull_will_work(tmp_path, monkeypatch):
+def test_the_summary_shows_the_configured_remote_and_that_it_is_pullable(tmp_path, monkeypatch):
     with_remote(tmp_path, "git@github.com:zerg/x.git")
     monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
     monkeypatch.setenv("REBUILD_ENABLED", "1")
 
     summary = rebuild.summary_for(labels())
 
-    assert summary["can_pull"] is False
+    # The remote shown is the one configured; the pull works anyway.
     assert summary["remote"] == "git@github.com:zerg/x.git"
+    assert summary["can_pull"] is True

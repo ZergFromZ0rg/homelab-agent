@@ -25,6 +25,7 @@ repo. Nothing else is rebuildable, because there'd be nothing to pull.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import threading
 import time
@@ -51,13 +52,46 @@ def host_path(absolute: str) -> Path:
     return Path(HOST_ROOT, absolute.lstrip("/"))
 
 
-# Transports the helper can actually attempt. It has git and CA
-# certificates; it does not have an ssh binary, and it has none of the
-# host user's keys or credential helpers, so an ssh remote fails with
-# "cannot run ssh: No such file or directory" before it reaches the
-# network. A private https remote will still fail on credentials — that
-# one can't be told apart from a public one without trying.
+# The helper has git and CA certificates. It does not have an ssh binary,
+# or any of the host user's keys — nor should it: this is an
+# unauthenticated read of a public repo, and handing a container someone's
+# signing key to do it would be absurd.
+#
+# So an ssh remote isn't a problem to be fixed on the host. ssh is the
+# right way for a person to push; it just isn't available in here. The
+# same repo is readable over https, and the URL for it is derivable, so
+# that's what gets fetched. Nothing on the host changes and pushes keep
+# using the keys they always did.
 PULLABLE_SCHEMES = ("http://", "https://")
+
+_SSH_URL = re.compile(r"^(?:ssh://)?(?:[^@/]+@)?([^:/]+)[:/](.+?)(?:\.git)?/?$")
+
+
+def https_equivalent(url: str | None) -> str | None:
+    """The https URL for the same repo, for anything ssh-shaped.
+
+    ``git@github.com:owner/repo.git`` and ``ssh://git@github.com/owner/repo``
+    both become ``https://github.com/owner/repo.git``. An https URL is
+    returned unchanged. Anything else — a local path, a protocol we don't
+    recognise — gets None rather than a guess.
+    """
+    if not url:
+        return None
+
+    lowered = url.lower()
+
+    if lowered.startswith(PULLABLE_SCHEMES):
+        return url
+
+    if not (lowered.startswith("ssh://") or "@" in url.split("/")[0]):
+        return None
+
+    match = _SSH_URL.match(url)
+    if not match:
+        return None
+
+    host, path = match.groups()
+    return f"https://{host}/{path}.git"
 
 
 def origin_url(git_dir: Path) -> str | None:
@@ -85,7 +119,9 @@ def origin_url(git_dir: Path) -> str | None:
 
 
 def can_pull(url: str | None) -> bool:
-    return bool(url) and url.lower().startswith(PULLABLE_SCHEMES)
+    """Whether the helper can fetch this repo at all — directly or by
+    deriving the https URL for it."""
+    return https_equivalent(url) is not None
 
 
 def target_for(labels: dict | None) -> dict | None:
@@ -120,6 +156,9 @@ def target_for(labels: dict | None) -> dict | None:
         "working_dir": working_dir,
         "path": str(local),
         "remote": remote,
+        # What the helper will actually fetch from, which is not always
+        # what's configured: an ssh remote is read over https instead.
+        "fetch_url": https_equivalent(remote),
         "can_pull": can_pull(remote),
     }
 
@@ -206,9 +245,9 @@ def start(client, target: dict, *, pull: bool = True) -> dict:
     if pull and not target.get("can_pull", True):
         raise ValueError(
             f"can't pull {target['project']}: its origin is "
-            f"{target.get('remote') or 'not set'}, and the rebuild helper "
-            "has no ssh keys. Use an https remote, or rebuild without "
-            "pulling."
+            f"{target.get('remote') or 'not set'}, which isn't a URL the "
+            "helper can fetch over http(s). Rebuild without pulling, or "
+            "point the remote at a reachable repo."
         )
 
     with _lock:
@@ -225,6 +264,7 @@ def start(client, target: dict, *, pull: bool = True) -> dict:
             "project": target["project"],
             "service": target.get("service"),
             "working_dir": target["working_dir"],
+            "fetch_url": target.get("fetch_url"),
             "pull": pull,
             "replaces_self": replaces_self,
             "state": "running",
@@ -277,7 +317,11 @@ def _script(job: dict) -> str:
 
     if job["pull"]:
         quoted = shlex.quote(job["working_dir"])
-        parts.append(f"git -c safe.directory={quoted} pull --ff-only origin")
+        safe = f"git -c safe.directory={quoted}"
+        url = shlex.quote(job["fetch_url"])
+        # Pull from the URL by name rather than from "origin", so a remote
+        # configured for ssh push is still fetched over https in here.
+        parts.append(f'{safe} pull --ff-only {url} "$({safe} rev-parse --abbrev-ref HEAD)"')
 
     parts.append("docker compose up -d --build")
 

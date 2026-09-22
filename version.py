@@ -33,6 +33,7 @@ import threading
 import time
 from pathlib import Path
 
+import rebuild
 from log import log
 
 REMOTE_TIMEOUT = 15
@@ -93,11 +94,18 @@ def source_info(path: str) -> dict | None:
     }
 
 
-def remote_sha(path: str, branch: str | None) -> str | None:
+def remote_sha(path: str, branch: str | None, url: str | None = None) -> str | None:
     """What the remote's branch is at. One network call, cached by the
-    caller. Fails quietly — no network is not an error worth surfacing."""
+    caller.
+
+    Asks the url by name rather than "origin" for the same reason the
+    rebuild helper does: a remote configured for ssh push can still be
+    read over https from in here, and this is an unauthenticated read of a
+    public repo either way.
+    """
     ref = branch or "HEAD"
-    out = _git(["ls-remote", "origin", ref], path, timeout=REMOTE_TIMEOUT)
+    target = url or "origin"
+    out = _git(["ls-remote", target, ref], path, timeout=REMOTE_TIMEOUT)
 
     if not out:
         return None
@@ -142,6 +150,7 @@ def report(client, working_dir: str | None, container_id: str = "") -> dict:
     info = {
         "source": None,
         "remote_sha": None,
+        "fetch_url": None,
         "image_created": None,
         "needs_rebuild": False,
         "behind_remote": False,
@@ -149,6 +158,13 @@ def report(client, working_dir: str | None, container_id: str = "") -> dict:
 
     if not working_dir:
         return info
+
+    # The url the check will actually use — https even when the remote is
+    # configured for ssh push, since this container has no keys and needs
+    # none for a public repo.
+    info["fetch_url"] = rebuild.https_equivalent(
+        rebuild.origin_url(Path(working_dir) / ".git")
+    )
 
     info["image_created"] = image_created(client, container_id)
     source = source_info(working_dir)
@@ -170,7 +186,7 @@ def report(client, working_dir: str | None, container_id: str = "") -> dict:
     if fresh:
         info["remote_sha"] = cached
     else:
-        sha = remote_sha(working_dir, source["branch"])
+        sha = remote_sha(working_dir, source["branch"], info["fetch_url"])
         with _lock:
             _cache.update(at=now, remote=sha)
         info["remote_sha"] = sha

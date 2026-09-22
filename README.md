@@ -1301,29 +1301,41 @@ reports an error.
 owns it on the host, this runs as root, and git has refused to touch a
 repo owned by another user since 2.35.2.
 
-### Remotes it can pull from
+### Remotes, and why ssh is fine
 
 The helper has git and CA certificates. It does **not** have an `ssh`
-binary, or any of the host user's keys or credential helpers. So an `ssh`
-remote (`git@github.com:you/thing.git` or `ssh://…`) fails with `cannot
-run ssh: No such file or directory` before it reaches the network.
+binary or any of your keys — and shouldn't: this is an unauthenticated
+read of a public repo, and handing a container a signing key to do it
+would be absurd.
 
-Rather than let that happen, every target reports the remote it found and
-whether it can be pulled:
+So an `ssh` remote is **not** something to fix on the host. ssh is the
+right way for a person to push; it just isn't available in here. The same
+repo is readable over https and the URL is derivable, so that's what gets
+fetched:
 
-```json
-{"project": "homelab-dashboard", "service": "dashboard-web",
- "remote": "git@github.com:zerg/homelab-dashboard.git", "can_pull": false}
+```
+git@github.com:you/thing.git      →  https://github.com/you/thing.git
+ssh://git@gitlab.example.com/a/b  →  https://gitlab.example.com/a/b.git
 ```
 
-`POST /rebuild` with `pull: true` against such a target is a `400` naming
-the remote, and the dashboard's button sends `pull: false` for it
-automatically and says why. The project still builds — from whatever is
-checked out — it just won't fetch first. Switch the remote to `https://`
-if you want the pull.
+Nothing on the host changes and your pushes keep using the keys they
+always did. Every target reports both:
 
-A *private* `https` remote will still fail, on credentials rather than
-transport; that one can't be told apart from a public one without trying.
+```json
+{"remote": "git@github.com:zerg/homelab-dashboard.git",
+ "fetch_url": "https://github.com/zerg/homelab-dashboard.git",
+ "can_pull": true}
+```
+
+The pull names that URL rather than `origin`, precisely so the remote's
+own transport isn't used.
+
+`can_pull` is false only for a remote that is no kind of fetchable URL —
+a local path, say — and `POST /rebuild` with `pull: true` against one of
+those is a `400` rather than a helper that fails halfway.
+
+A *private* repo will still fail, on credentials rather than transport;
+that one can't be told apart from a public one without trying.
 
 **Rebuilding the agent's own project** is the one case that can't report
 back — `compose up` kills the process waiting for it. That job returns
