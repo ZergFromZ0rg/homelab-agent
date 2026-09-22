@@ -1048,6 +1048,9 @@ def backup_volumes(x_agent_token: str | None = Header(default=None)):
     return {
         "host": HOST_NAME,
         "volumes": volume_backup.list_volumes(client),
+        # Directories this host will back up. Empty is the default and
+        # means named volumes only.
+        "sources": {"dirs": volume_backup.source_dirs()},
         "store": {
             "enabled": volume_backup.enabled(),
             "roots": volume_backup.roots(client),
@@ -1070,9 +1073,12 @@ def backup_volume_run(
     require_agent_token(x_agent_token)
 
     volume = str(payload.get("volume") or "").strip()
+    path = str(payload.get("path") or "").strip()
 
-    if not volume:
-        raise HTTPException(status_code=400, detail="volume is required")
+    if not volume and not path:
+        raise HTTPException(
+            status_code=400, detail="a volume or a path is required"
+        )
 
     remote = payload.get("remote") or None
 
@@ -1082,7 +1088,8 @@ def backup_volume_run(
     try:
         return volume_backup.start(
             client,
-            volume=volume,
+            volume=volume or None,
+            path=path or None,
             directory=str(payload.get("directory") or "").strip(),
             remote=remote,
             name=(str(payload.get("name")).strip() if payload.get("name") else None),

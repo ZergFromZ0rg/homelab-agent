@@ -356,3 +356,126 @@ def test_resume_starts_them_again_in_reverse():
 
     assert volume_backup._resume(containers) == []
     assert all(c.started for c in containers)
+
+
+# ---- directory sources ----------------------------------------------------
+
+
+@pytest.fixture
+def host(tmp_path, monkeypatch):
+    """A fake host filesystem mounted at HOST_ROOT, the way the agent sees
+    the real one."""
+    root = tmp_path / "host"
+    (root / "home/zerg/ai-librarian/data/qdrant").mkdir(parents=True)
+    (root / "etc").mkdir(parents=True)
+    monkeypatch.setenv("HOST_ROOT", str(root))
+    return root
+
+
+def test_directories_are_refused_until_the_host_opts_in(host):
+    with pytest.raises(volume_backup.PolicyError, match="BACKUP_SOURCE_DIRS"):
+        volume_backup.resolve_source("/home/zerg/ai-librarian/data/qdrant")
+
+
+def test_a_directory_resolves_to_its_host_spelling(host, monkeypatch):
+    """The daemon resolves a bind mount on the host, so it must be handed
+    the host path — not the HOST_ROOT-prefixed one the agent reads through.
+    Handing over the wrong one gets an empty directory Docker creates."""
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg")
+
+    resolved = volume_backup.resolve_source("/home/zerg/ai-librarian/data/qdrant")
+
+    assert resolved == "/home/zerg/ai-librarian/data/qdrant"
+    assert str(host) not in resolved
+
+
+def test_a_source_root_can_be_backed_up_exactly(host, monkeypatch):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg/ai-librarian")
+
+    assert volume_backup.resolve_source("/home/zerg/ai-librarian") == (
+        "/home/zerg/ai-librarian"
+    )
+
+
+def test_a_directory_outside_every_root_is_refused(host, monkeypatch):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg/ai-librarian")
+
+    with pytest.raises(volume_backup.PolicyError, match="not under a backup source"):
+        volume_backup.resolve_source("/etc")
+
+
+def test_a_directory_source_refuses_dot_dot(host, monkeypatch):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg")
+
+    with pytest.raises(volume_backup.PolicyError, match=r"\.\."):
+        volume_backup.resolve_source("/home/zerg/../etc")
+
+
+def test_a_source_that_is_not_a_directory_is_refused(host, monkeypatch):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg")
+
+    with pytest.raises(volume_backup.PolicyError, match="not a directory"):
+        volume_backup.resolve_source("/home/zerg/nothing-here")
+
+
+def test_a_symlink_out_of_the_root_is_refused(host, monkeypatch):
+    """An allowed root someone can drop a symlink into is not a boundary
+    unless the link is resolved before the comparison."""
+    (host / "home/zerg/escape").symlink_to(host / "etc")
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg/ai-librarian")
+
+    with pytest.raises(volume_backup.PolicyError):
+        volume_backup.resolve_source("/home/zerg/escape")
+
+
+def test_a_relative_source_is_refused(host, monkeypatch):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg")
+
+    with pytest.raises(volume_backup.PolicyError, match="absolute"):
+        volume_backup.resolve_source("home/zerg")
+
+
+def test_a_paths_archive_name_is_stable_and_unique():
+    name = volume_backup.archive_name("/home/zerg/ai-librarian/data/qdrant", 1790000000)
+
+    assert name.startswith("home-zerg-ai-librarian-data-qdrant-")
+    assert name.endswith(".tar.gz")
+    assert "/" not in name
+
+
+def test_containers_using_a_directory_are_found_by_bind_mount():
+    def bind(source):
+        return {"Type": "bind", "Source": source}
+
+    path = "/home/zerg/ai-librarian/data/qdrant"
+
+    assert volume_backup._uses([bind(path)], None, path), "the exact directory"
+    assert volume_backup._uses([bind(path + "/segments")], None, path), "one under it"
+    assert volume_backup._uses([bind("/home/zerg/ai-librarian")], None, path), (
+        "a container mounting the parent writes into it too"
+    )
+    assert not volume_backup._uses([bind("/home/zerg/other")], None, path)
+    assert not volume_backup._uses([bind("/home/zerg/ai-librarian/data/qdrant2")], None, path)
+
+
+def test_a_job_takes_a_volume_or_a_path_but_not_both(host, monkeypatch, tmp_path):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg")
+    client = FakeClient(volumes=[FakeVolume("qdrant")])
+
+    with pytest.raises(volume_backup.PolicyError, match="not both"):
+        volume_backup.start(
+            client, volume="qdrant", path="/home/zerg", directory="/backups"
+        )
+
+    with pytest.raises(volume_backup.PolicyError, match="either a volume or a path"):
+        volume_backup.start(client, directory="/backups")
+
+
+def test_a_directory_job_checks_the_source_before_starting(host, monkeypatch):
+    """It has to fail here, not inside a helper container nobody is
+    watching yet."""
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg")
+    client = FakeClient()
+
+    with pytest.raises(volume_backup.PolicyError, match="not under a backup source"):
+        volume_backup.start(client, path="/etc", directory="/backups")

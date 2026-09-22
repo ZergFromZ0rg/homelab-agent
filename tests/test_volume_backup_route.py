@@ -193,3 +193,30 @@ def test_deleting_needs_a_list_of_names(client, store):
     )
 
     assert resp.status_code == 400
+
+
+def test_the_listing_says_which_directories_may_be_backed_up(client, store, monkeypatch):
+    assert client.get("/backup/volumes").json()["sources"]["dirs"] == []
+
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg, /srv/data")
+
+    assert client.get("/backup/volumes").json()["sources"]["dirs"] == [
+        "/home/zerg", "/srv/data",
+    ]
+
+
+def test_running_with_neither_a_volume_nor_a_path_is_a_400(client, store):
+    resp = client.post("/backup/volumes/run", json={"directory": str(store)})
+
+    assert resp.status_code == 400
+    assert "volume or a path" in resp.json()["detail"]
+
+
+def test_a_directory_source_is_refused_until_the_host_opts_in(client, store):
+    resp = client.post(
+        "/backup/volumes/run",
+        json={"path": "/home/zerg/ai-librarian", "directory": str(store)},
+    )
+
+    assert resp.status_code == 400
+    assert "BACKUP_SOURCE_DIRS" in resp.json()["detail"]

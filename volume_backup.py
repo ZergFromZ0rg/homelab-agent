@@ -1,6 +1,18 @@
-"""Back a named Docker volume up to a directory, here or on another node.
+"""Back a named volume or a host directory up, here or on another node.
 
-Three things had to be decided before any of this could be written down.
+**Two kinds of source, because that is how homelabs actually look.** A
+named volume is the tidy case. A great deal of real data sits in a bind
+mount instead — ``./data/qdrant:/qdrant/storage`` in somebody's compose
+file — and a backup feature that can't see those is a backup feature that
+misses the thing you most wanted backed up. A directory source is opt-in
+per host via ``BACKUP_SOURCE_DIRS``: not because the agent couldn't
+otherwise read the path (it mounts the host read-only already, and anyone
+who can call these routes can mount anything through the socket) but
+because *sending* a directory to another machine deserves a deliberate
+decision naming which directories.
+
+Three more things had to be decided before any of this could be written
+down.
 
 **Where a backup is allowed to land.** ``BACKUP_DIRS`` lists paths *inside
 this container*, and each one has to be a bind mount from the host. That
@@ -73,6 +85,69 @@ def configured_dirs() -> list[str]:
 
 def enabled() -> bool:
     return bool(configured_dirs())
+
+
+def source_dirs() -> list[str]:
+    """Host directories this host will back up, from ``BACKUP_SOURCE_DIRS``.
+
+    Empty means named volumes only, which is the default. A job may name
+    any directory at or under one of these.
+    """
+    return [d.rstrip("/") or "/" for d in _split(os.getenv("BACKUP_SOURCE_DIRS", ""))]
+
+
+def host_root() -> str:
+    return os.getenv("HOST_ROOT", "/host").rstrip("/")
+
+
+def resolve_source(path: str) -> str:
+    """Check a directory source and return the path to hand the daemon.
+
+    Two spellings again, the other way round from a destination: the agent
+    checks what is there through ``HOST_ROOT``, and the daemon is given the
+    bare host path, because that is the one it resolves a bind mount
+    against.
+    """
+    if not path or not path.startswith("/"):
+        raise PolicyError("a backup source must be an absolute path")
+
+    wanted = Path(path.rstrip("/") or "/")
+
+    if ".." in wanted.parts:
+        raise PolicyError("a backup source must not contain '..'")
+
+    allowed = source_dirs()
+
+    if not allowed:
+        raise PolicyError(
+            "this host backs up named volumes only: set BACKUP_SOURCE_DIRS "
+            "on its agent to allow backing up a directory"
+        )
+
+    inside = Path(host_root() + str(wanted))
+
+    if not inside.is_dir():
+        raise PolicyError(f"{path} is not a directory on this host")
+
+    # Resolve through the host mount, then compare in host spelling. A
+    # symlink inside an allowed root that points out of it is otherwise a
+    # way straight past the allowlist.
+    real_inside = inside.resolve()
+
+    try:
+        real = "/" + str(real_inside.relative_to(host_root() or "/"))
+    except ValueError:
+        real = str(real_inside)
+
+    for root in allowed:
+        base = Path(root)
+
+        if Path(real) == base or base in Path(real).parents:
+            return real
+
+    raise PolicyError(
+        f"{path} is not under a backup source directory ({', '.join(allowed)})"
+    )
 
 
 def _mount_table(client) -> dict[str, str]:
@@ -247,9 +322,16 @@ def list_volumes(client) -> list[dict]:
     return sorted(out, key=lambda v: v["name"])
 
 
-def archive_name(volume: str, when: float | None = None) -> str:
+def archive_name(source: str, when: float | None = None) -> str:
+    """``<source>-<stamp>.tar.gz``, where source is a volume name or a path.
+
+    The same sanitiser covers both: a path's slashes become dashes, so
+    ``/home/zerg/ai-librarian/data/qdrant`` reads back as
+    ``home-zerg-ai-librarian-data-qdrant`` — long, but stable and unique,
+    which is what retention matches on.
+    """
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(when or time.time()))
-    safe = re.sub(r"[^A-Za-z0-9._-]", "-", volume).strip("-") or "volume"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-", source).strip("-") or "volume"
     return f"{safe}-{stamp}{SUFFIX}"
 
 
@@ -421,8 +503,32 @@ def _finish(job: dict, state: str, error: str | None = None) -> None:
     level("backup %s %s%s", job["id"], state, f": {error}" if error else "")
 
 
-def _quiesce(client, volume: str) -> tuple[list, list[str]]:
-    """Stop the containers writing to a volume, newest first.
+def _uses(mounts: list, volume: str | None, path: str | None) -> bool:
+    """Whether a container is writing to what we are about to copy.
+
+    For a directory that means any bind mount at, under, or *containing*
+    the path — a container mounting the parent writes into it just as
+    surely as one mounting it exactly.
+    """
+    for mount in mounts:
+        if volume and mount.get("Name") == volume:
+            return True
+
+        if path and mount.get("Type") == "bind":
+            source = (mount.get("Source") or "").rstrip("/")
+
+            if source and (
+                source == path
+                or source.startswith(path + "/")
+                or path.startswith(source + "/")
+            ):
+                return True
+
+    return False
+
+
+def _quiesce(client, volume: str | None, path: str | None = None) -> tuple[list, list[str]]:
+    """Stop the containers writing to the source, newest first.
 
     A protected container is never stopped — that's what protection means,
     and the agent stopping itself mid-backup would orphan the job. It is
@@ -432,9 +538,7 @@ def _quiesce(client, volume: str) -> tuple[list, list[str]]:
     stopped, skipped = [], []
 
     for container in client.containers.list():
-        mounts = container.attrs.get("Mounts") or []
-
-        if not any(m.get("Name") == volume for m in mounts):
+        if not _uses(container.attrs.get("Mounts") or [], volume, path):
             continue
 
         if container.name in deploy.PROTECTED_NAMES:
@@ -444,7 +548,9 @@ def _quiesce(client, volume: str) -> tuple[list, list[str]]:
         stopped.append(container)
 
     for container in stopped:
-        audit.info("backup: stopping %s to quiesce %s", container.name, volume)
+        audit.info(
+            "backup: stopping %s to quiesce %s", container.name, volume or path
+        )
         container.stop(timeout=30)
 
     return stopped, skipped
@@ -463,18 +569,29 @@ def _resume(stopped: list) -> list[str]:
     return failed
 
 
-def start(client, *, volume: str, directory: str, remote: dict | None = None,
+def start(client, *, volume: str | None = None, path: str | None = None,
+          directory: str, remote: dict | None = None,
           name: str | None = None, stop_containers: bool = False) -> dict:
     """Kick off a backup. Returns the job immediately.
 
-    ``remote`` is ``{"url", "token"}`` when the archive belongs on another
-    node; the helper streams it there and that node's agent writes it.
-    Without it the archive is written here, to ``directory``.
+    Exactly one of ``volume`` and ``path`` is the source. ``remote`` is
+    ``{"url", "token"}`` when the archive belongs on another node; the
+    helper streams it there and that node's agent writes it. Without it the
+    archive is written here, to ``directory``.
     """
-    try:
-        client.volumes.get(volume)
-    except Exception:  # noqa: BLE001 - docker-py raises NotFound broadly
-        raise PolicyError(f"no volume named {volume!r} on this host")
+    if bool(volume) == bool(path):
+        raise PolicyError("a backup needs either a volume or a path, not both")
+
+    if volume:
+        try:
+            client.volumes.get(volume)
+        except Exception:  # noqa: BLE001 - docker-py raises NotFound broadly
+            raise PolicyError(f"no volume named {volume!r} on this host")
+        source_host_path = None
+    else:
+        # Checked now rather than inside the helper, whose output nobody is
+        # watching yet.
+        source_host_path = resolve_source(path)
 
     host_path = None
 
@@ -491,7 +608,8 @@ def start(client, *, volume: str, directory: str, remote: dict | None = None,
         job = {
             "id": uuid.uuid4().hex[:12],
             "volume": volume,
-            "archive": name or archive_name(volume),
+            "path": path,
+            "archive": name or archive_name(volume or path),
             "directory": directory,
             "remote_url": (remote or {}).get("url"),
             "stop_containers": bool(stop_containers),
@@ -506,15 +624,19 @@ def start(client, *, volume: str, directory: str, remote: dict | None = None,
         _record(job)
 
     audit.info(
-        "backup %s: volume=%s -> %s%s",
-        job["id"], volume, job["remote_url"] or directory,
+        "backup %s: %s -> %s%s",
+        job["id"], volume or path, job["remote_url"] or directory,
         " (stopping its containers)" if stop_containers else "",
     )
 
     thread = threading.Thread(
         target=_run_job,
         args=(client, job),
-        kwargs={"host_path": host_path, "token": (remote or {}).get("token")},
+        kwargs={
+            "host_path": host_path,
+            "source_host_path": source_host_path,
+            "token": (remote or {}).get("token"),
+        },
         daemon=True,
     )
     thread.start()
@@ -522,27 +644,34 @@ def start(client, *, volume: str, directory: str, remote: dict | None = None,
     return dict(job)
 
 
-def _run_job(client, job: dict, *, host_path: str | None, token: str | None) -> None:
+def _run_job(client, job: dict, *, host_path: str | None,
+             source_host_path: str | None, token: str | None) -> None:
     try:
-        _backup(client, job, host_path=host_path, token=token)
+        _backup(client, job, host_path=host_path,
+                source_host_path=source_host_path, token=token)
     except Exception as error:  # noqa: BLE001 - the thread must not die silently
         _finish(job, "failed", str(error))
 
 
-def _backup(client, job: dict, *, host_path: str | None, token: str | None) -> None:
+def _backup(client, job: dict, *, host_path: str | None,
+            source_host_path: str | None, token: str | None) -> None:
     import json as _json
 
     stopped, skipped = [], []
 
     if job["stop_containers"]:
-        stopped, skipped = _quiesce(client, job["volume"])
+        stopped, skipped = _quiesce(client, job["volume"], job.get("path"))
 
         with _lock:
             job["stopped"] = [c.name for c in stopped]
             job["not_stopped"] = skipped
 
     environment = {"BACKUP_NAME": job["archive"]}
-    volumes = {job["volume"]: {"bind": "/src", "mode": "ro"}}
+    # A volume is bound by name; a directory by its real host path, which
+    # resolve_source() has already checked and translated out of HOST_ROOT.
+    volumes = {
+        (job["volume"] or source_host_path): {"bind": "/src", "mode": "ro"}
+    }
 
     if job["remote_url"]:
         environment["BACKUP_DEST_URL"] = job["remote_url"]

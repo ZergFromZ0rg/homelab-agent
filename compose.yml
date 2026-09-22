@@ -52,6 +52,10 @@ services:
       BACKUP_DIRS: ${BACKUP_DIRS:-}
       BACKUP_PUBLIC_URL: ${BACKUP_PUBLIC_URL:-}
 
+      # Host directories this agent may back up, on top of named volumes.
+      # Read through the /host mount below, so nothing extra is needed.
+      BACKUP_SOURCE_DIRS: ${BACKUP_SOURCE_DIRS:-}
+
       # Rebuild-from-the-dashboard. Off unless set to 1, because it runs
       # `git pull` and `docker compose --build` — whatever the repo says,
       # as root on the host. See Rebuilding in the README.
