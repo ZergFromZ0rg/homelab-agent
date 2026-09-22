@@ -94,16 +94,30 @@ def test_enabled_once_backup_dirs_is_set(monkeypatch):
 
 
 def test_a_root_that_is_not_mounted_says_what_to_add(monkeypatch):
-    """The commonest misconfiguration, and the answer is one compose line.
-    Reporting it beats a bare 'not allowed'."""
+    """A hand-configured root that nobody mounted. The answer is one
+    compose line, and reporting it beats a bare 'not allowed'.
+
+    ``/backups`` has its own, better message — see
+    ``test_the_placeholder_volume_is_not_a_destination`` — because that one
+    is set up with a variable, not by editing YAML."""
+    monkeypatch.setenv("BACKUP_DIRS", "/mnt/nas")
+    client = FakeClient(own_mounts=[mount("/host", "/", rw=False)])
+
+    (root,) = volume_backup.roots(client)
+
+    assert root["usable"] is False
+    assert "/mnt/nas" in root["problem"]
+    assert "volumes" in root["problem"]
+
+
+def test_the_standard_mount_points_at_the_variable_that_sets_it(monkeypatch):
     monkeypatch.setenv("BACKUP_DIRS", "/backups")
     client = FakeClient(own_mounts=[mount("/host", "/", rw=False)])
 
     (root,) = volume_backup.roots(client)
 
     assert root["usable"] is False
-    assert "/backups" in root["problem"]
-    assert "volumes" in root["problem"]
+    assert "BACKUP_HOST_DIR" in root["problem"]
 
 
 def test_a_read_only_mount_is_not_a_backup_root(monkeypatch):
@@ -506,3 +520,35 @@ def test_the_two_settings_do_not_duplicate_the_mount(monkeypatch):
     monkeypatch.setenv("BACKUP_DIRS", "/backups")
 
     assert volume_backup.configured_dirs() == ["/backups"]
+
+
+def test_the_placeholder_volume_is_not_a_destination(monkeypatch):
+    """compose binds a named volume at /backups when BACKUP_HOST_DIR is
+    unset. It is writable, so without this it reads as a configured
+    destination and archives go quietly into a volume nobody looks in."""
+    monkeypatch.setenv("BACKUP_DIRS", "/backups")
+    client = FakeClient(own_mounts=[{
+        "Type": "volume",
+        "Name": "homelab-agent_agent-backups-unset",
+        "Destination": "/backups",
+        "Source": "/var/lib/docker/volumes/homelab-agent_agent-backups-unset/_data",
+        "RW": True,
+    }])
+
+    (root,) = volume_backup.roots(client)
+
+    assert root["usable"] is False
+    assert "BACKUP_HOST_DIR" in root["problem"]
+
+
+def test_a_real_directory_at_the_mount_is_a_destination(tmp_path, monkeypatch):
+    monkeypatch.setenv("BACKUP_HOST_DIR", "/home/zerg/backups")
+    client = FakeClient(own_mounts=[{
+        "Type": "bind", "Destination": str(tmp_path),
+        "Source": "/home/zerg/backups", "RW": True,
+    }])
+    monkeypatch.setenv("BACKUP_DIRS", str(tmp_path))
+
+    usable = [r for r in volume_backup.roots(client) if r["usable"]]
+
+    assert [r["host_path"] for r in usable] == ["/home/zerg/backups"]

@@ -83,6 +83,11 @@ def _split(value: str) -> list[str]:
 # variable is that nobody has to edit the service definition.
 STORE_MOUNT = "/backups"
 
+# compose binds this named volume at STORE_MOUNT when BACKUP_HOST_DIR is
+# unset. It is writable, so it would otherwise pass for a real
+# destination and archives would vanish into a throwaway volume.
+PLACEHOLDER_VOLUME = "agent-backups-unset"
+
 
 def configured_dirs() -> list[str]:
     """Destination roots this host will write to.
@@ -194,6 +199,13 @@ def _mount_table(client) -> dict[str, str]:
         destination = (mount.get("Destination") or "").rstrip("/")
         source = (mount.get("Source") or "").rstrip("/")
 
+        # The stand-in compose binds when no host directory was chosen. It
+        # is a perfectly good writable mount, which is the problem: left in
+        # the table it reads as a configured destination and backups go
+        # quietly into a volume nobody will think to look in.
+        if (mount.get("Name") or "").endswith(PLACEHOLDER_VOLUME):
+            continue
+
         if destination and source and mount.get("RW"):
             table[destination] = source
 
@@ -214,6 +226,10 @@ def roots(client) -> list[dict]:
 
         if host_path is None:
             problem = (
+                f"{path} is not backed by a directory on this host — set "
+                "BACKUP_HOST_DIR in the agent's .env to the directory "
+                "archives should be written to, then restart it"
+                if path == STORE_MOUNT else
                 f"{path} is not a writable bind mount in this agent — add "
                 f"'- /your/host/path:{path}' to the agent's volumes"
             )
