@@ -96,12 +96,21 @@ services:
       # Backup working tree, so a restart doesn't re-clone the repo.
       - agent-data:/data
 
-      # Uncomment to let this host *store* volume backups, and set
-      # BACKUP_DIRS=/backups in .env to match. The mount is the allowlist:
-      # the agent writes archives it receives itself, so it can only ever
-      # write where you have deliberately given it write access. The
-      # read-only /host mount above is not a candidate, by design.
-      # - /srv/backups:/backups
+      # Where archives are written when this host stores backups. Set
+      # BACKUP_HOST_DIR in .env to a directory on this machine and that is
+      # the whole setup — the agent treats /backups as a destination only
+      # when BACKUP_HOST_DIR is set.
+      #
+      # This is a variable rather than a line to uncomment because editing
+      # a service's YAML by hand is the step people get wrong, and getting
+      # it wrong is silent: the agent comes up fine and simply reports that
+      # it stores nothing.
+      #
+      # The default is a throwaway named volume, so a host that stores no
+      # backups has nothing of its filesystem bound in here. The mount is
+      # still the boundary: the agent writes received archives itself, and
+      # it can only ever write under this one path.
+      - ${BACKUP_HOST_DIR:-agent-backups-unset}:/backups
 
     # NVIDIA hosts set AGENT_RUNTIME=nvidia in .env; everything else leaves
     # it alone. This is a variable rather than a line to uncomment because
@@ -112,3 +121,6 @@ services:
 
 volumes:
   agent-data:
+  # Bound at /backups only when BACKUP_HOST_DIR is unset. Nothing writes
+  # here: without BACKUP_HOST_DIR the agent stores no backups at all.
+  agent-backups-unset:

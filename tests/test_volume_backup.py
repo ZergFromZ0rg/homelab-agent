@@ -73,6 +73,8 @@ def mount(container_path, host_path, rw=True):
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.delenv("BACKUP_DIRS", raising=False)
+    monkeypatch.delenv("BACKUP_HOST_DIR", raising=False)
+    monkeypatch.delenv("BACKUP_SOURCE_DIRS", raising=False)
     monkeypatch.setenv("HOSTNAME", "agentcontainer")
     volume_backup.reset()
     yield
@@ -479,3 +481,28 @@ def test_a_directory_job_checks_the_source_before_starting(host, monkeypatch):
 
     with pytest.raises(volume_backup.PolicyError, match="not under a backup source"):
         volume_backup.start(client, path="/etc", directory="/backups")
+
+
+def test_backup_host_dir_is_enough_on_its_own(monkeypatch):
+    """The one-variable setup. Two settings that had to agree were one too
+    many: out of step, the agent comes up fine and quietly stores nothing,
+    which is exactly what happened on the real fleet."""
+    assert volume_backup.configured_dirs() == []
+
+    monkeypatch.setenv("BACKUP_HOST_DIR", "/home/zerg/backups")
+
+    assert volume_backup.configured_dirs() == ["/backups"]
+    assert volume_backup.enabled() is True
+
+
+def test_backup_dirs_still_names_roots_directly(monkeypatch):
+    monkeypatch.setenv("BACKUP_DIRS", "/mnt/nas/backups")
+
+    assert volume_backup.configured_dirs() == ["/mnt/nas/backups"]
+
+
+def test_the_two_settings_do_not_duplicate_the_mount(monkeypatch):
+    monkeypatch.setenv("BACKUP_HOST_DIR", "/home/zerg/backups")
+    monkeypatch.setenv("BACKUP_DIRS", "/backups")
+
+    assert volume_backup.configured_dirs() == ["/backups"]

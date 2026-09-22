@@ -79,8 +79,29 @@ def _split(value: str) -> list[str]:
     return [part.strip() for part in re.split(r"[:,\n]", value) if part.strip()]
 
 
+# Where compose binds BACKUP_HOST_DIR. Fixed, because the point of the
+# variable is that nobody has to edit the service definition.
+STORE_MOUNT = "/backups"
+
+
 def configured_dirs() -> list[str]:
-    return _split(os.getenv("BACKUP_DIRS", ""))
+    """Destination roots this host will write to.
+
+    ``BACKUP_HOST_DIR`` is the one-variable form: setting it makes compose
+    bind that directory at ``/backups`` and makes this agent treat
+    ``/backups`` as a root. Two settings that always had to agree were one
+    setting too many — get them out of step and the agent comes up fine and
+    quietly reports that it stores nothing.
+
+    ``BACKUP_DIRS`` still names roots directly, for more than one of them
+    or for a mount somebody set up themselves.
+    """
+    dirs = _split(os.getenv("BACKUP_DIRS", ""))
+
+    if os.getenv("BACKUP_HOST_DIR", "").strip() and STORE_MOUNT not in dirs:
+        dirs.append(STORE_MOUNT)
+
+    return dirs
 
 
 def enabled() -> bool:
