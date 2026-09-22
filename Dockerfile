@@ -21,6 +21,8 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY log.py main.py connections.py sockets.py rebuild.py version.py stack_backup.py register.py deploy.py stack_deploy.py ./
+COPY log.py main.py connections.py sockets.py rebuild.py version.py \
+     stack_backup.py register.py deploy.py stack_deploy.py \
+     volume_backup.py backup_helper.py ./
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8123"]

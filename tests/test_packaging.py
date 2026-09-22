@@ -31,13 +31,37 @@ def imported_by(module: str) -> set[str]:
     return names
 
 
+def _logical_lines(text: str) -> list[str]:
+    """Dockerfile lines with backslash continuations joined up.
+
+    The COPY grew past one readable line once there were a dozen modules,
+    and a line-at-a-time reader silently sees only the first few — which
+    reports modules that *are* in the image as missing.
+    """
+    lines, current = [], ""
+
+    for raw in text.splitlines():
+        stripped = raw.strip()
+
+        if stripped.endswith("\\"):
+            current += stripped[:-1] + " "
+            continue
+
+        lines.append((current + stripped).strip())
+        current = ""
+
+    if current:
+        lines.append(current.strip())
+
+    return lines
+
+
 def copied_into_image() -> set[str]:
-    for line in (ROOT / "Dockerfile").read_text().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("COPY") and ".py" in stripped:
+    for line in _logical_lines((ROOT / "Dockerfile").read_text()):
+        if line.startswith("COPY") and ".py" in line:
             return {
                 token[:-3]
-                for token in stripped.split()
+                for token in line.split()
                 if token.endswith(".py")
             }
     raise AssertionError("no COPY line for .py files in the Dockerfile")

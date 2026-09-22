@@ -8,7 +8,7 @@ import glob
 from pathlib import Path
 import docker
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from log import log, audit
@@ -18,6 +18,7 @@ import connections
 import deploy
 import rebuild
 import version
+import volume_backup
 from deploy import CreateContainerRequest, PolicyError
 from stack_deploy import (
     CreateStackRequest,
@@ -1032,6 +1033,162 @@ def backup_run():
     stack_backup.trigger()
 
     return {"success": True, "triggered": True}
+
+
+@app.get("/backup/volumes")
+def backup_volumes(x_agent_token: str | None = Header(default=None)):
+    """What can be backed up here, and whether anything can be stored here.
+
+    Both halves in one answer because the dashboard needs both to offer a
+    job: volumes are what a source host can read, roots are what a
+    destination host can write.
+    """
+    require_agent_token(x_agent_token)
+
+    return {
+        "host": HOST_NAME,
+        "volumes": volume_backup.list_volumes(client),
+        "store": {
+            "enabled": volume_backup.enabled(),
+            "roots": volume_backup.roots(client),
+            "receive_url": (
+                os.getenv("BACKUP_PUBLIC_URL", "").strip()
+                or os.getenv("AGENT_URL", "").strip()
+                or None
+            ),
+        },
+    }
+
+
+@app.post("/backup/volumes/run")
+def backup_volume_run(
+    payload: dict,
+    x_agent_token: str | None = Header(default=None),
+):
+    """Start a backup. Returns a job id, because a volume of any size takes
+    far longer than a request should be held open for."""
+    require_agent_token(x_agent_token)
+
+    volume = str(payload.get("volume") or "").strip()
+
+    if not volume:
+        raise HTTPException(status_code=400, detail="volume is required")
+
+    remote = payload.get("remote") or None
+
+    if remote is not None and not isinstance(remote, dict):
+        raise HTTPException(status_code=400, detail="remote must be an object")
+
+    try:
+        return volume_backup.start(
+            client,
+            volume=volume,
+            directory=str(payload.get("directory") or "").strip(),
+            remote=remote,
+            name=(str(payload.get("name")).strip() if payload.get("name") else None),
+            stop_containers=bool(payload.get("stop_containers")),
+        )
+
+    except volume_backup.PolicyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+
+@app.get("/backup/volumes/jobs")
+def backup_volume_jobs(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return {"jobs": volume_backup.recent()}
+
+
+@app.get("/backup/volumes/jobs/{job_id}")
+def backup_volume_job(
+    job_id: str,
+    x_agent_token: str | None = Header(default=None),
+):
+    require_agent_token(x_agent_token)
+    job = volume_backup.status(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="unknown backup job")
+
+    return job
+
+
+@app.post("/backup/receive")
+async def backup_receive(
+    request: Request,
+    x_agent_token: str | None = Header(default=None),
+    x_backup_dir: str | None = Header(default=None),
+    x_backup_name: str | None = Header(default=None),
+):
+    """Take an archive another node's helper is streaming here.
+
+    Async on purpose: the body arrives a chunk at a time and each write
+    goes to a worker thread, so a multi-gigabyte volume never has to exist
+    in this process's memory or block the loop that is still answering the
+    dashboard.
+    """
+    require_agent_token(x_agent_token)
+
+    from anyio import to_thread
+
+    try:
+        receiver = await to_thread.run_sync(
+            volume_backup.Receiver, client, x_backup_dir or "", x_backup_name or ""
+        )
+    except volume_backup.PolicyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except OSError as error:
+        raise HTTPException(status_code=500, detail=f"could not open the archive: {error}")
+
+    try:
+        async for chunk in request.stream():
+            if chunk:
+                await to_thread.run_sync(receiver.write, chunk)
+
+        return await to_thread.run_sync(receiver.commit)
+
+    except Exception as error:  # noqa: BLE001 - a partial archive must not survive
+        await to_thread.run_sync(receiver.abort)
+        log.warning("backup receive failed: %s", error)
+        raise HTTPException(status_code=500, detail=f"upload failed: {error}")
+
+
+@app.get("/backup/archives")
+def backup_archives(
+    directory: str,
+    x_agent_token: str | None = Header(default=None),
+):
+    require_agent_token(x_agent_token)
+
+    try:
+        return {"directory": directory, "archives": volume_backup.list_archives(client, directory)}
+    except volume_backup.PolicyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
+@app.post("/backup/archives/delete")
+def backup_archives_delete(
+    payload: dict,
+    x_agent_token: str | None = Header(default=None),
+):
+    """Deleting is a POST, not a DELETE, because it takes a list of names
+    in a body and a DELETE with a body is a fight with every proxy."""
+    require_agent_token(x_agent_token)
+
+    names = payload.get("names")
+
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise HTTPException(status_code=400, detail="names must be a list of strings")
+
+    try:
+        return volume_backup.delete_archives(
+            client, str(payload.get("directory") or "").strip(), names
+        )
+    except volume_backup.PolicyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
 
 
 def find_container_or_404(container_id: str):

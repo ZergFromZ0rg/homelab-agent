@@ -46,6 +46,12 @@ services:
       ALLOWED_HOST_PATHS: ${ALLOWED_HOST_PATHS:-}
       ALLOWED_DEVICES: ${ALLOWED_DEVICES:-}
 
+      # Volume backups. Directories inside this container that archives
+      # may be written to — see the volumes section. Empty means this host
+      # stores no backups; it can still be a source for another node's.
+      BACKUP_DIRS: ${BACKUP_DIRS:-}
+      BACKUP_PUBLIC_URL: ${BACKUP_PUBLIC_URL:-}
+
       # Rebuild-from-the-dashboard. Off unless set to 1, because it runs
       # `git pull` and `docker compose --build` — whatever the repo says,
       # as root on the host. See Rebuilding in the README.
@@ -85,6 +91,13 @@ services:
 
       # Backup working tree, so a restart doesn't re-clone the repo.
       - agent-data:/data
+
+      # Uncomment to let this host *store* volume backups, and set
+      # BACKUP_DIRS=/backups in .env to match. The mount is the allowlist:
+      # the agent writes archives it receives itself, so it can only ever
+      # write where you have deliberately given it write access. The
+      # read-only /host mount above is not a candidate, by design.
+      # - /srv/backups:/backups
 
     # NVIDIA hosts set AGENT_RUNTIME=nvidia in .env; everything else leaves
     # it alone. This is a variable rather than a line to uncomment because
