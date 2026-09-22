@@ -159,7 +159,8 @@ def test_owners_maps_inodes_to_process_names(tmp_path):
         1455: ("curl", [44444, 99999]),
     })
 
-    found = sockets.owners({31337, 44444}, root)
+    found, denied = sockets.owners({31337, 44444}, root)
+    assert denied is False
 
     assert found[31337] == {"pid": 812, "process": "sshd"}
     assert found[44444] == {"pid": 1455, "process": "curl"}
@@ -167,29 +168,29 @@ def test_owners_maps_inodes_to_process_names(tmp_path):
 
 def test_owners_ignores_inodes_nobody_asked_for(tmp_path):
     root = fake_proc(tmp_path, {812: ("sshd", [31337, 55555])})
-    assert set(sockets.owners({31337}, root)) == {31337}
+    assert set(sockets.owners({31337}, root)[0]) == {31337}
 
 
 def test_owners_is_a_no_op_without_wanted_inodes(tmp_path):
-    assert sockets.owners(set(), fake_proc(tmp_path, {1: ("init", [1])})) == {}
+    assert sockets.owners(set(), fake_proc(tmp_path, {1: ("init", [1])})) == ({}, False)
 
 
 def test_owners_survives_a_process_exiting_mid_walk(tmp_path):
     root = fake_proc(tmp_path, {812: ("sshd", [31337]), 99: ("gone", [])})
     (tmp_path / "99" / "fd").rmdir()
 
-    assert sockets.owners({31337}, root)[31337]["pid"] == 812
+    assert sockets.owners({31337}, root)[0][31337]["pid"] == 812
 
 
 def test_owners_handles_a_process_with_no_comm(tmp_path):
     root = fake_proc(tmp_path, {812: ("sshd", [31337])})
     (tmp_path / "812" / "comm").unlink()
 
-    assert sockets.owners({31337}, root) == {31337: {"pid": 812, "process": None}}
+    assert sockets.owners({31337}, root)[0] == {31337: {"pid": 812, "process": None}}
 
 
 def test_owners_returns_nothing_for_an_unreadable_root():
-    assert sockets.owners({1}, "/definitely/not/here") == {}
+    assert sockets.owners({1}, "/definitely/not/here") == ({}, False)
 
 
 def test_the_walk_is_capped(tmp_path, monkeypatch):
@@ -197,7 +198,7 @@ def test_the_walk_is_capped(tmp_path, monkeypatch):
     root = fake_proc(tmp_path, {1: ("a", [1]), 2: ("b", [2]), 3: ("c", [3])})
 
     # Sorted order means 1 and 2 are walked, 3 is past the cap.
-    assert set(sockets.owners({1, 2, 3}, root)) == {1, 2}
+    assert set(sockets.owners({1, 2, 3}, root)[0]) == {1, 2}
 
 
 # ---- where /proc comes from ----------------------------------------------
@@ -225,3 +226,34 @@ def test_process_naming_can_be_switched_off(monkeypatch):
     assert sockets.enabled() is True
     monkeypatch.setenv("CONNECTIONS_PROCESSES", "0")
     assert sockets.enabled() is False
+
+
+def test_a_refused_walk_is_reported_as_denied(tmp_path):
+    """Docker drops CAP_SYS_PTRACE, so reading another process's fds is
+    refused. Swallowing that as "no owner" made the whole feature look
+    like it worked while naming nothing."""
+    root = fake_proc(tmp_path, {812: ("sshd", [31337]), 99: ("other", [1])})
+
+    for pid in ("812", "99"):
+        (tmp_path / pid / "fd").chmod(0o000)
+
+    try:
+        found, denied = sockets.owners({31337}, root)
+    finally:
+        for pid in ("812", "99"):
+            (tmp_path / pid / "fd").chmod(0o755)
+
+    assert found == {}
+    assert denied is True
+
+
+def test_a_few_vanished_processes_are_not_denial(tmp_path):
+    """Processes come and go; that's normal and must not read as a
+    capability problem."""
+    root = fake_proc(tmp_path, {1: ("gone", []), 2: ("b", [2]), 3: ("c", [31337])})
+    (tmp_path / "1" / "fd").rmdir()
+
+    found, denied = sockets.owners({31337}, root)
+
+    assert found[31337]["process"] == "c"
+    assert denied is False

@@ -470,25 +470,33 @@ def snapshot(host: str = "", client=None, *, now: float | None = None) -> dict:
     return result
 
 
-def _name_host_processes(peers: list[dict]) -> bool:
+def _name_host_processes(peers: list[dict]) -> str:
     """Fill in ``process``/``pid`` on the rows no container claimed.
 
-    Mutates ``peers`` and reports whether it managed to run at all. Only
-    the rows still unattributed are looked up, because the lookup walks
-    every process's open file descriptors — on a host where everything is
-    containerised there is nothing to do and nothing is read.
+    Mutates ``peers`` and returns what happened, because "nothing got
+    named" has three very different causes and only one of them is fine:
+
+      ``ok``        it ran (whether or not every socket resolved)
+      ``off``       CONNECTIONS_PROCESSES=0
+      ``no-sockets``  the socket tables weren't readable
+      ``denied``    the walk was refused — the container is missing
+                    CAP_SYS_PTRACE, so it can't see who owns a socket
+
+    ``denied`` used to be indistinguishable from "these sockets have no
+    owner", which made the whole feature look like it worked while naming
+    nothing at all.
     """
     if not sockets.enabled():
-        return False
+        return "off"
 
     unclaimed = [p for p in peers if not p.get("container")]
     if not unclaimed:
-        return True
+        return "ok"
 
     try:
         index = sockets.build_index(sockets.read_sockets())
         if not index["by_port"]:
-            return False
+            return "no-sockets"
 
         wanted, per_row = set(), {}
         for row in unclaimed:
@@ -497,7 +505,7 @@ def _name_host_processes(peers: list[dict]) -> bool:
                 per_row[id(row)] = inode
                 wanted.add(inode)
 
-        found = sockets.owners(wanted)
+        found, denied = sockets.owners(wanted)
 
         for row in unclaimed:
             owner = found.get(per_row.get(id(row)))
@@ -505,11 +513,11 @@ def _name_host_processes(peers: list[dict]) -> bool:
                 row["process"] = owner["process"]
                 row["pid"] = owner["pid"]
 
-        return True
+        return "denied" if denied and not found else "ok"
 
     except OSError as error:
         log.debug("process names unavailable: %s", error)
-        return False
+        return "no-sockets"
 
 
 def _build(host: str, client=None) -> dict:
@@ -567,16 +575,27 @@ def _build(host: str, client=None) -> dict:
     for row in peers:
         row.pop("_flow", None)
 
+    hint = None
+    if processes == "denied":
+        hint = (
+            "Traffic that isn't a container's can't be named: reading "
+            "another process's open sockets needs CAP_SYS_PTRACE, which "
+            "Docker drops by default. Add `cap_add: [SYS_PTRACE]` to the "
+            "agent to turn this on."
+        )
+
     return {
         **base,
         "available": True,
+        "processes_hint": hint,
         "source": str(path),
         "accounting": has_accounting(flows),
         "flows_total": len(flows),
         "conversations_total": total,
         "truncated": total > len(peers),
         "attributed": index is not None,
-        "processes": processes,
+        "processes": processes == "ok",
+        "processes_state": processes,
         "peers": peers,
     }
 

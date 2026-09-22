@@ -58,6 +58,14 @@ services:
 
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
+    # Lets the agent see which process owns a socket, for the Connections
+    # panel's host traffic (sshd, tailscaled, ...). Without it that part
+    # is silently blank: reading another process's open files needs
+    # ptrace-level access and Docker drops this by default. Container
+    # traffic is named without it. Comment out if you'd rather not.
+    cap_add:
+      - SYS_PTRACE
+
     volumes:
       # The host daemon. This is the agent's real privilege boundary.
       - /var/run/docker.sock:/var/run/docker.sock

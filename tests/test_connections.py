@@ -530,7 +530,7 @@ def test_host_flows_get_a_process_name(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         connections.sockets, "owners",
-        lambda wanted, *a, **k: {4242: {"pid": 991, "process": "curl"}},
+        lambda wanted, *a, **k: ({4242: {"pid": 991, "process": "curl"}}, False),
     )
 
     result = connections.snapshot("bigboy")
@@ -576,7 +576,7 @@ def test_an_unmatched_host_flow_keeps_a_null_process(tmp_path, monkeypatch):
             "remote_ip": "9.9.9.9", "remote_port": 9, "inode": 1,
         }],
     )
-    monkeypatch.setattr(connections.sockets, "owners", lambda *a, **k: {})
+    monkeypatch.setattr(connections.sockets, "owners", lambda *a, **k: ({}, False))
 
     peer = connections.snapshot("bigboy")["peers"][0]
     assert peer["process"] is None and peer["pid"] is None
@@ -616,3 +616,50 @@ def test_the_representative_flow_does_not_leak_into_the_response(tmp_path, monke
     monkeypatch.setattr(connections.sockets, "read_sockets", lambda *a, **k: [])
 
     assert "_flow" not in connections.snapshot("bigboy")["peers"][0]
+
+
+def test_a_denied_process_walk_says_why(tmp_path, monkeypatch):
+    """The real-world failure: Docker drops CAP_SYS_PTRACE, so the walk is
+    refused and nothing is ever named. That used to look identical to
+    "these sockets have no owner"."""
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+
+    monkeypatch.setattr(
+        connections.sockets, "read_sockets",
+        lambda *a, **k: [{
+            "proto": "tcp", "local_ip": "10.0.0.5", "local_port": 51234,
+            "remote_ip": "1.1.1.1", "remote_port": 443, "inode": 4242,
+        }],
+    )
+    monkeypatch.setattr(connections.sockets, "owners", lambda *a, **k: ({}, True))
+
+    result = connections.snapshot("bigboy")
+
+    assert result["processes"] is False
+    assert result["processes_state"] == "denied"
+    assert "CAP_SYS_PTRACE" in result["processes_hint"]
+    assert result["available"] is True, "the table itself is still fine"
+
+
+def test_a_working_walk_carries_no_hint(tmp_path, monkeypatch):
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+    monkeypatch.setattr(
+        connections.sockets, "read_sockets",
+        lambda *a, **k: [{
+            "proto": "tcp", "local_ip": "10.0.0.5", "local_port": 51234,
+            "remote_ip": "1.1.1.1", "remote_port": 443, "inode": 4242,
+        }],
+    )
+    monkeypatch.setattr(
+        connections.sockets, "owners",
+        lambda *a, **k: ({4242: {"pid": 1, "process": "sshd"}}, False),
+    )
+
+    result = connections.snapshot("bigboy")
+
+    assert result["processes"] is True
+    assert result["processes_hint"] is None

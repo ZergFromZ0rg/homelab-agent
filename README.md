@@ -1136,15 +1136,34 @@ local port, and `/proc/<pid>/fd/*` says which process is holding it.
 ```
 
 **No `pid: host` is needed** — the same host filesystem mount everything
-else here uses is enough. A bind-mounted procfs exposes every host PID
-regardless of this container's own PID namespace, and reading an fd
-symlink is just a readlink. As with conntrack, the socket tables are read
-as PID 1's copy, because `/proc/net` is a symlink to `/proc/self/net` and
-would otherwise give this container's empty tables.
+else here uses is enough to *see* every host PID, and the socket tables
+are read as PID 1's copy because `/proc/net` is a symlink to
+`/proc/self/net` and would otherwise give this container's empty ones.
 
-`"processes": false` means the lookup couldn't run: the socket tables
-weren't readable, or `CONNECTIONS_PROCESSES=0`. The conntrack table is
-returned either way.
+**`CAP_SYS_PTRACE` is needed**, though, and that one isn't obvious.
+Reading another process's `/proc/<pid>/fd` is ptrace-level access, which
+Docker drops by default — so without it every readlink is refused, no
+socket resolves to a process, and the result is indistinguishable from a
+host whose sockets genuinely have no owner. `compose.yml` adds it:
+
+```yaml
+    cap_add:
+      - SYS_PTRACE
+```
+
+Comment it out if you'd rather not grant it. Container traffic is still
+named without it; only host processes go unnamed, and the response then
+says so rather than looking empty:
+
+```json
+{"processes": false, "processes_state": "denied",
+ "processes_hint": "Traffic that isn't a container's can't be named: ..."}
+```
+
+`processes_state` says which of four things happened: `ok`, `off`
+(`CONNECTIONS_PROCESSES=0`), `no-sockets` (the tables weren't readable),
+or `denied` (the capability above). The conntrack table is returned in
+every case.
 
 The fd walk is the expensive part of this endpoint — it reads every
 process's open file descriptors. It therefore runs **only when there are

@@ -157,19 +157,34 @@ def read_sockets(root: str | None = None) -> list[dict]:
     return rows
 
 
-def _socket_inodes(pid_dir: Path) -> set[int]:
-    """The socket inodes one process holds open."""
+def _socket_inodes(pid_dir: Path) -> tuple[set[int], bool]:
+    """The socket inodes one process holds open, and whether we were
+    refused.
+
+    Refusal is the common case and it matters: reading another process's
+    ``/proc/<pid>/fd`` needs ptrace-level access, which Docker drops
+    (``CAP_SYS_PTRACE``) by default. Treating that as "this process holds
+    no sockets" is how the whole feature can look like it works while
+    never naming anything.
+    """
     inodes = set()
 
     try:
         entries = list((pid_dir / "fd").iterdir())
+    except PermissionError:
+        return inodes, True
     except OSError:
-        # Gone between listing and reading, or not ours to look at.
-        return inodes
+        # Gone between listing and reading.
+        return inodes, False
+
+    denied = False
 
     for entry in entries:
         try:
             target = os.readlink(entry)
+        except PermissionError:
+            denied = True
+            continue
         except OSError:
             continue
 
@@ -179,28 +194,33 @@ def _socket_inodes(pid_dir: Path) -> set[int]:
             except ValueError:
                 continue
 
-    return inodes
+    return inodes, denied
 
 
-def owners(wanted: set[int], root: str | None = None) -> dict[int, dict]:
-    """``inode -> {"pid", "process"}`` for the inodes asked for.
+def owners(wanted: set[int], root: str | None = None) -> tuple[dict[int, dict], bool]:
+    """``(inode -> {"pid", "process"}, denied)`` for the inodes asked for.
 
     Walks every process's open files, which is the expensive part — call
     it only with inodes you actually need, and stop as soon as they're all
     accounted for.
+
+    ``denied`` says the walk was refused for most of what it tried, which
+    means the container lacks ``CAP_SYS_PTRACE`` rather than that nothing
+    owns these sockets.
     """
     if not wanted:
-        return {}
+        return {}, False
 
     root = root or proc_root()
     found: dict[int, dict] = {}
     scanned = 0
+    refused = 0
 
     try:
         entries = sorted(Path(root).iterdir())
     except OSError as error:
         log.debug("cannot list %s: %s", root, error)
-        return {}
+        return {}, False
 
     for entry in entries:
         if not entry.name.isdigit():
@@ -211,7 +231,10 @@ def owners(wanted: set[int], root: str | None = None) -> dict[int, dict]:
             log.debug("process scan stopped at %d processes", MAX_PROCESSES)
             break
 
-        matched = _socket_inodes(entry) & wanted
+        inodes, denied = _socket_inodes(entry)
+        refused += 1 if denied else 0
+
+        matched = inodes & wanted
         if not matched:
             continue
 
@@ -226,7 +249,11 @@ def owners(wanted: set[int], root: str | None = None) -> dict[int, dict]:
         if len(found) == len(wanted):
             break
 
-    return found
+    # A couple of refusals are normal (processes come and go). Being
+    # refused by most of them is the capability problem.
+    denied = scanned > 0 and refused > scanned / 2
+
+    return found, denied
 
 
 def build_index(sockets: list[dict]) -> dict:
