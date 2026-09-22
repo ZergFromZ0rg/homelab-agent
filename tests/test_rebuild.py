@@ -202,7 +202,8 @@ def test_a_failing_rebuild_keeps_its_output(tmp_path, monkeypatch):
     finished = wait_for(rebuild.start(client, target(tmp_path))["id"])
 
     assert finished["state"] == "failed"
-    assert "exited 1" in finished["error"]
+    # "no space left on device" is now recognised and explained.
+    assert "disk space" in finished["error"]
     assert "no space left" in finished["steps"][0]["output"]
 
 
@@ -476,3 +477,68 @@ def test_the_summary_shows_the_configured_remote_and_that_it_is_pullable(tmp_pat
     # The remote shown is the one configured; the pull works anyway.
     assert summary["remote"] == "git@github.com:zerg/x.git"
     assert summary["can_pull"] is True
+
+
+# ---- reading a failure ----------------------------------------------------
+
+
+def test_a_private_repo_is_named_as_such():
+    """git's own wording describes the symptom, not the cause: nothing in
+    "could not read Username" says the repo is private."""
+    out = "fatal: could not read Username for 'https://github.com': No such device or address"
+
+    assert "private" in rebuild.classify_failure(out, 1)
+
+
+def test_authentication_failed_is_the_same_family():
+    assert "private" in rebuild.classify_failure("remote: Authentication failed", 1)
+
+
+def test_a_diverged_checkout_says_the_agent_will_not_touch_it():
+    message = rebuild.classify_failure("fatal: Not possible to fast-forward, aborting.", 1)
+
+    assert "diverged" in message
+    assert "won't" in message, "it should say it isn't going to fix that itself"
+
+
+def test_a_full_disk():
+    assert "disk space" in rebuild.classify_failure(
+        "write /var/lib/docker/tmp: no space left on device", 1)
+
+
+def test_a_taken_port():
+    assert "already taken" in rebuild.classify_failure(
+        "driver failed programming external connectivity: port is already allocated", 1)
+
+
+def test_an_unpullable_image():
+    assert "couldn't be pulled" in rebuild.classify_failure(
+        "Error response from daemon: pull access denied for foo/bar", 1)
+
+
+def test_dubious_ownership_blames_the_agent_not_the_host():
+    """It would mean safe.directory regressed, which is ours to fix."""
+    message = rebuild.classify_failure("fatal: detected dubious ownership", 1)
+
+    assert "bug in the agent" in message
+
+
+def test_an_unrecognised_failure_is_not_guessed_at():
+    """A wrong explanation is worse than none."""
+    assert rebuild.classify_failure("some unrecognised explosion", 3) == "rebuild exited 3"
+    assert rebuild.classify_failure("", 1) == "rebuild exited 1"
+
+
+def test_the_job_carries_the_readable_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(rebuild, "HOST_ROOT", str(tmp_path))
+    client = fake_client(
+        exit_code=1,
+        logs=b"fatal: could not read Username for 'https://github.com'\n",
+    )
+
+    finished = wait_for(rebuild.start(client, target(tmp_path))["id"])
+
+    assert finished["state"] == "failed"
+    assert "private" in finished["error"]
+    # The raw output is still there for anyone who wants it.
+    assert "could not read Username" in finished["steps"][0]["output"]

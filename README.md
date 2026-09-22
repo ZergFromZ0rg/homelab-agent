@@ -1389,6 +1389,14 @@ running is a `409`.
 its last 8 KB of combined output, which is what you want when a build
 fails.
 
+A failed job's `error` explains the cause rather than repeating git's
+wording, which tends to describe the symptom — nothing in *"could not read
+Username for https://github.com"* says the repo is private. Recognised:
+private repos and auth failures, an ssh key refusal, a diverged checkout,
+an unreachable remote, a full disk, a taken port, and an unpullable
+image. Anything else falls back to the exit code rather than inventing a
+cause. The raw output stays on the step either way.
+
 | Route | |
 | --- | --- |
 | `POST /rebuild` | `{"container": "<id or name>", "pull": true}` → a job |

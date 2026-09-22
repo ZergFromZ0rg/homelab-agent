@@ -328,6 +328,72 @@ def _script(job: dict) -> str:
     return " && ".join(parts)
 
 
+# Git and compose both fail in a handful of recognisable ways, and their
+# own wording tends to describe the symptom rather than the cause. "could
+# not read Username for https://github.com" is a private repo; nothing in
+# that sentence says so.
+#
+# Ordered: the first pattern that matches wins, so put the specific ones
+# before the general.
+_FAILURES = (
+    (
+        ("could not read username", "authentication failed", "invalid username or password"),
+        "that repo is private, and the agent has no credentials for it. "
+        "Pull it on the host yourself, then rebuild without pulling.",
+    ),
+    (
+        ("permission denied (publickey", "host key verification failed"),
+        "the remote refused the agent's (nonexistent) ssh key. A public "
+        "repo is read over https instead; a private one needs pulling on "
+        "the host.",
+    ),
+    (
+        ("dubious ownership",),
+        "git refused the checkout's ownership — this is a bug in the agent, "
+        "not your setup; it should be passing -c safe.directory.",
+    ),
+    (
+        ("not possible to fast-forward", "diverging branches", "would be overwritten"),
+        "the checkout on that host has diverged from the remote, so a "
+        "fast-forward pull won't work. Sort it out there — the agent won't "
+        "merge or discard anything on its own.",
+    ),
+    (
+        ("could not resolve host", "unable to access", "connection timed out",
+         "network is unreachable"),
+        "the host couldn't reach the git remote.",
+    ),
+    (
+        ("no space left on device",),
+        "that host is out of disk space.",
+    ),
+    (
+        ("port is already allocated", "address already in use"),
+        "a port the project wants is already taken on that host.",
+    ),
+    (
+        ("pull access denied", "manifest unknown", "not found: manifest"),
+        "an image in the project couldn't be pulled — check the tag exists "
+        "and the registry is reachable.",
+    ),
+)
+
+
+def classify_failure(output: str, exit_code: int) -> str:
+    """Turn a build's output into something worth reading.
+
+    Falls back to the exit code rather than inventing a cause: a wrong
+    explanation is worse than none.
+    """
+    lowered = (output or "").lower()
+
+    for needles, message in _FAILURES:
+        if any(needle in lowered for needle in needles):
+            return message
+
+    return f"rebuild exited {exit_code}"
+
+
 def _run_job(client, job: dict) -> None:
     try:
         _rebuild(client, job)
@@ -415,8 +481,11 @@ def _rebuild(client, job: dict) -> None:
         "seconds": round(time.time() - started, 1),
     })
 
-    _finish(job, "done" if code == 0 else "failed",
-            None if code == 0 else f"rebuild exited {code}")
+    _finish(
+        job,
+        "done" if code == 0 else "failed",
+        None if code == 0 else classify_failure(output, code),
+    )
 
 
 def summary_for(labels: dict | None) -> dict | None:
