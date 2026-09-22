@@ -634,12 +634,18 @@ def test_a_denied_process_walk_says_why(tmp_path, monkeypatch):
         }],
     )
     monkeypatch.setattr(connections.sockets, "owners", lambda *a, **k: ({}, True))
+    monkeypatch.setattr(connections.sockets, "diagnose", lambda *a, **k: {
+        "pids_visible": 200, "fds_readable": 2, "fds_refused": 190,
+        "sockets": 40,
+        "reason": "refused when reading processes' open sockets — add "
+                  "`cap_add: [SYS_PTRACE]` to the agent",
+    })
 
     result = connections.snapshot("bigboy")
 
     assert result["processes"] is False
     assert result["processes_state"] == "denied"
-    assert "CAP_SYS_PTRACE" in result["processes_hint"]
+    assert "SYS_PTRACE" in result["processes_hint"]
     assert result["available"] is True, "the table itself is still fine"
 
 
@@ -663,3 +669,33 @@ def test_a_working_walk_carries_no_hint(tmp_path, monkeypatch):
 
     assert result["processes"] is True
     assert result["processes_hint"] is None
+
+
+def test_sockets_read_but_nothing_matched_is_its_own_state(tmp_path, monkeypatch):
+    """The state that actually happened on the real fleet: the walk works,
+    the tables are read, and still nothing resolves. Reporting that as
+    "ok" is what made the feature look like it worked."""
+    table = tmp_path / "nf_conntrack"
+    table.write_text(ACCOUNTED_TCP)
+    monkeypatch.setenv("CONNTRACK_FILE", str(table))
+
+    monkeypatch.setattr(
+        connections.sockets, "read_sockets",
+        lambda *a, **k: [{
+            "proto": "tcp", "local_ip": "10.0.0.5", "local_port": 51234,
+            "remote_ip": "1.1.1.1", "remote_port": 443, "inode": 4242,
+        }],
+    )
+    monkeypatch.setattr(connections.sockets, "owners", lambda *a, **k: ({}, False))
+    monkeypatch.setattr(connections.sockets, "diagnose", lambda *a, **k: {
+        "pids_visible": 260, "fds_readable": 82, "fds_refused": 0,
+        "sockets": 52, "reason": None,
+    })
+
+    result = connections.snapshot("bigboy")
+
+    assert result["processes_state"] == "unmatched"
+    assert "260 processes visible" in result["processes_hint"]
+    assert "82 with readable sockets" in result["processes_hint"]
+    # The evidence travels with it, so nobody has to go collect it.
+    assert result["processes_facts"]["sockets"] == 52

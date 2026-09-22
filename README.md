@@ -1160,10 +1160,30 @@ says so rather than looking empty:
  "processes_hint": "Traffic that isn't a container's can't be named: ..."}
 ```
 
-`processes_state` says which of four things happened: `ok`, `off`
-(`CONNECTIONS_PROCESSES=0`), `no-sockets` (the tables weren't readable),
-or `denied` (the capability above). The conntrack table is returned in
-every case.
+`processes_state` says which of five things happened, and when it isn't
+`ok` the response carries the evidence with it rather than leaving you to
+go and collect it:
+
+| state | |
+| --- | --- |
+| `ok` | names resolved |
+| `off` | `CONNECTIONS_PROCESSES=0` |
+| `no-sockets` | the socket tables weren't readable |
+| `denied` | the walk was refused — add the capability above |
+| `unmatched` | everything is readable and still nothing resolved |
+
+`unmatched` is the honest one. It happens, it isn't a misconfiguration
+you can fix from here, and `processes_facts` comes back with the counts
+that would otherwise take several commands on the host to gather:
+
+```json
+{"processes_state": "unmatched",
+ "processes_hint": "Host processes couldn't be matched to their sockets on this host — 260 processes visible, 82 with readable sockets, 52 sockets in the table. Container traffic is named regardless; this only affects the host's own.",
+ "processes_facts": {"pids_visible": 260, "fds_readable": 82, "fds_refused": 0, "sockets": 52}}
+```
+
+Container traffic is named in every one of these states. This only ever
+affects the host's own processes, which is the least interesting half.
 
 The fd walk is the expensive part of this endpoint — it reads every
 process's open file descriptors. It therefore runs **only when there are

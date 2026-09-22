@@ -302,3 +302,60 @@ def match(flow: dict, index: dict) -> int | None:
             return inode
 
     return None
+
+
+def diagnose(root: str | None = None) -> dict:
+    """Why process naming is or isn't working, without anyone having to
+    SSH anywhere.
+
+    This exists because working that out by hand took five commands across
+    two machines and four wrong theories. Every fact that mattered is
+    cheap to collect, so the agent collects it and says so.
+    """
+    root = root or proc_root()
+    facts = {
+        "enabled": enabled(),
+        "proc_root": root,
+        "pids_visible": 0,
+        "fds_readable": 0,
+        "fds_refused": 0,
+        "sockets": 0,
+    }
+
+    if not facts["enabled"]:
+        facts["reason"] = "turned off with CONNECTIONS_PROCESSES=0"
+        return facts
+
+    try:
+        pids = [d for d in os.listdir(root) if d.isdigit()]
+    except OSError as error:
+        facts["reason"] = f"can't read {root}: {error}"
+        return facts
+
+    facts["pids_visible"] = len(pids)
+
+    for pid in pids:
+        inodes, denied = _socket_inodes(Path(root, pid))
+        if denied:
+            facts["fds_refused"] += 1
+        elif inodes:
+            facts["fds_readable"] += 1
+
+    facts["sockets"] = len(read_sockets(root))
+
+    if not facts["pids_visible"]:
+        facts["reason"] = (
+            f"no processes visible at {root} \u2014 mount the host's filesystem "
+            "(-v /:/host:ro) so the agent can see them"
+        )
+    elif facts["fds_refused"] > facts["fds_readable"]:
+        facts["reason"] = (
+            "refused when reading processes' open sockets \u2014 add "
+            "`cap_add: [SYS_PTRACE]` to the agent"
+        )
+    elif not facts["sockets"]:
+        facts["reason"] = f"no socket tables under {root}/1/net"
+    else:
+        facts["reason"] = None
+
+    return facts

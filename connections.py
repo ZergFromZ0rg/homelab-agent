@@ -513,7 +513,12 @@ def _name_host_processes(peers: list[dict]) -> str:
                 row["process"] = owner["process"]
                 row["pid"] = owner["pid"]
 
-        return "denied" if denied and not found else "ok"
+        if found:
+            return "ok"
+        # Sockets were read and the walk wasn't refused, yet nothing
+        # resolved. That's a real state and it deserves its own name —
+        # reporting it as "ok" is what made this look like it worked.
+        return "denied" if denied else "unmatched"
 
     except OSError as error:
         log.debug("process names unavailable: %s", error)
@@ -576,18 +581,25 @@ def _build(host: str, client=None) -> dict:
         row.pop("_flow", None)
 
     hint = None
-    if processes == "denied":
-        hint = (
-            "Traffic that isn't a container's can't be named: reading "
-            "another process's open sockets needs CAP_SYS_PTRACE, which "
-            "Docker drops by default. Add `cap_add: [SYS_PTRACE]` to the "
-            "agent to turn this on."
+    facts = None
+
+    if processes in ("denied", "unmatched", "no-sockets"):
+        # Collect the evidence once, here, rather than leaving someone to
+        # work it out by hand across several machines.
+        facts = sockets.diagnose()
+        hint = facts.get("reason") or (
+            "Host processes couldn't be matched to their sockets on this "
+            f"host — {facts['pids_visible']} processes visible, "
+            f"{facts['fds_readable']} with readable sockets, "
+            f"{facts['sockets']} sockets in the table. Container traffic "
+            "is named regardless; this only affects the host's own."
         )
 
     return {
         **base,
         "available": True,
         "processes_hint": hint,
+        "processes_facts": facts,
         "source": str(path),
         "accounting": has_accounting(flows),
         "flows_total": len(flows),
