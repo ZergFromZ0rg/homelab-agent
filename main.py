@@ -1096,6 +1096,24 @@ def backup_volumes(x_agent_token: str | None = Header(default=None)):
     }
 
 
+@app.get("/backup/projects")
+def backup_projects(x_agent_token: str | None = Header(default=None)):
+    """Every Compose project here and the data it owns, whether or not it is
+    currently allowed to be backed up.
+
+    This is the "what would I lose" question, so it has to include what
+    nobody has configured yet — that is precisely the case worth knowing
+    about.
+    """
+    require_agent_token(x_agent_token)
+
+    return {
+        "host": HOST_NAME,
+        "projects": volume_backup.projects(client),
+        "source_dirs": volume_backup.source_dirs(),
+    }
+
+
 @app.post("/backup/volumes/run")
 def backup_volume_run(
     payload: dict,

@@ -1102,3 +1102,88 @@ def _backup(client, job: dict, *, host_path: str | None,
 def reset() -> None:
     with _lock:
         _jobs.clear()
+
+
+# ---------------------------------------------------------------------------
+# What it would take to rebuild this host
+# ---------------------------------------------------------------------------
+
+
+def projects(client) -> list[dict]:
+    """Every Compose project on this host and the data each one owns.
+
+    Deliberately *not* filtered by ``BACKUP_SOURCE_DIRS``. The question this
+    answers is "what would I lose if this machine died", and an answer that
+    only lists the directories somebody already allowed would say "nothing"
+    on a host nobody has configured — which is the exact case where the
+    honest answer is "everything".
+
+    Each directory carries whether it is currently allowed, so the caller
+    can name the one setting that would protect it.
+    """
+    allowed = source_dirs()
+    root = host_root()
+
+    def permitted(path: str) -> bool:
+        target = Path(path)
+        return any(target == Path(r) or Path(r) in target.parents for r in allowed)
+
+    found: dict[str, dict] = {}
+
+    try:
+        containers = client.containers.list(all=True)
+    except Exception as error:  # noqa: BLE001
+        log.warning("could not list containers: %s", error)
+        return []
+
+    for container in containers:
+        labels = container.labels or {}
+        name = labels.get("com.docker.compose.project") or "(no project)"
+        entry = found.setdefault(name, {
+            "project": name,
+            "working_dir": labels.get("com.docker.compose.project.working_dir"),
+            "containers": [],
+            "directories": [],
+            "volumes": [],
+        })
+        entry["containers"].append(container.name)
+
+        for mount in container.attrs.get("Mounts") or []:
+            if mount.get("Type") == "volume" and mount.get("Name"):
+                volume = mount["Name"]
+
+                if volume.endswith(PLACEHOLDER_VOLUME) or _anonymous(volume):
+                    continue
+
+                if volume not in [v["name"] for v in entry["volumes"]]:
+                    entry["volumes"].append({"name": volume, "allowed": True})
+
+            elif mount.get("Type") == "bind":
+                path = (mount.get("Source") or "").rstrip("/")
+
+                # The docker socket and /proc-style mounts are plumbing, not
+                # data. Backing them up is meaningless and listing them as
+                # unprotected would be noise that hides the real answer.
+                if not path or path.startswith(("/var/run", "/run", "/proc", "/sys", "/dev")):
+                    continue
+
+                if path in [d["path"] for d in entry["directories"]]:
+                    continue
+
+                inside = Path(root + path)
+
+                if not inside.is_dir():
+                    continue
+
+                entry["directories"].append({
+                    "path": path,
+                    "allowed": permitted(path),
+                    **measure(str(inside)),
+                })
+
+    for entry in found.values():
+        entry["containers"] = sorted(set(entry["containers"]))
+        entry["directories"].sort(key=lambda d: d["path"])
+        entry["volumes"].sort(key=lambda v: v["name"])
+
+    return sorted(found.values(), key=lambda e: e["project"])

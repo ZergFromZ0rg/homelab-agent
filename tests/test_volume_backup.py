@@ -854,3 +854,91 @@ def test_verifying_an_encrypted_archive_without_the_passphrase_is_unknown(
 
     assert out["ok"] is None
     assert "no backup passphrase" in out["error"]
+
+
+# ---- what would I lose ----------------------------------------------------
+
+
+def test_projects_report_data_nobody_has_allowed_yet(host, monkeypatch):
+    """The whole point. A host nobody has configured must not answer
+    "nothing to lose" — that is exactly the host where the true answer is
+    "everything"."""
+    monkeypatch.delenv("BACKUP_SOURCE_DIRS", raising=False)
+    volume_backup.forget_sizes()
+
+    container = FakeContainer("qdrant-1", mounts=[
+        {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+    ])
+    container.labels = {"com.docker.compose.project": "ai-librarian"}
+    found = volume_backup.projects(FakeClient(containers=[container]))
+
+    assert [p["project"] for p in found] == ["ai-librarian"]
+    (directory,) = found[0]["directories"]
+    assert directory["path"] == "/home/zerg/ai-librarian/data/qdrant"
+    assert directory["allowed"] is False, "reported, but flagged as not allowed"
+
+
+def test_projects_mark_what_is_already_allowed(host, monkeypatch):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg/ai-librarian")
+    volume_backup.forget_sizes()
+
+    container = FakeContainer("qdrant-1", mounts=[
+        {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+    ])
+    container.labels = {"com.docker.compose.project": "ai-librarian"}
+    client = FakeClient(containers=[container])
+
+    (project,) = volume_backup.projects(client)
+
+    assert project["directories"][0]["allowed"] is True
+
+
+def test_plumbing_mounts_are_not_reported_as_data(host, monkeypatch):
+    """The docker socket and /proc are not things you restore. Listing them
+    as unprotected would be noise hiding the real answer."""
+    volume_backup.forget_sizes()
+
+    container = FakeContainer("agent", mounts=[
+        {"Type": "bind", "Source": "/var/run/docker.sock"},
+        {"Type": "bind", "Source": "/proc"},
+        {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+    ])
+    container.labels = {"com.docker.compose.project": "homelab-agent"}
+    client = FakeClient(containers=[container])
+
+    (project,) = volume_backup.projects(client)
+
+    assert [d["path"] for d in project["directories"]] == [
+        "/home/zerg/ai-librarian/data/qdrant"
+    ]
+
+
+def test_anonymous_and_placeholder_volumes_are_not_data(host):
+    volume_backup.forget_sizes()
+
+    container = FakeContainer("x", mounts=[
+        {"Type": "volume", "Name": "a" * 64},
+        {"Type": "volume", "Name": "homelab-agent_agent-backups-unset"},
+        {"Type": "volume", "Name": "uptime-kuma_data"},
+    ])
+    container.labels = {"com.docker.compose.project": "uptime-kuma"}
+    client = FakeClient(containers=[container])
+
+    (project,) = volume_backup.projects(client)
+
+    assert [v["name"] for v in project["volumes"]] == ["uptime-kuma_data"]
+
+
+def test_a_container_with_no_project_still_reports_its_data(host):
+    volume_backup.forget_sizes()
+
+    container = FakeContainer("loose", mounts=[
+        {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+    ])
+    container.labels = {}
+    client = FakeClient(containers=[container])
+
+    (project,) = volume_backup.projects(client)
+
+    assert project["project"] == "(no project)"
+    assert project["directories"]
