@@ -62,6 +62,9 @@ services:
       # Volume backups. Directories inside this container that archives
       # may be written to — see the volumes section. Empty means this host
       # stores no backups; it can still be a source for another node's.
+      # Set it and every archive this host writes or receives is encrypted
+      # with gpg. Usually set from the dashboard instead of here.
+      BACKUP_PASSPHRASE: ${BACKUP_PASSPHRASE:-}
       BACKUP_DIRS: ${BACKUP_DIRS:-}
       BACKUP_PUBLIC_URL: ${BACKUP_PUBLIC_URL:-}
 

@@ -6,6 +6,8 @@ and it does the same thing, which is what these tests do.
 """
 
 import hashlib
+import io
+import os
 import json
 import subprocess
 import sys
@@ -36,7 +38,11 @@ def run_helper(src, *, dest=None, env=None, name="test.tar.gz"):
 
     done = subprocess.run(
         [sys.executable, HELPER],
-        capture_output=True, text=True, env={"PATH": "/usr/bin:/bin", **full},
+        # The real PATH, not a minimal one: gpg lives wherever the machine
+        # running these tests put it (/opt/homebrew on a Mac, /usr/bin in
+        # the container), and a stripped PATH only tests that.
+        capture_output=True, text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **full},
     )
 
     try:
@@ -257,3 +263,114 @@ def test_an_unreachable_agent_is_reported(volume):
 
     assert code == 1
     assert report["error"]
+
+
+# ---- encryption -----------------------------------------------------------
+
+import shutil
+
+needs_gpg = pytest.mark.skipif(shutil.which("gpg") is None, reason="gpg not installed")
+
+PASSPHRASE = "correct horse battery staple"
+
+
+@needs_gpg
+def test_an_encrypted_archive_is_not_readable_as_a_tar(tmp_path):
+    src = make_volume(tmp_path / "src")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    code, report = run_helper(
+        src, dest=dest, name="test.tar.gz.gpg",
+        env={"BACKUP_PASSPHRASE": PASSPHRASE},
+    )
+
+    assert code == 0, report
+    assert report["encrypted"] is True
+
+    with pytest.raises(tarfile.ReadError):
+        tarfile.open(dest / "test.tar.gz.gpg")
+
+
+@needs_gpg
+def test_an_encrypted_archive_restores_with_gpg_and_tar_alone(tmp_path):
+    """The reason for using a standard format instead of rolling one: a
+    restore needs gpg and the passphrase and nothing from this repository.
+    A backup whose only reader is the tool that made it is a hostage."""
+    src = make_volume(tmp_path / "src")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    restored = tmp_path / "restored"
+    restored.mkdir()
+
+    run_helper(src, dest=dest, name="test.tar.gz.gpg",
+               env={"BACKUP_PASSPHRASE": PASSPHRASE})
+
+    plain = subprocess.run(
+        ["gpg", "--batch", "--quiet", "--pinentry-mode", "loopback",
+         "--passphrase", PASSPHRASE, "-d", str(dest / "test.tar.gz.gpg")],
+        capture_output=True,
+    )
+    assert plain.returncode == 0, plain.stderr[:300]
+
+    with tarfile.open(fileobj=io.BytesIO(plain.stdout), mode="r|gz") as tar:
+        tar.extractall(restored, filter="tar")
+
+    assert (restored / "a.txt").read_text() == "hello volume"
+    assert (restored / "sub" / "blob.bin").read_bytes() == (
+        src / "sub" / "blob.bin"
+    ).read_bytes()
+
+
+@needs_gpg
+def test_the_wrong_passphrase_does_not_open_it(tmp_path):
+    src = make_volume(tmp_path / "src")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    run_helper(src, dest=dest, name="test.tar.gz.gpg",
+               env={"BACKUP_PASSPHRASE": PASSPHRASE})
+
+    out = subprocess.run(
+        ["gpg", "--batch", "--quiet", "--pinentry-mode", "loopback",
+         "--passphrase", "wrong", "-d", str(dest / "test.tar.gz.gpg")],
+        capture_output=True,
+    )
+
+    assert out.returncode != 0
+
+
+@needs_gpg
+def test_encryption_streams_to_another_agent_too(tmp_path):
+    src = make_volume(tmp_path / "src")
+
+    with Receiver() as receiver:
+        code, report = run_helper(src, env={
+            "BACKUP_DEST_URL": receiver.url, "BACKUP_DEST_DIR": "/backups",
+            "BACKUP_PASSPHRASE": PASSPHRASE,
+        }, name="test.tar.gz.gpg")
+
+    assert code == 0, report
+    assert report["encrypted"] is True
+    assert receiver.seen["encoding"].lower() == "chunked", (
+        "still streamed — encryption must not mean staging the whole archive"
+    )
+    assert receiver.seen["bytes"] == report["bytes"]
+
+
+@needs_gpg
+def test_a_bad_passphrase_setup_reports_gpgs_own_error(tmp_path):
+    """gpg's message is the only one that says what went wrong; a broken
+    pipe from the writer thread would hide it."""
+    src = make_volume(tmp_path / "src")
+    dest = tmp_path / "dest"
+    dest.mkdir()
+
+    code, report = run_helper(
+        src, dest=dest, name="test.tar.gz.gpg",
+        env={"BACKUP_PASSPHRASE": PASSPHRASE, "GNUPGHOME": "/nonexistent/nope"},
+    )
+
+    if code != 0:
+        assert "gpg" in report["error"].lower()
+        assert "broken pipe" not in report["error"].lower()

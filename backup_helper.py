@@ -17,6 +17,12 @@ Mounts
 
 Environment
     BACKUP_NAME       the archive's filename
+    BACKUP_PASSPHRASE when set, the archive is encrypted with gpg before it
+                      is written or sent. Symmetric, AES256, standard
+                      OpenPGP: a restore needs gpg and the passphrase, and
+                      nothing from this repository. That is the point — a
+                      backup whose only reader is the tool that made it is
+                      a hostage, not a backup.
     BACKUP_DEST_URL   a *remote* agent's base url, when the destination is
                       on another node. Mutually exclusive with /dest.
     BACKUP_DEST_DIR   the directory to ask that agent to write into
@@ -38,6 +44,7 @@ import json
 import os
 import queue
 import stat
+import subprocess
 import sys
 import tarfile
 import threading
@@ -109,15 +116,37 @@ class _Sink:
         pass
 
 
-def _write_archive(emit, counts: Counter) -> None:
+def gpg_command(passphrase_fd: int) -> list[str]:
+    """Symmetric AES256, passphrase down a file descriptor.
+
+    The fd number is passed in rather than fixed: ``os.pipe()`` hands back
+    whatever numbers are free and ``pass_fds`` keeps those numbers in the
+    child, so hardcoding ``3`` means gpg waits on a descriptor nobody is
+    writing to.
+    """
+    return [
+        "gpg", "--batch", "--yes", "--quiet", "--no-tty",
+        "--pinentry-mode", "loopback", "--passphrase-fd", str(passphrase_fd),
+        "--symmetric", "--cipher-algo", "AES256",
+        # Already gzipped. Compressing ciphertext-to-be twice buys nothing
+        # and costs real time on a slow box.
+        "--compress-algo", "none",
+    ]
+
+
+def _write_archive(emit, counts: Counter, *, count_output: bool = True) -> None:
     """Tar ``/src`` through gzip into ``emit``.
 
     ``mtime=0`` on the gzip header so two runs over unchanged data differ
     only where the data differs — it makes an archive's checksum mean
     something. ``w|`` is tar's stream mode: no seeking back, which is what
     lets this work against a pipe or a socket at all.
+
+    ``count_output`` is off when something downstream (gpg) will produce
+    the bytes that actually land, since those are the ones worth measuring
+    and hashing.
     """
-    sink = _Sink(emit, counts)
+    sink = _Sink(emit, counts) if count_output else _Passthrough(emit)
     gz = gzip.GzipFile(filename="", mode="wb", fileobj=sink, mtime=0)
 
     try:
@@ -127,11 +156,93 @@ def _write_archive(emit, counts: Counter) -> None:
         gz.close()
 
 
-def _to_file(path: str, counts: Counter) -> None:
+class _Passthrough:
+    """A write-only file object that just forwards."""
+
+    def __init__(self, emit):
+        self._emit = emit
+
+    def write(self, data) -> int:
+        block = bytes(data)
+        if block:
+            self._emit(block)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+
+def _produce(emit, counts: Counter, passphrase: str) -> None:
+    """The bytes that land, plain or encrypted.
+
+    With a passphrase the tar goes into gpg's stdin on a thread while this
+    reads its stdout, because a pipe in both directions fills up and
+    deadlocks if only one end is being served.
+    """
+    if not passphrase:
+        _write_archive(emit, counts)
+        return
+
+    read_fd, write_fd = os.pipe()
+    process = subprocess.Popen(
+        gpg_command(read_fd), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, pass_fds=(read_fd,),
+    )
+
+    # Down a pipe, not in argv: anything on the command line is readable by
+    # every process on the host for as long as gpg runs.
+    with os.fdopen(write_fd, "wb") as handle:
+        handle.write(passphrase.encode() + b"\n")
+
+    os.close(read_fd)
+
+    failure: list[BaseException] = []
+
+    def feed():
+        try:
+            _write_archive(process.stdin.write, counts, count_output=False)
+        except BaseException as error:  # noqa: BLE001 - re-raised below
+            failure.append(error)
+        finally:
+            try:
+                process.stdin.close()
+            except BrokenPipeError:
+                pass
+
+    thread = threading.Thread(target=feed, daemon=True)
+    thread.start()
+
+    sink = _Sink(emit, counts)
+
+    while True:
+        chunk = process.stdout.read(CHUNK_BYTES)
+
+        if not chunk:
+            break
+
+        sink.write(chunk)
+
+    process.stdout.close()
+    code = process.wait()
+    stderr = (process.stderr.read() or b"").decode("utf-8", "replace").strip()
+    process.stderr.close()
+    thread.join(timeout=30)
+
+    # gpg's own complaint first. When it dies the writer thread sees a
+    # broken pipe, and reporting that instead would hide the only message
+    # that says what went wrong.
+    if code != 0:
+        raise RuntimeError(f"gpg failed ({code}): {stderr[:300]}")
+
+    if failure:
+        raise failure[0]
+
+
+def _to_file(path: str, counts: Counter, passphrase: str) -> None:
     partial = f"{path}.part"
 
     with open(partial, "wb") as handle:
-        _write_archive(handle.write, counts)
+        _produce(handle.write, counts, passphrase)
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -153,9 +264,9 @@ class _Chunks:
         self._queue: queue.Queue = queue.Queue(QUEUE_DEPTH)
         self._error: BaseException | None = None
 
-    def feed(self, counts: Counter) -> None:
+    def feed(self, counts: Counter, passphrase: str = "") -> None:
         try:
-            _write_archive(self._queue.put, counts)
+            _produce(self._queue.put, counts, passphrase)
         except BaseException as error:  # noqa: BLE001 - re-raised in the reader
             self._error = error
         finally:
@@ -175,11 +286,13 @@ class _Chunks:
 
 
 def _to_agent(base_url: str, directory: str, name: str, token: str,
-              counts: Counter) -> dict:
+              counts: Counter, passphrase: str = "") -> dict:
     url = urllib.parse.urlparse(base_url.rstrip("/") + "/backup/receive")
     chunks = _Chunks()
 
-    thread = threading.Thread(target=chunks.feed, args=(counts,), daemon=True)
+    thread = threading.Thread(
+        target=chunks.feed, args=(counts, passphrase), daemon=True
+    )
     thread.start()
 
     connection = (
@@ -224,6 +337,7 @@ def main() -> int:
     dest_url = os.environ.get("BACKUP_DEST_URL", "").strip()
     dest_dir = os.environ.get("BACKUP_DEST_DIR", "").strip()
     token = os.environ.get("BACKUP_TOKEN", "").strip()
+    passphrase = os.environ.get("BACKUP_PASSPHRASE", "")
 
     if not name:
         print(json.dumps({"error": "BACKUP_NAME is required"}))
@@ -239,9 +353,9 @@ def main() -> int:
 
     try:
         if dest_url:
-            remote = _to_agent(dest_url, dest_dir, name, token, counts)
+            remote = _to_agent(dest_url, dest_dir, name, token, counts, passphrase)
         else:
-            _to_file(os.path.join(DEST, name), counts)
+            _to_file(os.path.join(DEST, name), counts, passphrase)
 
     except Exception as error:  # noqa: BLE001 - the message is the product
         print(json.dumps({"error": str(error)[:500]}))
@@ -256,6 +370,7 @@ def main() -> int:
         "sha256": counts.digest.hexdigest(),
         "seconds": round(time.time() - started, 1),
         "destination": dest_url or DEST,
+        "encrypted": bool(passphrase),
     }
 
     # The receiving agent hashed the bytes it actually stored. If that

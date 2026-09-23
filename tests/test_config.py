@@ -278,3 +278,20 @@ def test_a_setting_takes_effect_without_a_restart(client, writable):
     client.put("/config", json={"settings": {"REBUILD_ENABLED": True}})
 
     assert rebuild.enabled() is True
+
+
+def test_the_passphrase_is_a_secret_that_can_be_set(writable):
+    config.update({"BACKUP_PASSPHRASE": "correct horse battery staple"})
+
+    shown = {s["key"]: s for s in config.current()}["BACKUP_PASSPHRASE"]
+
+    assert shown["value"] == "", "never handed back"
+    assert shown["set"] is True
+    assert config.get("BACKUP_PASSPHRASE") == "correct horse battery staple"
+
+
+def test_the_passphrase_is_marked_as_the_one_you_cannot_lose(writable):
+    setting = config.BY_KEY["BACKUP_PASSPHRASE"]
+
+    assert setting["danger"] is True
+    assert "UNREADABLE" in setting["help"]

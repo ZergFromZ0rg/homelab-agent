@@ -44,6 +44,7 @@ wrong.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import threading
@@ -65,9 +66,11 @@ MAX_JOBS = 30
 
 # Archives are named by the agent, never by the caller, and this is what
 # that name is allowed to look like coming back in over HTTP.
-ARCHIVE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.tar\.gz$")
+ARCHIVE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,180}\.tar\.gz(\.gpg)?$")
 
 SUFFIX = ".tar.gz"
+ENCRYPTED_SUFFIX = ".tar.gz.gpg"
+SUFFIXES = (ENCRYPTED_SUFFIX, SUFFIX)
 
 
 class PolicyError(ValueError):
@@ -516,7 +519,15 @@ def candidate_dirs(client) -> list[dict]:
     return out
 
 
-def archive_name(source: str, when: float | None = None) -> str:
+def passphrase() -> str:
+    """The backup passphrase, or empty. Set on every host that writes *or
+    checks* an archive: the host that verifies is usually not the one that
+    encrypted."""
+    return config.get("BACKUP_PASSPHRASE")
+
+
+def archive_name(source: str, when: float | None = None,
+                 encrypted: bool | None = None) -> str:
     """``<source>-<stamp>.tar.gz``, where source is a volume name or a path.
 
     The same sanitiser covers both: a path's slashes become dashes, so
@@ -526,7 +537,8 @@ def archive_name(source: str, when: float | None = None) -> str:
     """
     stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime(when or time.time()))
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", source).strip("-") or "volume"
-    return f"{safe}-{stamp}{SUFFIX}"
+    secret = passphrase() if encrypted is None else encrypted
+    return f"{safe}-{stamp}{ENCRYPTED_SUFFIX if secret else SUFFIX}"
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +562,7 @@ def list_archives(client, directory: str) -> list[dict]:
     out = []
 
     for entry in path.iterdir():
-        if not entry.is_file() or not entry.name.endswith(SUFFIX):
+        if not entry.is_file() or not entry.name.endswith(SUFFIXES):
             continue
 
         try:
@@ -562,6 +574,7 @@ def list_archives(client, directory: str) -> list[dict]:
             "name": entry.name,
             "bytes": info.st_size,
             "modified_at": info.st_mtime,
+            "encrypted": entry.name.endswith(ENCRYPTED_SUFFIX),
         })
 
     return sorted(out, key=lambda a: a["modified_at"], reverse=True)
@@ -589,6 +602,51 @@ def delete_archives(client, directory: str, names: list[str]) -> dict:
         audit.info("backup: deleted %s from %s", ", ".join(deleted), directory)
 
     return {"deleted": deleted, "missing": missing}
+
+
+@contextlib.contextmanager
+def _opened(path: Path, secret: str):
+    """The archive's plaintext bytes, decrypting on the way if needed.
+
+    gpg streams, so a 2 GB archive is never held anywhere — which is the
+    same reason it was chosen for writing them.
+    """
+    if not secret:
+        with open(path, "rb") as handle:
+            yield handle
+        return
+
+    import subprocess
+
+    read_fd, write_fd = os.pipe()
+
+    with os.fdopen(write_fd, "wb") as handle:
+        handle.write(secret.encode() + b"\n")
+
+    process = subprocess.Popen(
+        [
+            "gpg", "--batch", "--quiet", "--no-tty",
+            "--pinentry-mode", "loopback", "--passphrase-fd", str(read_fd),
+            "--decrypt", str(path),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(read_fd,),
+    )
+    os.close(read_fd)
+
+    try:
+        yield process.stdout
+    finally:
+        try:
+            process.stdout.close()
+        except Exception:  # noqa: BLE001 - already unwinding
+            pass
+
+        code = process.wait()
+        stderr = (process.stderr.read() or b"").decode("utf-8", "replace")
+        process.stderr.close()
+
+        if code != 0:
+            raise ValueError(f"could not decrypt: {stderr.strip()[:200]}")
 
 
 def verify(client, directory: str, name: str) -> dict:
@@ -619,11 +677,22 @@ def verify(client, directory: str, name: str) -> dict:
     total = 0
     started = time.time()
 
+    encrypted = name.endswith(ENCRYPTED_SUFFIX)
+    secret = passphrase()
+
+    if encrypted and not secret:
+        return {
+            "name": name, "ok": None,
+            "error": "this archive is encrypted and this host has no backup "
+                     "passphrase set, so it cannot be checked here",
+            "files": 0, "seconds": 0.0,
+        }
+
     try:
         # Stream mode: no seeking, so every byte goes through the
         # decompressor. A seekable read would skip file data and miss
         # exactly the corruption this is looking for.
-        with open(target, "rb") as raw:
+        with _opened(target, secret if encrypted else "") as raw:
             stream = gzip.GzipFile(fileobj=raw, mode="rb")
 
             with tarfile.open(mode="r|", fileobj=stream) as tar:
@@ -943,6 +1012,13 @@ def _backup(client, job: dict, *, host_path: str | None,
             job["not_stopped"] = skipped
 
     environment = {"BACKUP_NAME": job["archive"]}
+
+    # Encryption is a property of the host, not of one job: "some of my
+    # backups are readable" is rarely what anybody means.
+    secret = passphrase()
+
+    if secret:
+        environment["BACKUP_PASSPHRASE"] = secret
     # A volume is bound by name; a directory by its real host path, which
     # resolve_source() has already checked and translated out of HOST_ROOT.
     volumes = {

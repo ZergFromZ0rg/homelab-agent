@@ -808,3 +808,49 @@ def test_an_archive_with_no_files_is_not_intact(tmp_path, monkeypatch):
 
     assert out["ok"] is False
     assert "no files" in out["error"]
+
+
+# ---- encryption -----------------------------------------------------------
+
+
+def test_an_archive_is_named_for_whether_it_is_encrypted(monkeypatch):
+    assert volume_backup.archive_name("q", 1790000000).endswith(".tar.gz")
+
+    monkeypatch.setenv("BACKUP_PASSPHRASE", "hunter2")
+
+    assert volume_backup.archive_name("q", 1790000000).endswith(".tar.gz.gpg")
+
+
+def test_both_kinds_of_archive_are_listed(tmp_path, monkeypatch):
+    client = _root(tmp_path, monkeypatch)
+    (tmp_path / "q-20260101-000000.tar.gz").write_bytes(b"a")
+    (tmp_path / "q-20260202-000000.tar.gz.gpg").write_bytes(b"bb")
+    os.utime(tmp_path / "q-20260101-000000.tar.gz", (1, 1))
+    os.utime(tmp_path / "q-20260202-000000.tar.gz.gpg", (2, 2))
+
+    archives = volume_backup.list_archives(client, str(tmp_path))
+
+    assert [a["name"] for a in archives] == [
+        "q-20260202-000000.tar.gz.gpg", "q-20260101-000000.tar.gz",
+    ]
+    assert archives[0]["encrypted"] is True
+    assert archives[1]["encrypted"] is False
+
+
+def test_an_encrypted_name_is_a_valid_archive_name():
+    assert volume_backup.check_name("q-20260101-000000.tar.gz.gpg")
+
+
+def test_verifying_an_encrypted_archive_without_the_passphrase_is_unknown(
+    tmp_path, monkeypatch
+):
+    """Not 'corrupt' — the archive may be perfect and this host simply
+    cannot read it. Calling that corruption would raise a false alarm."""
+    client = _root(tmp_path, monkeypatch)
+    monkeypatch.delenv("BACKUP_PASSPHRASE", raising=False)
+    (tmp_path / "q-20260101-000000.tar.gz.gpg").write_bytes(b"not really gpg")
+
+    out = volume_backup.verify(client, str(tmp_path), "q-20260101-000000.tar.gz.gpg")
+
+    assert out["ok"] is None
+    assert "no backup passphrase" in out["error"]

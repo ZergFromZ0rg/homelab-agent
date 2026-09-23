@@ -73,6 +73,16 @@ SETTINGS: list[dict] = [
                 "named volumes only.",
     },
     {
+        "key": "BACKUP_PASSPHRASE", "kind": "secret", "scope": "live",
+        "group": "Backups", "label": "Encrypt backups with this passphrase",
+        "help": "Set it and every archive this host writes or receives is "
+                "encrypted with gpg. Set the SAME value on every host, or a "
+                "host cannot check an archive another one sent it. "
+                "LOSE IT AND EVERY ENCRYPTED ARCHIVE IS UNREADABLE — there is "
+                "no recovery, by design.",
+        "danger": True,
+    },
+    {
         "key": "BACKUP_DIRS", "kind": "paths", "scope": "live",
         "group": "Backups", "label": "Extra destinations",
         "help": "Only needed for a second backup disk, or a mount you set up "
