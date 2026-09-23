@@ -220,3 +220,26 @@ def test_a_directory_source_is_refused_until_the_host_opts_in(client, store):
 
     assert resp.status_code == 400
     assert "BACKUP_SOURCE_DIRS" in resp.json()["detail"]
+
+
+def test_the_projects_route_reports_what_would_be_lost(client, store, monkeypatch):
+    import volume_backup
+
+    monkeypatch.setattr(volume_backup, "projects", lambda c: [
+        {"project": "jellyfin", "working_dir": "/srv/jellyfin",
+         "containers": ["jellyfin"], "volumes": [], "directories": []},
+    ])
+
+    body = client.get("/backup/projects").json()
+
+    assert body["host"]
+    assert [p["project"] for p in body["projects"]] == ["jellyfin"]
+    assert body["source_dirs"] == []
+
+
+def test_the_projects_route_needs_the_token(client, store, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "AGENT_TOKEN", "sekret")
+
+    assert client.get("/backup/projects").status_code == 401
