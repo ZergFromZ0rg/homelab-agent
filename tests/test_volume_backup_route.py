@@ -243,3 +243,29 @@ def test_the_projects_route_needs_the_token(client, store, monkeypatch):
     monkeypatch.setattr(main, "AGENT_TOKEN", "sekret")
 
     assert client.get("/backup/projects").status_code == 401
+
+
+def test_the_store_route_answers_without_measuring_anything(client, store, monkeypatch):
+    """"Can I send backups here" must not cost a walk of every volume on
+    the host — that is minutes on a big one."""
+    import volume_backup
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the store route must not measure anything")
+
+    monkeypatch.setattr(volume_backup, "measure", explode)
+    monkeypatch.setattr(volume_backup, "list_volumes", explode)
+    monkeypatch.setattr(volume_backup, "candidate_dirs", explode)
+
+    body = client.get("/backup/store").json()
+
+    assert body["enabled"] is True
+    assert body["roots"][0]["usable"] is True
+    assert body["encrypted"] is False
+
+
+def test_the_store_route_needs_the_token(client, store, monkeypatch):
+    import main
+
+    monkeypatch.setattr(main, "AGENT_TOKEN", "sekret")
+    assert client.get("/backup/store").status_code == 401

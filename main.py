@@ -1064,6 +1064,29 @@ def put_config(
         raise HTTPException(status_code=400, detail=str(error))
 
 
+@app.get("/backup/store")
+def backup_store(x_agent_token: str | None = Header(default=None)):
+    """Just whether this host can receive backups, and where.
+
+    Split out of ``/backup/volumes`` because that one measures every volume
+    and every candidate directory — minutes of walking on a big host — and
+    the question "can I send backups here" should cost nothing.
+    """
+    require_agent_token(x_agent_token)
+
+    return {
+        "host": HOST_NAME,
+        "enabled": volume_backup.enabled(),
+        "roots": volume_backup.roots(client),
+        "receive_url": (
+            config.get("BACKUP_PUBLIC_URL").strip()
+            or config.get("AGENT_URL").strip()
+            or None
+        ),
+        "encrypted": bool(volume_backup.passphrase()),
+    }
+
+
 @app.get("/backup/volumes")
 def backup_volumes(x_agent_token: str | None = Header(default=None)):
     """What can be backed up here, and whether anything can be stored here.
