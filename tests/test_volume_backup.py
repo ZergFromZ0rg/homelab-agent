@@ -552,3 +552,96 @@ def test_a_real_directory_at_the_mount_is_a_destination(tmp_path, monkeypatch):
     usable = [r for r in volume_backup.roots(client) if r["usable"]]
 
     assert [r["host_path"] for r in usable] == ["/home/zerg/backups"]
+
+
+# ---- sizing and candidates ------------------------------------------------
+
+
+def test_measure_counts_files_not_directories(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "a.bin").write_bytes(b"x" * 1000)
+    (tmp_path / "sub" / "b.bin").write_bytes(b"y" * 2000)
+    volume_backup.forget_sizes()
+
+    out = volume_backup.measure(str(tmp_path))
+
+    assert out == {"bytes": 3000, "files": 2, "partial": False}
+
+
+def test_measure_does_not_follow_symlinks(tmp_path):
+    """Following one would double-count at best and walk out of the tree at
+    worst."""
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "big.bin").write_bytes(b"x" * 5000)
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "link").symlink_to(real)
+    volume_backup.forget_sizes()
+
+    assert volume_backup.measure(str(tree))["bytes"] == 0
+
+
+def test_measure_gives_up_rather_than_hanging(tmp_path, monkeypatch):
+    """A media library is a long walk, and the form asking for this size
+    has to get an answer."""
+    for i in range(50):
+        d = tmp_path / f"d{i}"
+        d.mkdir()
+        (d / "f").write_bytes(b"x" * 10)
+
+    volume_backup.forget_sizes()
+    out = volume_backup.measure(str(tmp_path), budget=-1)
+
+    assert out["partial"] is True
+
+
+def test_measure_is_cached(tmp_path):
+    (tmp_path / "a.bin").write_bytes(b"x" * 100)
+    volume_backup.forget_sizes()
+
+    first = volume_backup.measure(str(tmp_path))
+    (tmp_path / "b.bin").write_bytes(b"y" * 100)
+
+    assert volume_backup.measure(str(tmp_path)) == first, "second read is cached"
+
+
+def test_candidates_are_the_bind_mounts_a_host_allows(host, monkeypatch):
+    """Not a file browser — the agent has no business listing the host.
+    These are the directories containers actually write to."""
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg/ai-librarian")
+    volume_backup.forget_sizes()
+
+    client = FakeClient(containers=[
+        FakeContainer("qdrant-1", mounts=[
+            {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+        ]),
+        FakeContainer("elsewhere", mounts=[
+            {"Type": "bind", "Source": "/etc/passwd"},
+        ]),
+    ])
+
+    paths = [c["path"] for c in volume_backup.candidate_dirs(client)]
+
+    assert "/home/zerg/ai-librarian/data/qdrant" in paths
+    assert "/home/zerg/ai-librarian" in paths, "the root itself is offered"
+    assert "/etc/passwd" not in paths, "outside the allowed roots"
+
+
+def test_candidates_carry_who_uses_them(host, monkeypatch):
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg/ai-librarian")
+    volume_backup.forget_sizes()
+
+    client = FakeClient(containers=[
+        FakeContainer("qdrant-1", mounts=[
+            {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+        ]),
+    ])
+
+    found = {c["path"]: c for c in volume_backup.candidate_dirs(client)}
+
+    assert found["/home/zerg/ai-librarian/data/qdrant"]["in_use_by"] == ["qdrant-1"]
+
+
+def test_no_candidates_until_the_host_opts_in():
+    assert volume_backup.candidate_dirs(FakeClient()) == []

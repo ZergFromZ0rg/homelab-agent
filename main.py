@@ -1048,9 +1048,13 @@ def backup_volumes(x_agent_token: str | None = Header(default=None)):
     return {
         "host": HOST_NAME,
         "volumes": volume_backup.list_volumes(client),
-        # Directories this host will back up. Empty is the default and
-        # means named volumes only.
-        "sources": {"dirs": volume_backup.source_dirs()},
+        # Directories this host will back up: the roots it allows, and the
+        # ones worth offering, sized so the form can show what a job costs
+        # before anyone commits to it.
+        "sources": {
+            "dirs": volume_backup.source_dirs(),
+            "candidates": volume_backup.candidate_dirs(client),
+        },
         "store": {
             "enabled": volume_backup.enabled(),
             "roots": volume_backup.roots(client),

@@ -345,6 +345,13 @@ def list_volumes(client) -> list[dict]:
         attrs = volume.attrs or {}
         name = attrs.get("Name") or volume.name
 
+        mountpoint = attrs.get("Mountpoint") or ""
+        size = (
+            measure(host_root() + mountpoint)
+            if mountpoint and Path(host_root() + mountpoint).is_dir()
+            else {"bytes": None, "files": None, "partial": False}
+        )
+
         out.append({
             "name": name,
             "driver": attrs.get("Driver"),
@@ -354,9 +361,134 @@ def list_volumes(client) -> list[dict]:
                 "com.docker.compose.project"
             ),
             "in_use_by": sorted(users.get(name, [])),
+            **size,
         })
 
     return sorted(out, key=lambda v: v["name"])
+
+
+# Sizing a tree means walking it, and a media library is a long walk. Both
+# budgets exist so the form that asks for these sizes still answers: a
+# result that says "at least 40 GB, still counting" is more use than a
+# spinner, and far more use than a request that times out.
+SIZE_BUDGET_SECONDS = 3.0
+SIZE_BUDGET_ENTRIES = 400_000
+SIZE_CACHE_SECONDS = 300
+
+_sizes: dict[str, tuple[float, dict]] = {}
+_size_lock = threading.Lock()
+
+
+def measure(path: str, *, budget: float = SIZE_BUDGET_SECONDS) -> dict:
+    """Bytes and file count under a path, as far as we got.
+
+    Cached, because the settings form asks for every candidate at once and
+    a directory's size does not change in a way anyone is watching.
+    """
+    now = time.time()
+
+    with _size_lock:
+        hit = _sizes.get(path)
+
+        if hit and now - hit[0] < SIZE_CACHE_SECONDS:
+            return hit[1]
+
+    deadline = now + budget
+    total = files = entries = 0
+    partial = False
+    stack = [path]
+
+    while stack:
+        if time.time() > deadline or entries > SIZE_BUDGET_ENTRIES:
+            partial = True
+            break
+
+        current = stack.pop()
+
+        try:
+            with os.scandir(current) as scan:
+                for entry in scan:
+                    entries += 1
+
+                    try:
+                        # Never follow a symlink: it would double-count at
+                        # best and walk out of the tree at worst.
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                        elif entry.is_file(follow_symlinks=False):
+                            files += 1
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+
+    result = {"bytes": total, "files": files, "partial": partial}
+
+    with _size_lock:
+        _sizes[path] = (time.time(), result)
+
+    return result
+
+
+def forget_sizes() -> None:
+    with _size_lock:
+        _sizes.clear()
+
+
+def candidate_dirs(client) -> list[dict]:
+    """Directories worth offering as a backup source.
+
+    Not a file browser — the agent has no business handing out a listing of
+    the host. These are the directories *containers on this host actually
+    bind-mount*, narrowed to what ``BACKUP_SOURCE_DIRS`` allows, plus the
+    allowed roots themselves. That set is small, and it is exactly where a
+    stack's data lives, which is how the qdrant directory was found in the
+    first place.
+    """
+    allowed = source_dirs()
+
+    if not allowed:
+        return []
+
+    def permitted(path: str) -> bool:
+        target = Path(path)
+        return any(target == Path(r) or Path(r) in target.parents for r in allowed)
+
+    users: dict[str, set[str]] = {}
+
+    try:
+        for container in client.containers.list(all=True):
+            for mount in container.attrs.get("Mounts") or []:
+                if mount.get("Type") != "bind":
+                    continue
+
+                source = (mount.get("Source") or "").rstrip("/")
+
+                if source and permitted(source):
+                    users.setdefault(source, set()).add(container.name)
+    except Exception as error:  # noqa: BLE001
+        log.debug("could not map bind mounts: %s", error)
+
+    for root in allowed:
+        users.setdefault(root, set())
+
+    out = []
+    root_path = host_root()
+
+    for path in sorted(users):
+        inside = Path(root_path + path)
+
+        if not inside.is_dir():
+            continue
+
+        out.append({
+            "path": path,
+            "in_use_by": sorted(users[path]),
+            **measure(str(inside)),
+        })
+
+    return out
 
 
 def archive_name(source: str, when: float | None = None) -> str:
