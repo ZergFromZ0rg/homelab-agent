@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from log import log, audit
 from stack_backup import StackBackup
 from register import Registrar
+import config
 import connections
 import deploy
 import rebuild
@@ -1035,6 +1036,34 @@ def backup_run():
     return {"success": True, "triggered": True}
 
 
+@app.get("/config")
+def get_config(x_agent_token: str | None = Header(default=None)):
+    """Every setting this agent understands, and whether it can be changed.
+
+    Readable even on a host that doesn't accept settings, so the dashboard
+    can show what is configured and say what to do about the rest instead
+    of an empty page.
+    """
+    require_agent_token(x_agent_token)
+    return {"host": HOST_NAME, **config.snapshot()}
+
+
+@app.put("/config")
+def put_config(
+    payload: dict,
+    x_agent_token: str | None = Header(default=None),
+):
+    """Apply settings. Nothing here touches .env, compose or this container
+    — the values go to a file this agent owns and are read back at call
+    time, so the worst a bad request can do is misconfigure the agent."""
+    require_agent_token(x_agent_token)
+
+    try:
+        return config.update(payload.get("settings") or payload)
+    except config.ConfigError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
 @app.get("/backup/volumes")
 def backup_volumes(x_agent_token: str | None = Header(default=None)):
     """What can be backed up here, and whether anything can be stored here.
@@ -1059,8 +1088,8 @@ def backup_volumes(x_agent_token: str | None = Header(default=None)):
             "enabled": volume_backup.enabled(),
             "roots": volume_backup.roots(client),
             "receive_url": (
-                os.getenv("BACKUP_PUBLIC_URL", "").strip()
-                or os.getenv("AGENT_URL", "").strip()
+                config.get("BACKUP_PUBLIC_URL").strip()
+                or config.get("AGENT_URL").strip()
                 or None
             ),
         },

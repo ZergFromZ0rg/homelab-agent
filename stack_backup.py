@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 
+import config
 from log import log
 
 
@@ -173,16 +174,6 @@ class StackBackup:
         self.inventory_provider = inventory_provider
 
         self.enabled = _env_bool("BACKUP_ENABLED", True)
-        self.repo = os.getenv("BACKUP_REPO", "").strip()
-        self.branch = os.getenv("BACKUP_BRANCH", "main").strip() or "main"
-        self.token = os.getenv("GITHUB_TOKEN", "").strip()
-
-        try:
-            hours = float(os.getenv("BACKUP_INTERVAL_HOURS", "12"))
-        except ValueError:
-            hours = 12.0
-
-        self.interval_seconds = max(300, int(hours * 3600))
         self.host_root = os.getenv("HOST_ROOT", "/host").rstrip("/")
         self.workdir = os.getenv("BACKUP_WORKDIR", "/data/repo")
         self.run_on_start = _env_bool("BACKUP_RUN_ON_START", True)
@@ -197,13 +188,6 @@ class StackBackup:
             "GIT_AUTHOR_EMAIL",
             "homelab-agent@users.noreply.github.com",
         )
-
-        extra = os.getenv("STACK_DIRS", "")
-        self.extra_dirs = [
-            part.strip()
-            for part in re.split(r"[:\n,]", extra)
-            if part.strip()
-        ]
 
         self._lock = threading.Lock()
         self._trigger = threading.Event()
@@ -223,13 +207,50 @@ class StackBackup:
             "projects": None,
         }
 
+    # Read fresh on every use rather than captured at startup: a token or
+    # repository set from the dashboard has to take effect on the next run,
+    # not the next time somebody restarts the container.
+    @property
+    def repo(self):
+        return config.get("BACKUP_REPO").strip()
+
+    @property
+    def token(self):
+        return config.get("GITHUB_TOKEN").strip()
+
+    @property
+    def branch(self):
+        return config.get("BACKUP_BRANCH", "main").strip() or "main"
+
+    @property
+    def interval_seconds(self):
+        try:
+            hours = float(config.get("BACKUP_INTERVAL_HOURS", "12"))
+        except ValueError:
+            hours = 12.0
+
+        return max(300, int(hours * 3600))
+
+    @property
+    def extra_dirs(self):
+        return [
+            part.strip()
+            for part in re.split(r"[:\n,]", config.get("STACK_DIRS"))
+            if part.strip()
+        ]
+
     @property
     def configured(self):
         return bool(self.enabled and self.repo and self.token)
 
     def snapshot(self):
         status = dict(self._status)
-        status["configured"] = self.configured
+        status.update(
+            configured=self.configured,
+            repo=self.repo or None,
+            branch=self.branch,
+            interval_hours=round(self.interval_seconds / 3600, 2),
+        )
         return status
 
     def start(self):

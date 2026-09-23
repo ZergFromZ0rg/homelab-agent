@@ -46,6 +46,10 @@ services:
       ALLOWED_HOST_PATHS: ${ALLOWED_HOST_PATHS:-}
       ALLOWED_DEVICES: ${ALLOWED_DEVICES:-}
 
+      # Lets the dashboard change this agent's settings. Writes land in
+      # the agent's own /data volume, never in .env or in this file.
+      CONFIG_WRITABLE: ${CONFIG_WRITABLE:-}
+
       # Volume backups. Directories inside this container that archives
       # may be written to — see the volumes section. Empty means this host
       # stores no backups; it can still be a source for another node's.

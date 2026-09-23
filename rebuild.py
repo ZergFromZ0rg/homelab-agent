@@ -32,6 +32,7 @@ import time
 import uuid
 from pathlib import Path
 
+import config
 from log import audit, log
 
 TIMEOUT = int(os.getenv("REBUILD_TIMEOUT", "1800"))
@@ -42,7 +43,7 @@ HOST_ROOT = os.getenv("HOST_ROOT", "/host").rstrip("/")
 
 
 def enabled() -> bool:
-    return os.getenv("REBUILD_ENABLED", "").strip() in ("1", "true", "yes")
+    return config.get("REBUILD_ENABLED").strip().lower() in ("1", "true", "yes")
 
 
 def host_path(absolute: str) -> Path:

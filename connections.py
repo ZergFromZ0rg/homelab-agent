@@ -49,6 +49,7 @@ import time
 from pathlib import Path
 
 import sockets
+import config
 from log import log
 
 # This container's own conntrack table. It exists and is readable, but in
@@ -94,7 +95,7 @@ _STATE_RE = re.compile(r"^[A-Z][A-Z_]+$")
 
 
 def enabled() -> bool:
-    return os.getenv("CONNECTIONS_ENABLED", "1").strip() not in ("0", "false", "no")
+    return config.get("CONNECTIONS_ENABLED", "1").strip().lower() not in ("0", "false", "no")
 
 
 def max_peers() -> int:

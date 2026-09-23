@@ -54,6 +54,7 @@ from pathlib import Path
 from log import log
 from log import audit
 
+import config
 import deploy
 import rebuild
 
@@ -101,9 +102,9 @@ def configured_dirs() -> list[str]:
     ``BACKUP_DIRS`` still names roots directly, for more than one of them
     or for a mount somebody set up themselves.
     """
-    dirs = _split(os.getenv("BACKUP_DIRS", ""))
+    dirs = _split(config.get("BACKUP_DIRS"))
 
-    if os.getenv("BACKUP_HOST_DIR", "").strip() and STORE_MOUNT not in dirs:
+    if config.get("BACKUP_HOST_DIR").strip() and STORE_MOUNT not in dirs:
         dirs.append(STORE_MOUNT)
 
     return dirs
@@ -119,7 +120,7 @@ def source_dirs() -> list[str]:
     Empty means named volumes only, which is the default. A job may name
     any directory at or under one of these.
     """
-    return [d.rstrip("/") or "/" for d in _split(os.getenv("BACKUP_SOURCE_DIRS", ""))]
+    return [d.rstrip("/") or "/" for d in _split(config.get("BACKUP_SOURCE_DIRS"))]
 
 
 def host_root() -> str:
