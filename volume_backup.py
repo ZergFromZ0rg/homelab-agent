@@ -316,6 +316,13 @@ def ensure_dir(client, directory: str) -> tuple[Path, str]:
 # ---------------------------------------------------------------------------
 
 
+ANONYMOUS = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _anonymous(name: str) -> bool:
+    return bool(ANONYMOUS.match(name or ""))
+
+
 def list_volumes(client) -> list[dict]:
     """Named volumes on this host, and what is using each one.
 
@@ -345,6 +352,11 @@ def list_volumes(client) -> list[dict]:
         attrs = volume.attrs or {}
         name = attrs.get("Name") or volume.name
 
+        # This agent's own stand-in mount. Offering it as something to back
+        # up is pure noise: it exists precisely because nothing is stored.
+        if name.endswith(PLACEHOLDER_VOLUME):
+            continue
+
         mountpoint = attrs.get("Mountpoint") or ""
         size = (
             measure(host_root() + mountpoint)
@@ -364,7 +376,11 @@ def list_volumes(client) -> list[dict]:
             **size,
         })
 
-    return sorted(out, key=lambda v: v["name"])
+    # Anonymous volumes — the 64-hex ones Docker names when a compose file
+    # asks for a mount without naming it — sort last. They are rarely what
+    # anyone means to back up, and a dozen of them above the named ones
+    # buries the real answer.
+    return sorted(out, key=lambda v: (_anonymous(v["name"]), v["name"]))
 
 
 # Sizing a tree means walking it, and a media library is a long walk. Both

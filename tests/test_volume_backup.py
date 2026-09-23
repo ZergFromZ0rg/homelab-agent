@@ -645,3 +645,28 @@ def test_candidates_carry_who_uses_them(host, monkeypatch):
 
 def test_no_candidates_until_the_host_opts_in():
     assert volume_backup.candidate_dirs(FakeClient()) == []
+
+
+def test_the_agents_own_placeholder_is_not_offered_as_a_source(monkeypatch):
+    """It exists precisely because nothing is stored there."""
+    client = FakeClient(volumes=[
+        FakeVolume("homelab-agent_agent-backups-unset"),
+        FakeVolume("qdrant"),
+    ])
+
+    assert [v["name"] for v in volume_backup.list_volumes(client)] == ["qdrant"]
+
+
+def test_anonymous_volumes_sort_below_named_ones():
+    """A dozen 64-hex volumes above the real ones buries the answer."""
+    client = FakeClient(volumes=[
+        FakeVolume("f" * 64),
+        FakeVolume("uptime-kuma_data"),
+        FakeVolume("a" * 64),
+        FakeVolume("jellyfin_config"),
+    ])
+
+    names = [v["name"] for v in volume_backup.list_volumes(client)]
+
+    assert names[:2] == ["jellyfin_config", "uptime-kuma_data"]
+    assert names[2:] == ["a" * 64, "f" * 64]
