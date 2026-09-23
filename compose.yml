@@ -46,6 +46,15 @@ services:
       ALLOWED_HOST_PATHS: ${ALLOWED_HOST_PATHS:-}
       ALLOWED_DEVICES: ${ALLOWED_DEVICES:-}
 
+      # These three are used by compose itself — for the /backups mount,
+      # and for the runtime below — and the agent cannot see a compose
+      # variable unless it is also passed in here. Without that the
+      # Settings panel shows them blank and, worse, BACKUP_HOST_DIR stops
+      # enabling /backups at all.
+      BACKUP_HOST_DIR: ${BACKUP_HOST_DIR:-}
+      AGENT_RUNTIME: ${AGENT_RUNTIME:-}
+      CONNECTIONS_ENABLED: ${CONNECTIONS_ENABLED:-}
+
       # Lets the dashboard change this agent's settings. Writes land in
       # the agent's own /data volume, never in .env or in this file.
       CONFIG_WRITABLE: ${CONFIG_WRITABLE:-}
