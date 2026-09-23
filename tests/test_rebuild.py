@@ -169,7 +169,10 @@ def test_a_rebuild_pulls_then_builds(tmp_path, monkeypatch):
     script = helper_script(client)
     assert script.index("pull --ff-only") < script.index("docker compose up")
     assert "https://github.com/zerg/media.git" in script
-    assert script.startswith("git ")
+    # The first real command is still the pull; what precedes it is only
+    # noting who owns the checkout, so root can hand it back afterwards.
+    assert script.startswith("__owner=$(stat ")
+    assert script.split(";")[1].strip().startswith("git ")
     assert "docker compose up -d --build" in script
     assert finished["steps"][0]["output"] == "built\n"
 
@@ -542,3 +545,41 @@ def test_the_job_carries_the_readable_reason(tmp_path, monkeypatch):
     assert "private" in finished["error"]
     # The raw output is still there for anyone who wants it.
     assert "could not read Username" in finished["steps"][0]["output"]
+
+
+def test_the_script_hands_the_checkout_back_to_its_owner():
+    """Running git as root in somebody's home directory leaves root-owned
+    objects, and the next thing that happens is the owner cannot pull their
+    own repo. It accumulated silently through every rebuild."""
+    script = rebuild._script({
+        "pull": True, "working_dir": "/home/zerg/homelab-agent",
+        "fetch_url": "https://github.com/x/y.git",
+    })
+
+    assert "stat -c %u:%g" in script
+    assert "chown -R" in script
+    assert script.index("chown -R") > script.index("docker compose"), (
+        "restore ownership after the work, not before"
+    )
+    assert "exit $__code" in script, "and still report the real exit code"
+
+
+def test_ownership_is_restored_even_when_the_work_fails():
+    """A failed pull leaves exactly the same mess as a successful one."""
+    script = rebuild._script({
+        "pull": True, "working_dir": "/srv/x",
+        "fetch_url": "https://github.com/x/y.git",
+    })
+
+    # `;` not `&&` between the work and the chown, or a failure skips it.
+    after_work = script.split("docker compose up -d --build", 1)[1]
+    assert after_work.lstrip().startswith(";"), after_work[:40]
+
+
+def test_a_build_only_rebuild_also_restores_ownership():
+    script = rebuild._script({
+        "pull": False, "working_dir": "/srv/x", "fetch_url": None,
+    })
+
+    assert "chown -R" in script
+    assert "git" not in script

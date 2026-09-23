@@ -313,11 +313,19 @@ def _script(job: dict) -> str:
 
     ``--ff-only`` so a checkout that has diverged from its remote stops
     and says so rather than merging or leaving conflicts behind.
+
+    And it hands the checkout back. Running git as root in somebody's home
+    directory leaves root-owned objects and a root-owned index behind, and
+    the next thing that happens is the person who owns the repo cannot pull
+    it: "fatal: failed to write object". That accumulated silently through
+    every rebuild until a plain ``git pull`` on the host failed. The chown
+    runs whatever the outcome, because a failed pull leaves the same mess
+    as a successful one.
     """
+    quoted = shlex.quote(job["working_dir"])
     parts = []
 
     if job["pull"]:
-        quoted = shlex.quote(job["working_dir"])
         safe = f"git -c safe.directory={quoted}"
         url = shlex.quote(job["fetch_url"])
         # Pull from the URL by name rather than from "origin", so a remote
@@ -326,7 +334,13 @@ def _script(job: dict) -> str:
 
     parts.append("docker compose up -d --build")
 
-    return " && ".join(parts)
+    work = " && ".join(parts)
+
+    # The owner as it was before root touched anything.
+    capture = f"__owner=$(stat -c %u:%g {quoted})"
+    restore = f'chown -R "$__owner" {quoted} 2>/dev/null || true'
+
+    return f"{capture}; {work}; __code=$?; {restore}; exit $__code"
 
 
 # Git and compose both fail in a handful of recognisable ways, and their
