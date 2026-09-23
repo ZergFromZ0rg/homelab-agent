@@ -1180,6 +1180,29 @@ def backup_archives(
         raise HTTPException(status_code=400, detail=str(error))
 
 
+@app.post("/backup/archives/verify")
+def backup_archives_verify(
+    payload: dict,
+    x_agent_token: str | None = Header(default=None),
+):
+    """Read an archive back and report whether it is intact.
+
+    Synchronous: it is bounded by the archive's size, and whoever pressed
+    the button is waiting for the answer. FastAPI runs a sync route in a
+    worker thread, so a slow one doesn't block the dashboard's polling.
+    """
+    require_agent_token(x_agent_token)
+
+    try:
+        return volume_backup.verify(
+            client,
+            str(payload.get("directory") or "").strip(),
+            str(payload.get("name") or "").strip(),
+        )
+    except volume_backup.PolicyError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+
 @app.post("/backup/archives/delete")
 def backup_archives_delete(
     payload: dict,

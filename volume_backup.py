@@ -498,10 +498,18 @@ def candidate_dirs(client) -> list[dict]:
         if not inside.is_dir():
             continue
 
+        size = measure(str(inside))
+
+        # An empty directory is not worth offering. There is nothing to
+        # archive, and a job pointed at one would write an empty tar every
+        # night and look like it was protecting something.
+        if not size["bytes"] and not size["files"]:
+            continue
+
         out.append({
             "path": path,
             "in_use_by": sorted(users[path]),
-            **measure(str(inside)),
+            **size,
         })
 
     return out
@@ -580,6 +588,88 @@ def delete_archives(client, directory: str, names: list[str]) -> dict:
         audit.info("backup: deleted %s from %s", ", ".join(deleted), directory)
 
     return {"deleted": deleted, "missing": missing}
+
+
+def verify(client, directory: str, name: str) -> dict:
+    """Read an archive back and say whether it is intact.
+
+    This is the check that makes a backup a backup rather than a file of
+    the right size. It streams the whole thing through gzip and walks every
+    tar member, so it proves three separate things: the gzip CRC is good
+    (the decompressor checks it at the end of the stream, which only
+    happens if every byte is read), the tar structure parses to the last
+    member, and the contents add up to what was backed up.
+
+    Short of writing the bytes somewhere, this is a restore. It stops
+    before the one destructive step, which is the step nobody should be
+    able to trigger from a dashboard.
+    """
+    import gzip
+    import tarfile
+
+    check_name(name)
+    path, _ = resolve(client, directory)
+    target = path / name
+
+    if not target.is_file():
+        raise PolicyError(f"no archive named {name} in {directory}")
+
+    files = dirs = links = 0
+    total = 0
+    started = time.time()
+
+    try:
+        # Stream mode: no seeking, so every byte goes through the
+        # decompressor. A seekable read would skip file data and miss
+        # exactly the corruption this is looking for.
+        with open(target, "rb") as raw:
+            stream = gzip.GzipFile(fileobj=raw, mode="rb")
+
+            with tarfile.open(mode="r|", fileobj=stream) as tar:
+                for member in tar:
+                    if member.isfile():
+                        files += 1
+                        total += member.size
+                    elif member.isdir():
+                        dirs += 1
+                    elif member.issym() or member.islnk():
+                        links += 1
+
+            # Drain whatever is left, which is what makes gzip check its
+            # CRC and length trailer. Without this a *truncated* archive
+            # passes: tar reads a short stream as a clean end-of-archive
+            # and never looks at the trailer that isn't there. That is the
+            # single failure this whole check exists to catch, and it read
+            # as "intact, 0 files" until a test said otherwise.
+            while stream.read(1 << 20):
+                pass
+
+        if not files and not dirs:
+            raise ValueError("the archive contains no files")
+
+    except Exception as error:  # noqa: BLE001 - any failure is the answer
+        audit.warning("backup: %s failed verification: %s", name, error)
+        return {
+            "name": name,
+            "ok": False,
+            "error": f"{type(error).__name__}: {error}"[:300],
+            "files": files,
+            "seconds": round(time.time() - started, 1),
+        }
+
+    audit.info("backup: verified %s (%d files, %d bytes)", name, files, total)
+
+    return {
+        "name": name,
+        "ok": True,
+        "error": None,
+        "files": files,
+        "dirs": dirs,
+        "links": links,
+        "bytes": total,
+        "archive_bytes": target.stat().st_size,
+        "seconds": round(time.time() - started, 1),
+    }
 
 
 class Receiver:

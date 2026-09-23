@@ -7,6 +7,7 @@ and ``test_volume_backup_integration.py`` (a real daemon, auto-skipped).
 
 import hashlib
 import os
+from pathlib import Path as pathlib_path
 from unittest import mock
 
 import pytest
@@ -382,9 +383,14 @@ def host(tmp_path, monkeypatch):
     """A fake host filesystem mounted at HOST_ROOT, the way the agent sees
     the real one."""
     root = tmp_path / "host"
-    (root / "home/zerg/ai-librarian/data/qdrant").mkdir(parents=True)
+    qdrant = root / "home/zerg/ai-librarian/data/qdrant"
+    qdrant.mkdir(parents=True)
+    # Non-empty, because an empty directory is deliberately not offered as
+    # a source and a fixture of empty ones would test the wrong thing.
+    (qdrant / "segment.bin").write_bytes(b"x" * 128)
     (root / "etc").mkdir(parents=True)
     monkeypatch.setenv("HOST_ROOT", str(root))
+    volume_backup.forget_sizes()
     return root
 
 
@@ -670,3 +676,135 @@ def test_anonymous_volumes_sort_below_named_ones():
 
     assert names[:2] == ["jellyfin_config", "uptime-kuma_data"]
     assert names[2:] == ["a" * 64, "f" * 64]
+
+
+# ---- verifying an archive -------------------------------------------------
+
+
+def _real_archive(tmp_path, monkeypatch, *, corrupt_at=None):
+    """A genuine gzipped tar in an allowed backup directory."""
+    import gzip
+    import io
+    import tarfile
+
+    source = tmp_path / "src"
+    (source / "sub").mkdir(parents=True)
+    (source / "a.txt").write_text("hello")
+    (source / "sub" / "b.bin").write_bytes(b"x" * 4096)
+    (source / "link").symlink_to("a.txt")
+
+    raw = io.BytesIO()
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+        with tarfile.open(mode="w|", fileobj=gz) as tar:
+            tar.add(source, arcname=".")
+
+    blob = bytearray(raw.getvalue())
+
+    if corrupt_at is not None:
+        blob[corrupt_at] ^= 0xFF
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    name = "qdrant-20260922-010203.tar.gz"
+    (root / name).write_bytes(bytes(blob))
+
+    monkeypatch.setenv("BACKUP_DIRS", str(root))
+    client = FakeClient(own_mounts=[mount(str(root), "/srv/backups")])
+
+    return client, str(root), name
+
+
+def test_a_good_archive_verifies(tmp_path, monkeypatch):
+    client, directory, name = _real_archive(tmp_path, monkeypatch)
+
+    out = volume_backup.verify(client, directory, name)
+
+    assert out["ok"] is True
+    assert out["error"] is None
+    assert out["files"] == 2
+    assert out["links"] == 1
+    assert out["bytes"] == 4101
+
+
+def test_a_corrupted_archive_fails_verification(tmp_path, monkeypatch):
+    """A byte flipped in the middle of the compressed stream. The gzip CRC
+    only catches this if every byte is actually read, which is why the
+    check streams rather than seeks."""
+    client, directory, name = _real_archive(tmp_path, monkeypatch, corrupt_at=200)
+
+    out = volume_backup.verify(client, directory, name)
+
+    assert out["ok"] is False
+    assert out["error"]
+
+
+def test_a_truncated_archive_fails_verification(tmp_path, monkeypatch):
+    client, directory, name = _real_archive(tmp_path, monkeypatch)
+    target = pathlib_path(directory) / name
+    blob = target.read_bytes()
+    target.write_bytes(blob[: len(blob) // 2])
+
+    out = volume_backup.verify(client, directory, name)
+
+    assert out["ok"] is False
+
+
+def test_verifying_a_missing_archive_is_a_policy_error(tmp_path, monkeypatch):
+    client, directory, _ = _real_archive(tmp_path, monkeypatch)
+
+    with pytest.raises(volume_backup.PolicyError, match="no archive named"):
+        volume_backup.verify(client, directory, "gone-20260101-000000.tar.gz")
+
+
+def test_verifying_refuses_a_name_that_climbs_out(tmp_path, monkeypatch):
+    client, directory, _ = _real_archive(tmp_path, monkeypatch)
+
+    with pytest.raises(volume_backup.PolicyError):
+        volume_backup.verify(client, directory, "../escape.tar.gz")
+
+
+def test_an_empty_directory_is_not_offered(host, monkeypatch):
+    """Nothing to archive. A job pointed at one would write an empty tar
+    every night and look like it was protecting something."""
+    monkeypatch.setenv("BACKUP_SOURCE_DIRS", "/home/zerg/ai-librarian")
+    (host / "home/zerg/ai-librarian/library").mkdir(parents=True)
+    volume_backup.forget_sizes()
+
+    client = FakeClient(containers=[
+        FakeContainer("docs", mounts=[
+            {"Type": "bind", "Source": "/home/zerg/ai-librarian/library"},
+        ]),
+        FakeContainer("qdrant-1", mounts=[
+            {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+        ]),
+    ])
+
+    paths = [c["path"] for c in volume_backup.candidate_dirs(client)]
+
+    assert "/home/zerg/ai-librarian/data/qdrant" in paths
+    assert "/home/zerg/ai-librarian/library" not in paths
+
+
+def test_an_archive_with_no_files_is_not_intact(tmp_path, monkeypatch):
+    """A backup of nothing is not a backup. Belt to the drain's braces:
+    either alone let a truncated archive read as healthy."""
+    import gzip
+    import io
+    import tarfile
+
+    raw = io.BytesIO()
+    with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as gz:
+        with tarfile.open(mode="w|", fileobj=gz):
+            pass
+
+    root = tmp_path / "backups"
+    root.mkdir()
+    name = "empty-20260922-010203.tar.gz"
+    (root / name).write_bytes(raw.getvalue())
+    monkeypatch.setenv("BACKUP_DIRS", str(root))
+    client = FakeClient(own_mounts=[mount(str(root), "/srv/backups")])
+
+    out = volume_backup.verify(client, str(root), name)
+
+    assert out["ok"] is False
+    assert "no files" in out["error"]
