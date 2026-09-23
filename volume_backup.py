@@ -1136,6 +1136,35 @@ def projects(client) -> list[dict]:
         log.warning("could not list containers: %s", error)
         return []
 
+    # Where this host *stores* backups is not data it would lose — it is
+    # the copy. Listing it invites you to back up your backups, and on a
+    # host that receives other machines' archives it is also the biggest
+    # number on the page, which buries the real answer.
+    destinations = [
+        entry["host_path"].rstrip("/")
+        for entry in roots(client)
+        if entry.get("host_path")
+    ]
+
+    def is_destination(path: str) -> bool:
+        return any(
+            path == d or path.startswith(d + "/") or d.startswith(path + "/")
+            for d in destinations
+        )
+
+    sizes = {}
+
+    try:
+        for volume in client.volumes.list():
+            attrs = volume.attrs or {}
+            mountpoint = attrs.get("Mountpoint") or ""
+            inside = Path(root + mountpoint) if mountpoint else None
+
+            if inside and inside.is_dir():
+                sizes[attrs.get("Name") or volume.name] = measure(str(inside))
+    except Exception as error:  # noqa: BLE001
+        log.debug("could not size volumes: %s", error)
+
     for container in containers:
         labels = container.labels or {}
         name = labels.get("com.docker.compose.project") or "(no project)"
@@ -1156,7 +1185,14 @@ def projects(client) -> list[dict]:
                     continue
 
                 if volume not in [v["name"] for v in entry["volumes"]]:
-                    entry["volumes"].append({"name": volume, "allowed": True})
+                    # Sized like a directory is. Without this every volume
+                    # reads as 0 B and the "what would I lose" total quietly
+                    # leaves them out.
+                    entry["volumes"].append({
+                        "name": volume, "allowed": True,
+                        **sizes.get(volume, {"bytes": None, "files": None,
+                                             "partial": False}),
+                    })
 
             elif mount.get("Type") == "bind":
                 path = (mount.get("Source") or "").rstrip("/")
@@ -1168,6 +1204,9 @@ def projects(client) -> list[dict]:
                     continue
 
                 if path in [d["path"] for d in entry["directories"]]:
+                    continue
+
+                if is_destination(path):
                     continue
 
                 inside = Path(root + path)

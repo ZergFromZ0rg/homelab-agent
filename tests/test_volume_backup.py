@@ -942,3 +942,56 @@ def test_a_container_with_no_project_still_reports_its_data(host):
 
     assert project["project"] == "(no project)"
     assert project["directories"]
+
+
+def test_volumes_are_sized_like_directories(host, tmp_path, monkeypatch):
+    """Without this every volume reads as 0 B and the "what would I lose"
+    total quietly leaves them out — which is most of the answer on a host
+    whose data lives in volumes."""
+    data = host / "var/lib/docker/volumes/uptime-kuma_data/_data"
+    data.mkdir(parents=True)
+    (data / "kuma.db").write_bytes(b"x" * 4096)
+    volume_backup.forget_sizes()
+
+    container = FakeContainer("kuma", mounts=[
+        {"Type": "volume", "Name": "uptime-kuma_data"},
+    ])
+    container.labels = {"com.docker.compose.project": "uptime-kuma"}
+    client = FakeClient(
+        containers=[container],
+        volumes=[FakeVolume("uptime-kuma_data")],
+    )
+    client.volumes.list.return_value[0].attrs["Mountpoint"] = (
+        "/var/lib/docker/volumes/uptime-kuma_data/_data"
+    )
+
+    (project,) = volume_backup.projects(client)
+
+    assert project["volumes"][0]["bytes"] == 4096
+
+
+def test_the_backup_destination_is_not_listed_as_data_to_lose(host, monkeypatch):
+    """It is the copy, not the original. Listing it invites you to back up
+    your backups, and on the host that receives everyone's archives it is
+    also the biggest number on the page."""
+    store = host / "srv/backups"
+    store.mkdir(parents=True)
+    (store / "an-archive.tar.gz").write_bytes(b"x" * 2048)
+    monkeypatch.setenv("BACKUP_DIRS", "/backups")
+    volume_backup.forget_sizes()
+
+    container = FakeContainer("agent", mounts=[
+        {"Type": "bind", "Source": "/srv/backups"},
+        {"Type": "bind", "Source": "/home/zerg/ai-librarian/data/qdrant"},
+    ])
+    container.labels = {"com.docker.compose.project": "homelab-agent"}
+    client = FakeClient(
+        own_mounts=[mount("/backups", "/srv/backups")],
+        containers=[container],
+    )
+
+    (project,) = volume_backup.projects(client)
+
+    assert [d["path"] for d in project["directories"]] == [
+        "/home/zerg/ai-librarian/data/qdrant"
+    ]
