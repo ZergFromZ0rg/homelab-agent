@@ -132,9 +132,19 @@ SETTINGS: list[dict] = [
         "danger": True,
     },
     {
+        "key": "AI_REBUILD_ANY", "kind": "bool", "scope": "live",
+        "group": "Updates", "label": "Let the AI rebuild any container",
+        "help": "Permission for the dashboard's AI integration to rebuild "
+                "containers that aren't a git-tracked compose project — it "
+                "works out how from the running container. Recorded now; it "
+                "takes effect once AI rebuilds are built, and only on a host "
+                "that also allows rebuilds.",
+        "danger": True,
+    },
+    {
         "key": "CONNECTIONS_ENABLED", "kind": "bool", "scope": "live",
         "group": "Monitoring", "label": "Report network conversations",
-        "help": "Powers the Connections panel on this host's card.",
+        "help": "Powers the Connections panel on the Network tab.",
     },
     {
         "key": "HOST_NAME", "kind": "text", "scope": "host",

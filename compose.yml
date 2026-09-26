@@ -76,6 +76,7 @@ services:
       # `git pull` and `docker compose --build` — whatever the repo says,
       # as root on the host. See Rebuilding in the README.
       REBUILD_ENABLED: ${REBUILD_ENABLED:-}
+      AI_REBUILD_ANY: ${AI_REBUILD_ANY:-}
 
       # Harmless on a host with no NVIDIA card; they only do anything when
       # the runtime below is nvidia.

@@ -16,6 +16,7 @@ from stack_backup import StackBackup
 from register import Registrar
 import config
 import connections
+import networks
 import deploy
 import rebuild
 import version
@@ -1014,6 +1015,92 @@ def get_connections(x_agent_token: str | None = Header(default=None)):
     """
     require_agent_token(x_agent_token)
     return connections.snapshot(HOST_NAME, client)
+
+
+# ---------------------------------------------------------------------------
+# Docker networks — see networks.py for what is refused and why.
+# ---------------------------------------------------------------------------
+
+
+def _network_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except networks.NetworkError as error:
+        return JSONResponse(status_code=400, content={"success": False, "error": str(error)})
+
+
+@app.get("/networks")
+def get_networks():
+    """Every Docker network on this host and the containers on each.
+
+    Unauthenticated like /containers: it's the same inventory seen from the
+    network side — names, subnets and container addresses.
+    """
+    try:
+        return {"networks": networks.list_networks(client)}
+    except docker.errors.DockerException as error:
+        return JSONResponse(
+            status_code=502,
+            content={"networks": [], "error": f"can't read Docker networks: {error}"},
+        )
+
+
+@app.post("/networks")
+def post_network(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    result = _network_call(
+        networks.create_network,
+        client,
+        body.get("name", ""),
+        subnet=body.get("subnet") or None,
+        internal=bool(body.get("internal")),
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    audit.info("created network %s", result["name"])
+    return {"success": True, "network": result}
+
+
+@app.delete("/networks/{network_id}")
+def delete_network(network_id: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    result = _network_call(networks.remove_network, client, network_id)
+    if isinstance(result, JSONResponse):
+        return result
+    audit.info("removed network %s", result)
+    return {"success": True, "network": result}
+
+
+@app.post("/networks/{network_id}/connect")
+def connect_network(
+    network_id: str, body: dict, x_agent_token: str | None = Header(default=None)
+):
+    require_agent_token(x_agent_token)
+    result = _network_call(
+        networks.connect, client, network_id, body.get("container", ""),
+        set(PROTECTED_CONTAINERS),
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    cache_wake.set()
+    audit.info("connected %s to %s", result["container"], result["network"])
+    return {"success": True, **result}
+
+
+@app.post("/networks/{network_id}/disconnect")
+def disconnect_network(
+    network_id: str, body: dict, x_agent_token: str | None = Header(default=None)
+):
+    require_agent_token(x_agent_token)
+    result = _network_call(
+        networks.disconnect, client, network_id, body.get("container", ""),
+        set(PROTECTED_CONTAINERS),
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    cache_wake.set()
+    audit.info("disconnected %s from %s", result["container"], result["network"])
+    return {"success": True, **result}
 
 
 @app.get("/backup")
