@@ -16,6 +16,7 @@ from stack_backup import StackBackup
 from register import Registrar
 import config
 import connections
+import disk_delete
 import disk_usage
 import networks
 import deploy
@@ -1035,6 +1036,16 @@ def get_disk_usage(
         return disk_usage.usage(path, refresh=refresh)
     except disk_usage.DiskUsageError as error:
         return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+@app.post("/disk/delete")
+def post_disk_delete(body: dict, x_agent_token: str | None = Header(default=None)):
+    """Delete one file or folder — see disk_delete.py for what is refused."""
+    require_agent_token(x_agent_token)
+    try:
+        return disk_delete.delete(client, str(body.get("path", "")))
+    except disk_usage.DiskUsageError as error:
+        return JSONResponse(status_code=400, content={"success": False, "error": str(error)})
 
 
 # ---------------------------------------------------------------------------

@@ -258,6 +258,45 @@ def usage(path: str, *, refresh: bool = False, wait: bool = False) -> dict:
     return scan.view()
 
 
+def known_bytes(path: str) -> int | None:
+    """What the last finished scan of ``path``'s folder said it takes."""
+    parent = posixpath.dirname(path) or "/"
+    with _lock:
+        scan = _scans.get(parent)
+        if scan is None:
+            return None
+        for row in scan.entries:
+            if row["path"] == path and not row.get("pending"):
+                return row["bytes"]
+    return None
+
+
+def forget_path(path: str, freed: int | None) -> None:
+    """Keep cached scans honest after ``path`` is deleted.
+
+    The folder it was in loses the row; every folder above it shrinks by
+    what it took. Rescanning ``/`` would be right too, but takes seconds.
+    When the size isn't known, the scans above it are dropped instead, so
+    the next look rescans rather than showing a number that is now wrong.
+    """
+    with _lock:
+        for key in list(_scans):
+            if key == path or key.startswith(path.rstrip("/") + "/"):
+                del _scans[key]
+                continue
+            if not (key == "/" or path.startswith(key.rstrip("/") + "/")):
+                continue
+            if freed is None:
+                del _scans[key]
+                continue
+            scan = _scans[key]
+            for row in list(scan.entries):
+                if row["path"] == path:
+                    scan.entries.remove(row)
+                elif path.startswith(row["path"].rstrip("/") + "/") and row["bytes"] is not None:
+                    row["bytes"] = max(0, row["bytes"] - freed)
+
+
 def forget() -> None:
     with _lock:
         _scans.clear()
