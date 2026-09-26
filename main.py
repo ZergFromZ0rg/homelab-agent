@@ -16,6 +16,7 @@ from stack_backup import StackBackup
 from register import Registrar
 import config
 import connections
+import disk_usage
 import networks
 import deploy
 import rebuild
@@ -1015,6 +1016,25 @@ def get_connections(x_agent_token: str | None = Header(default=None)):
     """
     require_agent_token(x_agent_token)
     return connections.snapshot(HOST_NAME, client)
+
+
+@app.get("/disk/usage")
+def get_disk_usage(
+    path: str = "/",
+    refresh: bool = False,
+    x_agent_token: str | None = Header(default=None),
+):
+    """What's taking the space under ``path`` on this host — see disk_usage.py.
+
+    Token-gated like /connections: it reads every file name on the host,
+    which is a different class of thing from the container inventory.
+    Returns straight away; a scan still running says ``state: scanning``.
+    """
+    require_agent_token(x_agent_token)
+    try:
+        return disk_usage.usage(path, refresh=refresh)
+    except disk_usage.DiskUsageError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
 
 
 # ---------------------------------------------------------------------------
