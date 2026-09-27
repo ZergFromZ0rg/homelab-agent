@@ -78,6 +78,10 @@ services:
       REBUILD_ENABLED: ${REBUILD_ENABLED:-}
       AI_REBUILD_ANY: ${AI_REBUILD_ANY:-}
 
+      # Shells from the dashboard — into containers, and onto this host
+      # (as whoever owns this checkout). Off unless set to 1.
+      TERMINAL_ENABLED: ${TERMINAL_ENABLED:-}
+
       # Harmless on a host with no NVIDIA card; they only do anything when
       # the runtime below is nvidia.
       NVIDIA_VISIBLE_DEVICES: all

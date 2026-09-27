@@ -1,3 +1,4 @@
+import asyncio
 import os
 import time
 import threading
@@ -8,7 +9,7 @@ import glob
 from pathlib import Path
 import docker
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
 
 from log import log, audit
@@ -21,6 +22,7 @@ import disk_usage
 import networks
 import deploy
 import rebuild
+import terminal
 import version
 import volume_backup
 from deploy import CreateContainerRequest, PolicyError
@@ -794,6 +796,7 @@ def get_container_inventory():
 
 @app.on_event("startup")
 def startup_event():
+    terminal.cleanup_helpers(client)
     start_cache_worker()
     stack_backup.start()
     registrar.start()
@@ -863,6 +866,8 @@ def get_containers():
         "updated_at": updated_at,
         "gpu": gpu,
         "containers": containers,
+        # So the dashboard only offers a shell where one will open.
+        "terminal": terminal.enabled(),
     }
 
 
@@ -1003,6 +1008,52 @@ def rebuild_status(job_id: str, x_agent_token: str | None = Header(default=None)
     if job is None:
         raise HTTPException(status_code=404, detail="unknown rebuild job")
     return job
+
+
+@app.websocket("/terminal")
+async def terminal_socket(websocket: WebSocket):
+    """An interactive shell: ``?container=<id>`` for ``docker exec``, or
+    ``?target=host`` for a shell on this machine. See terminal.py.
+
+    Off unless TERMINAL_ENABLED is set. Refusals accept and then close
+    with a 44xx code and the reason: closing before the handshake reaches
+    the caller as a bare HTTP 403, and it could only say "refused".
+    """
+    await websocket.accept()
+    token = websocket.headers.get("x-agent-token")
+    if AGENT_TOKEN and not secrets.compare_digest(token or "", AGENT_TOKEN):
+        await websocket.close(code=4401, reason="invalid agent token")
+        return
+    if not terminal.enabled():
+        await websocket.close(
+            code=4403,
+            reason="the terminal is off on this host; set TERMINAL_ENABLED=1 on its agent",
+        )
+        return
+
+    params = websocket.query_params
+    target = "host" if params.get("target") == "host" else "container"
+    container_id = (params.get("container") or "").strip()
+    if target == "container" and not container_id:
+        await websocket.close(code=4400, reason="container is required")
+        return
+
+    def size(name, default):
+        try:
+            return int(params.get(name, default))
+        except ValueError:
+            return default
+
+    await terminal.serve(
+        websocket,
+        client,
+        target=target,
+        container_id=container_id or None,
+        checkout=await asyncio.to_thread(_own_working_dir) if target == "host" else None,
+        cols=size("cols", 80),
+        rows=size("rows", 24),
+        who=(params.get("by") or "unknown")[:80],
+    )
 
 
 @app.get("/connections")

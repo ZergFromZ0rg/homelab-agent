@@ -83,6 +83,12 @@ up with `--build`, so an agent (or anything else) can be updated from the
 dashboard instead of over SSH. **Off unless `REBUILD_ENABLED=1`** — see
 [Rebuilding](#rebuilding) below.
 
+### Web Terminal
+
+`WS /terminal` gives the dashboard an interactive shell — `docker exec`
+into a container, or a shell on the host itself. **Off unless
+`TERMINAL_ENABLED=1`** — see [Terminal](#terminal) below.
+
 ### Dashboard Registration
 
 If `DASHBOARD_URL` is set, Homelab Agent registers itself with a
@@ -1414,6 +1420,38 @@ All three require `X-Agent-Token` when `AGENT_TOKEN` is set.
 | `REBUILD_TIMEOUT` | `1800` | Seconds for the whole pull + build. |
 | `REBUILD_HELPER_IMAGE` | *(this agent's image)* | Image for the self-rebuild helper. |
 
+## Terminal
+
+`WS /terminal?container=<id>` opens a shell inside a running container;
+`WS /terminal?target=host` opens one on the machine. The dashboard's
+terminal dock is the client; it requires a passkey login before it will
+relay one, and logs every session to its activity feed.
+
+**Off unless `TERMINAL_ENABLED=1`**, and the socket wants `X-Agent-Token`
+when `AGENT_TOKEN` is set. A host shell is as much access as the machine
+has to give, so opt in only where the dashboard is behind a login.
+
+- **Container shells** run `bash` if the image has it, else `sh`. An image
+  with neither (distroless) has no shell to open.
+- **Host shells** run in a throwaway privileged helper (this agent's image,
+  in the host's PID namespace) that `nsenter`s into PID 1. You land as the
+  user who owns the agent's checkout — usually whoever installed it — or
+  root when that can't be worked out. The helper is removed when the
+  session ends, and on agent startup any left over from a crash are too.
+- **Closing a tab ends the shell.** `docker exec` has no kill, so the
+  agent sends the shell SIGHUP itself — otherwise it would keep running
+  after the browser left.
+
+Protocol: binary frames are terminal bytes both ways; text frames are JSON
+— `{"type":"resize","cols","rows"}` in, `{"type":"exit","code"}` or
+`{"type":"error","message"}` out. Refusals (off, bad token) close with a
+`44xx` code and the reason.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `TERMINAL_ENABLED` | *(off)* | `1` allows shells. Settable from the dashboard when `CONFIG_WRITABLE=1`. |
+| `TERMINAL_MAX_SESSIONS` | `8` | Concurrent shells on this host. |
+
 ## Dashboard Registration
 
 A homelab-dashboard instance normally has to be told about every agent it
@@ -1477,6 +1515,7 @@ homelab-agent/
 ├── connections.py
 ├── sockets.py
 ├── rebuild.py
+├── terminal.py
 ├── setup.sh
 ├── install.sh
 ├── stack_backup.py

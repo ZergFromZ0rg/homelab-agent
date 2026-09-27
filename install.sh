@@ -21,6 +21,7 @@ AGENT_TOKEN_ARG=""
 NAME=""
 AGENT_URL_OVERRIDE=""
 REBUILD=""
+TERMINAL=""
 
 usage() {
   cat <<'USAGE'
@@ -36,6 +37,7 @@ Usage: install.sh [options]
   --agent-url URL   how the dashboard should reach this agent
                     (default: http://<name>:8123)
   --rebuild         allow the dashboard to pull+rebuild projects here
+  --terminal        allow shells from the dashboard (containers and this host)
   --dir PATH        where to put the checkout (default ~/homelab-agent)
 USAGE
 }
@@ -49,6 +51,7 @@ while [ $# -gt 0 ]; do
     --agent-url) AGENT_URL_OVERRIDE=${2:?--agent-url needs a URL}; shift 2 ;;
     --dir) DIR=${2:?--dir needs a path}; shift 2 ;;
     --rebuild) REBUILD=1; shift ;;
+    --terminal) TERMINAL=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -123,6 +126,7 @@ put HOST_NAME "$NAME"
 [ -n "$TOKEN" ] && put REGISTER_TOKEN "$TOKEN"
 [ -n "$AGENT_TOKEN_ARG" ] && put AGENT_TOKEN "$AGENT_TOKEN_ARG"
 [ -n "$REBUILD" ] && put REBUILD_ENABLED 1
+[ -n "$TERMINAL" ] && put TERMINAL_ENABLED 1
 
 if [ -n "$AGENT_URL_OVERRIDE" ]; then
   put AGENT_URL "$AGENT_URL_OVERRIDE"

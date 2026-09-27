@@ -142,6 +142,14 @@ SETTINGS: list[dict] = [
         "danger": True,
     },
     {
+        "key": "TERMINAL_ENABLED", "kind": "bool", "scope": "live",
+        "group": "Updates", "label": "Allow terminals from the dashboard",
+        "help": "Shells into this host's containers, and a shell on the "
+                "host itself — as the user who owns the agent's checkout, "
+                "or root. Anyone signed in to the dashboard gets them.",
+        "danger": True,
+    },
+    {
         "key": "CONNECTIONS_ENABLED", "kind": "bool", "scope": "live",
         "group": "Monitoring", "label": "Report network conversations",
         "help": "Powers the Connections panel on the Network tab.",
