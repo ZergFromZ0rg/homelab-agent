@@ -24,6 +24,7 @@ import connections
 import disk_delete
 import disk_usage
 import files
+import compose_edit
 import networks
 import deploy
 import rebuild
@@ -1218,6 +1219,69 @@ def post_files_rename(body: dict, x_agent_token: str | None = Header(default=Non
 def post_files_mkdir(body: dict, x_agent_token: str | None = Header(default=None)):
     require_agent_token(x_agent_token)
     return _files_call(files.make_folder, client, str(body.get("path", "")), _owner_uid())
+
+
+# ---------------------------------------------------------------------------
+# Container settings — edit the compose file, then apply. See compose_edit.py.
+# ---------------------------------------------------------------------------
+
+
+def _compose_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except compose_edit.NotCompose as error:
+        return JSONResponse(status_code=400, content={"error": str(error), "compose": False})
+    except docker.errors.NotFound:
+        return JSONResponse(status_code=404, content={"error": "no such container"})
+    except OSError as error:
+        return JSONResponse(status_code=400, content={"error": f"can't read the compose file: {error}"})
+    except files.Conflict as error:
+        return JSONResponse(status_code=409, content={"error": str(error)})
+    except disk_usage.DiskUsageError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+@app.get("/compose")
+def get_compose(container: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _compose_call(compose_edit.read, client, container, _owner_uid())
+
+
+@app.get("/compose/generate")
+def get_compose_generate(container: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _compose_call(compose_edit.generate, client, container)
+
+
+@app.post("/compose/preview")
+def post_compose_preview(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _compose_call(
+        compose_edit.preview, client, str(body.get("container", "")),
+        str(body.get("path", "")), str(body.get("content", "")),
+    )
+
+
+@app.post("/compose/apply")
+def post_compose_apply(body: dict, x_agent_token: str | None = Header(default=None)):
+    """Save and apply, as a job to poll — see compose_edit.py. Needs
+    REBUILD_ENABLED: it runs whatever the file says."""
+    require_agent_token(x_agent_token)
+    modified = body.get("modified")
+    return _compose_call(
+        compose_edit.start, client, str(body.get("container", "")),
+        str(body.get("path", "")), str(body.get("content", "")),
+        float(modified) if modified is not None else None, _owner_uid(),
+    )
+
+
+@app.get("/compose/jobs/{job_id}")
+def get_compose_job(job_id: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    job = compose_edit.status(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "unknown job"})
+    return job
 
 
 # ---------------------------------------------------------------------------

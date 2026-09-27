@@ -95,6 +95,12 @@ into a container, or a shell on the host itself. **Off unless
 folders for the dashboard's file browser. Reading works everywhere;
 writing only under this host's roots — see [Files](#files) below.
 
+### Container Settings
+
+`/compose*` lets the dashboard edit a container's compose file and apply
+it — checked first, watched after, rolled back if it doesn't come up. See
+[Compose changes](#compose-changes) below.
+
 ### Dashboard Registration
 
 If `DASHBOARD_URL` is set, Homelab Agent registers itself with a
@@ -1489,6 +1495,33 @@ file sees the change.
 | --- | --- | --- |
 | `FILES_WRITABLE_PATHS` | *(none)* | Extra writable folders, e.g. a media disk. Settable from the dashboard when `CONFIG_WRITABLE=1`. |
 
+## Compose changes
+
+Editing a running container is undone by the next `docker compose up`, so
+the dashboard edits the compose file and has Compose apply it. Compose's
+own labels say which project, service, folder and files — nothing to set.
+
+| Route | |
+| --- | --- |
+| `GET /compose?container=` | the project's compose files, which defines the service, and whether this host may apply |
+| `POST /compose/preview` | `{container, path, content}` → `docker compose config` verdict + unified diff; nothing on the host changes |
+| `POST /compose/apply` | same plus `modified` → a job: save, `up -d`, watch, roll back on failure |
+| `GET /compose/jobs/{id}` | a job's steps and outcome (`done`, `rolled_back`, `failed`) |
+| `GET /compose/generate?container=` | for a container Compose didn't start: a compose file that would recreate it |
+
+- **Checking** runs `docker compose config` in a helper on a copy of the
+  edited file, with the real folder as `--project-directory`, so `./data`
+  and `.env` resolve as they will for real.
+- **Applying** saves the file as its owner (in place, keeping the inode),
+  runs `docker compose up -d` in a helper at the project's real path, and
+  watches the project's containers for `COMPOSE_WATCH_SECONDS` (45). One
+  that exits non-zero, restart-loops or turns unhealthy puts the previous
+  file back and runs `up -d` again; the job names it and carries its last
+  log lines.
+- **Needs `REBUILD_ENABLED`** — applying runs whatever the file says, as
+  root. The agent's own project is refused: `up` would replace the agent
+  halfway through the job.
+
 ## Dashboard Registration
 
 A homelab-dashboard instance normally has to be told about every agent it
@@ -1554,6 +1587,7 @@ homelab-agent/
 ├── rebuild.py
 ├── terminal.py
 ├── files.py
+├── compose_edit.py
 ├── setup.sh
 ├── install.sh
 ├── stack_backup.py

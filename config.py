@@ -132,9 +132,10 @@ SETTINGS: list[dict] = [
     },
     {
         "key": "REBUILD_ENABLED", "kind": "bool", "scope": "live",
-        "group": "Updates", "label": "Allow rebuilds from the dashboard",
+        "group": "Updates", "label": "Allow rebuilds and compose changes",
         "help": "Lets the dashboard pull and rebuild this host's compose "
-                "projects. That runs whatever the repo and its Dockerfile "
+                "projects, and apply edits to their compose files. That "
+                "runs whatever the repo, its Dockerfile or the compose file "
                 "say, as root on this host.",
         "danger": True,
     },
