@@ -17,6 +17,7 @@ REPO_URL=${REPO_URL:-https://github.com/ZergFromZ0rg/homelab-agent.git}
 DIR=${DIR:-$HOME/homelab-agent}
 DASHBOARD=""
 TOKEN=""
+AGENT_TOKEN_ARG=""
 NAME=""
 AGENT_URL_OVERRIDE=""
 REBUILD=""
@@ -27,6 +28,9 @@ Usage: install.sh [options]
 
   --dashboard URL   the dashboard this node should register with
   --token TOKEN     the dashboard's API_TOKEN, if it has one set
+  --agent-token T   the shared AGENT_TOKEN, so only the dashboard can
+                    drive this agent (the dashboard's Add-node command
+                    fills this in)
   --name NAME       this host's name (default: its hostname)
                     must match its Prometheus job_name
   --agent-url URL   how the dashboard should reach this agent
@@ -40,6 +44,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     --dashboard) DASHBOARD=${2:?--dashboard needs a URL}; shift 2 ;;
     --token) TOKEN=${2:?--token needs a value}; shift 2 ;;
+    --agent-token) AGENT_TOKEN_ARG=${2:?--agent-token needs a value}; shift 2 ;;
     --name) NAME=${2:?--name needs a value}; shift 2 ;;
     --agent-url) AGENT_URL_OVERRIDE=${2:?--agent-url needs a URL}; shift 2 ;;
     --dir) DIR=${2:?--dir needs a path}; shift 2 ;;
@@ -116,6 +121,7 @@ put HOST_NAME "$NAME"
 
 [ -n "$DASHBOARD" ] && put DASHBOARD_URL "$DASHBOARD"
 [ -n "$TOKEN" ] && put REGISTER_TOKEN "$TOKEN"
+[ -n "$AGENT_TOKEN_ARG" ] && put AGENT_TOKEN "$AGENT_TOKEN_ARG"
 [ -n "$REBUILD" ] && put REBUILD_ENABLED 1
 
 if [ -n "$AGENT_URL_OVERRIDE" ]; then
