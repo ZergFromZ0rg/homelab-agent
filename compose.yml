@@ -86,6 +86,10 @@ services:
       # stack folders; list more here. Reading is allowed everywhere.
       FILES_WRITABLE_PATHS: ${FILES_WRITABLE_PATHS:-}
 
+      # Nightly image updates at HH:MM (host time); empty = off. Usually
+      # set from the dashboard instead.
+      AUTO_UPDATE_AT: ${AUTO_UPDATE_AT:-}
+
       # Harmless on a host with no NVIDIA card; they only do anything when
       # the runtime below is nvidia.
       NVIDIA_VISIBLE_DEVICES: all

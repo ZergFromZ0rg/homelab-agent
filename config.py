@@ -158,6 +158,14 @@ SETTINGS: list[dict] = [
         "danger": True,
     },
     {
+        "key": "AUTO_UPDATE_AT", "kind": "time", "scope": "live",
+        "group": "Updates", "label": "Update images nightly at",
+        "help": "HH:MM in this host's time zone. Pulls newer images for its "
+                "compose stacks and recreates them, rolling back any that "
+                "don't come up. Empty = never; needs rebuilds and compose "
+                "changes allowed.",
+    },
+    {
         "key": "CONNECTIONS_ENABLED", "kind": "bool", "scope": "live",
         "group": "Monitoring", "label": "Report network conversations",
         "help": "Powers the Connections panel on the Network tab.",
@@ -309,6 +317,11 @@ def _clean(setting: dict, value) -> str:
             raise ConfigError(f"{label}: must be at most {high}")
 
         return str(int(number) if number.is_integer() else number)
+
+    if kind == "time":
+        if text and not re.fullmatch(r"([01]?\d|2[0-3]):[0-5]\d", text):
+            raise ConfigError(f"{label}: use 24-hour HH:MM, like 03:30")
+        return text
 
     if kind == "url":
         if text and not text.startswith(("http://", "https://")):

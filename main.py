@@ -25,6 +25,7 @@ import disk_delete
 import disk_usage
 import files
 import compose_edit
+import updates
 import networks
 import deploy
 import rebuild
@@ -384,6 +385,7 @@ def build_container_snapshot():
                 "size": get_container_size(container),
                 "ports": _container_ports(container),
                 "rebuild": rebuild.summary_for(container.labels),
+                "update": updates.for_container(container, container.labels),
             })
 
         except Exception as error:
@@ -804,6 +806,7 @@ def get_container_inventory():
 def startup_event():
     terminal.cleanup_helpers(client)
     start_cache_worker()
+    updates.start_loop(client)
     stack_backup.start()
     registrar.start()
 
@@ -1279,6 +1282,48 @@ def post_compose_apply(body: dict, x_agent_token: str | None = Header(default=No
 def get_compose_job(job_id: str, x_agent_token: str | None = Header(default=None)):
     require_agent_token(x_agent_token)
     job = compose_edit.status(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "unknown job"})
+    return job
+
+
+# ---------------------------------------------------------------------------
+# Image updates — see updates.py.
+# ---------------------------------------------------------------------------
+
+
+@app.get("/updates")
+def get_updates(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return {"images": updates.snapshot(), "jobs": updates.recent()}
+
+
+@app.post("/updates/check")
+def post_updates_check(x_agent_token: str | None = Header(default=None)):
+    """Check every image now instead of waiting for the next round."""
+    require_agent_token(x_agent_token)
+    result = updates.check_all(client)
+    cache_wake.set()
+    return {"images": result}
+
+
+@app.post("/updates")
+def post_updates(body: dict | None = None, x_agent_token: str | None = Header(default=None)):
+    """Update ``containers`` (names), or everything with an update when
+    it's missing. A job to poll; needs REBUILD_ENABLED."""
+    require_agent_token(x_agent_token)
+    names = (body or {}).get("containers")
+    if names is not None and not isinstance(names, list):
+        return JSONResponse(status_code=400, content={"error": "containers must be a list"})
+    if names == []:
+        return JSONResponse(status_code=400, content={"error": "no containers given"})
+    return _compose_call(updates.start, client, names, by=str((body or {}).get("by") or "dashboard")[:80])
+
+
+@app.get("/updates/jobs/{job_id}")
+def get_update_job(job_id: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    job = updates.status(job_id)
     if job is None:
         return JSONResponse(status_code=404, content={"error": "unknown job"})
     return job

@@ -101,6 +101,12 @@ writing only under this host's roots — see [Files](#files) below.
 it — checked first, watched after, rolled back if it doesn't come up. See
 [Compose changes](#compose-changes) below.
 
+### Image Updates
+
+The agent checks every few hours whether a newer image is on the registry
+for each container, and can pull and recreate with rollback. See
+[Image updates](#image-updates) below.
+
 ### Dashboard Registration
 
 If `DASHBOARD_URL` is set, Homelab Agent registers itself with a
@@ -1522,6 +1528,41 @@ own labels say which project, service, folder and files — nothing to set.
   root. The agent's own project is refused: `up` would replace the agent
   halfway through the job.
 
+## Image updates
+
+Every container in `GET /containers` carries `update`: `current`,
+`available`, `local` (built here, no registry to ask), `pinned` (by
+digest), `unknown` (the registry didn't answer) or `unchecked` (the image
+changed since the last check).
+
+**What "available" means.** The registry is asked for the manifest the tag
+points to now, and the entry *for this host's platform* is compared with
+the one the container runs (from the containerd image store). The tag's
+top-level digest is not used: registries re-publish multi-platform images
+(new attestations, other architectures rebuilt) without changing this
+host's image, and that would badge images that haven't changed. On the
+classic image store there is no per-platform record, so the tag's digest is
+compared instead (`basis: "tag"`).
+
+Registries are asked anonymously with the standard bearer-token challenge,
+which covers Docker Hub, ghcr.io, lscr.io and quay.io. Private images come
+back `local`.
+
+| Route | |
+| --- | --- |
+| `GET /updates` | the check results per image, and recent jobs |
+| `POST /updates/check` | check every image now |
+| `POST /updates` | `{containers: [names]}` → a job: `compose pull` + `up -d` + watch; rollback retags the previous image |
+| `GET /updates/jobs/{id}` | a job's steps and per-stack results |
+
+Updating needs `REBUILD_ENABLED` and a container Compose started; the
+agent's own stack updates with a rebuild instead.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `UPDATE_CHECK_HOURS` | `6` | Hours between registry checks. |
+| `AUTO_UPDATE_AT` | *(off)* | `HH:MM`, this host's time zone: update everything with an update, nightly. Settable from the dashboard. |
+
 ## Dashboard Registration
 
 A homelab-dashboard instance normally has to be told about every agent it
@@ -1586,6 +1627,7 @@ homelab-agent/
 ├── sockets.py
 ├── rebuild.py
 ├── terminal.py
+├── updates.py
 ├── files.py
 ├── compose_edit.py
 ├── setup.sh
