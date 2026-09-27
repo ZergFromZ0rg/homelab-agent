@@ -103,6 +103,13 @@ SETTINGS: list[dict] = [
                 "started, because it is a bind mount.",
     },
     {
+        "key": "FILES_WRITABLE_PATHS", "kind": "paths", "scope": "live",
+        "group": "Files", "label": "Extra folders the file browser may change",
+        "help": "The owner's home and every compose stack folder are writable "
+                "already. Add others here, e.g. a media disk. Reading is "
+                "allowed everywhere regardless.",
+    },
+    {
         "key": "BACKUP_REPO", "kind": "text", "scope": "live",
         "group": "Config backup", "label": "Repository",
         "help": "owner/name of a private repo for this host's compose files.",

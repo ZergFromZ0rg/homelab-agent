@@ -58,7 +58,9 @@ def normalize(path: str) -> str:
         raise DiskUsageError("path must be absolute")
     if ".." in path.split("/"):
         raise DiskUsageError("path must not contain '..'")
-    return posixpath.normpath(path) or "/"
+    # normpath keeps a leading "//" (POSIX leaves it implementation-defined),
+    # which would then fail every "is this under that root" comparison.
+    return posixpath.normpath("/" + path.lstrip("/")) or "/"
 
 
 def _on_host(path: str) -> str:

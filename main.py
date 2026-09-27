@@ -1,5 +1,8 @@
 import asyncio
+import io
+import mimetypes
 import os
+import tempfile
 import time
 import threading
 import subprocess
@@ -7,10 +10,11 @@ import secrets
 import shutil
 import glob
 from pathlib import Path
+from urllib.parse import quote
 import docker
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from log import log, audit
 from stack_backup import StackBackup
@@ -19,6 +23,7 @@ import config
 import connections
 import disk_delete
 import disk_usage
+import files
 import networks
 import deploy
 import rebuild
@@ -1097,6 +1102,122 @@ def post_disk_delete(body: dict, x_agent_token: str | None = Header(default=None
         return disk_delete.delete(client, str(body.get("path", "")))
     except disk_usage.DiskUsageError as error:
         return JSONResponse(status_code=400, content={"success": False, "error": str(error)})
+
+
+# ---------------------------------------------------------------------------
+# File browser — see files.py. Reads anywhere; writes only inside roots.
+# ---------------------------------------------------------------------------
+
+
+def _owner_uid():
+    return terminal.owner_uid(_own_working_dir())
+
+
+def _files_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except files.Conflict as error:
+        return JSONResponse(status_code=409, content={"success": False, "error": str(error)})
+    except disk_usage.DiskUsageError as error:
+        return JSONResponse(status_code=400, content={"success": False, "error": str(error)})
+
+
+@app.get("/files/list")
+def get_files_list(path: str = "~", x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(files.listing, client, path, _owner_uid())
+
+
+@app.get("/files/text")
+def get_files_text(path: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(files.read_text, client, path, _owner_uid())
+
+
+@app.put("/files/text")
+def put_files_text(body: dict, x_agent_token: str | None = Header(default=None)):
+    """Save an edited file. ``modified`` is the mtime it was opened at; a
+    file changed since then answers 409 rather than being overwritten."""
+    require_agent_token(x_agent_token)
+    data = str(body.get("content", "")).encode("utf-8")
+    modified = body.get("modified")
+    return _files_call(
+        files.write_file, client, str(body.get("path", "")), io.BytesIO(data), len(data),
+        _owner_uid(), overwrite=modified is not None,
+        expected_modified=float(modified) if modified is not None else None,
+    )
+
+
+def _disposition(name: str, inline: bool) -> str:
+    kind = "inline" if inline else "attachment"
+    return f"{kind}; filename*=UTF-8''{quote(name)}"
+
+
+@app.get("/files/download")
+def get_files_download(
+    path: str, inline: bool = False, x_agent_token: str | None = Header(default=None)
+):
+    """One file as-is, or a folder as a .tar.gz streamed as it's built."""
+    require_agent_token(x_agent_token)
+    try:
+        if os.path.isdir(disk_usage._on_host(disk_usage.normalize(path))) and not os.path.islink(
+            disk_usage._on_host(disk_usage.normalize(path))
+        ):
+            chunks, name = files.folder_archive(path)
+            return StreamingResponse(
+                chunks, media_type="application/gzip",
+                headers={"Content-Disposition": _disposition(name, False)},
+            )
+        handle, size, name = files.open_file(path)
+    except disk_usage.DiskUsageError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+
+    def body():
+        with handle:
+            while chunk := handle.read(1024 * 1024):
+                yield chunk
+
+    return StreamingResponse(
+        body(),
+        media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
+        headers={
+            "Content-Length": str(size),
+            "Content-Disposition": _disposition(name, inline),
+        },
+    )
+
+
+@app.post("/files/upload")
+async def post_files_upload(
+    request: Request, path: str, overwrite: bool = False,
+    x_agent_token: str | None = Header(default=None),
+):
+    """The raw request body becomes the file at ``path``. Spooled to a temp
+    file first: the helper needs the size up front for the tar header."""
+    require_agent_token(x_agent_token)
+    with tempfile.TemporaryFile() as spool:
+        async for chunk in request.stream():
+            spool.write(chunk)
+        size = spool.tell()
+        spool.seek(0)
+        return await asyncio.to_thread(
+            _files_call, files.write_file, client, path, spool, size,
+            _owner_uid(), overwrite=overwrite,
+        )
+
+
+@app.post("/files/rename")
+def post_files_rename(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(
+        files.rename, client, str(body.get("path", "")), str(body.get("name", "")), _owner_uid()
+    )
+
+
+@app.post("/files/mkdir")
+def post_files_mkdir(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(files.make_folder, client, str(body.get("path", "")), _owner_uid())
 
 
 # ---------------------------------------------------------------------------

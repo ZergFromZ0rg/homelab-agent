@@ -89,6 +89,12 @@ dashboard instead of over SSH. **Off unless `REBUILD_ENABLED=1`** — see
 into a container, or a shell on the host itself. **Off unless
 `TERMINAL_ENABLED=1`** — see [Terminal](#terminal) below.
 
+### File Browser
+
+`/files/*` lists, reads, downloads, uploads, edits, renames and makes
+folders for the dashboard's file browser. Reading works everywhere;
+writing only under this host's roots — see [Files](#files) below.
+
 ### Dashboard Registration
 
 If `DASHBOARD_URL` is set, Homelab Agent registers itself with a
@@ -1452,6 +1458,37 @@ Protocol: binary frames are terminal bytes both ways; text frames are JSON
 | `TERMINAL_ENABLED` | *(off)* | `1` allows shells. Settable from the dashboard when `CONFIG_WRITABLE=1`. |
 | `TERMINAL_MAX_SESSIONS` | `8` | Concurrent shells on this host. |
 
+## Files
+
+The dashboard's file browser. All routes want `X-Agent-Token` when
+`AGENT_TOKEN` is set.
+
+| Route | |
+| --- | --- |
+| `GET /files/list?path=` | every entry in a folder (`~` = the owner's home), plus whether it's writable and why not |
+| `GET /files/text?path=` | a UTF-8 file up to 2 MB, for the editor |
+| `PUT /files/text` | `{path, content, modified}` — 409 if the file changed since `modified` |
+| `GET /files/download?path=` | a file as-is, or a folder as a streamed `.tar.gz` |
+| `POST /files/upload?path=&overwrite=` | the raw body becomes the file; 409 if it exists |
+| `POST /files/rename` | `{path, name}` — within the same folder |
+| `POST /files/mkdir` | `{path}` |
+
+**Reading is allowed everywhere** the read-only `/host` mount reaches.
+**Writing is scoped to roots:** the home folder of whoever owns this
+agent's checkout, every Compose project folder on the host, `STACK_DIRS`,
+and `FILES_WRITABLE_PATHS`. Never `/` or an operating-system folder, and
+no symlinks on the way down.
+
+Writes run in a throwaway helper (network off, only the folder mounted)
+**as the owner** of the file, or of the folder for a new one, so nothing
+turns root-owned in someone's home. An edit is written over the existing
+file rather than replacing it, so a container that bind-mounts that single
+file sees the change.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `FILES_WRITABLE_PATHS` | *(none)* | Extra writable folders, e.g. a media disk. Settable from the dashboard when `CONFIG_WRITABLE=1`. |
+
 ## Dashboard Registration
 
 A homelab-dashboard instance normally has to be told about every agent it
@@ -1516,6 +1553,7 @@ homelab-agent/
 ├── sockets.py
 ├── rebuild.py
 ├── terminal.py
+├── files.py
 ├── setup.sh
 ├── install.sh
 ├── stack_backup.py

@@ -82,6 +82,10 @@ services:
       # (as whoever owns this checkout). Off unless set to 1.
       TERMINAL_ENABLED: ${TERMINAL_ENABLED:-}
 
+      # The file browser writes only under the owner's home and compose
+      # stack folders; list more here. Reading is allowed everywhere.
+      FILES_WRITABLE_PATHS: ${FILES_WRITABLE_PATHS:-}
+
       # Harmless on a host with no NVIDIA card; they only do anything when
       # the runtime below is nvidia.
       NVIDIA_VISIBLE_DEVICES: all

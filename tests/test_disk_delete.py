@@ -92,6 +92,10 @@ def test_refuses_the_dangerous_ones(host):
         ("/var/lib/docker/x", "operating system"),
         ("/home/ghost", "doesn't exist"),
         ("/home/../etc", "'..'"),
+        # A doubled leading slash still reaches /etc on disk; it used to
+        # slip past the system-folder check, which compared strings.
+        ("//etc/ssh", "operating system"),
+        ("//home", "top-level"),
     ]:
         with pytest.raises(DiskUsageError, match=reason):
             disk_delete.check(client, path)
