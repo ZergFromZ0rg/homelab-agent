@@ -178,6 +178,8 @@ def test_listing_and_deleting_archives(client, store):
 
     listed = client.get(f"/backup/archives?directory={store}").json()
     assert [a["name"] for a in listed["archives"]] == [name]
+    # Where they really are on the machine, not inside the agent.
+    assert listed["host_path"] == "/srv/backups"
 
     out = client.post(
         "/backup/archives/delete", json={"directory": str(store), "names": [name]}

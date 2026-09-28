@@ -1752,7 +1752,15 @@ def backup_archives(
     require_agent_token(x_agent_token)
 
     try:
-        return {"directory": directory, "archives": volume_backup.list_archives(client, directory)}
+        # host_path: where the archives really are on this machine, so the
+        # dashboard can show (and open) the folder, not just the path the
+        # agent sees inside its container.
+        _, host_path = volume_backup.resolve(client, directory)
+        return {
+            "directory": directory,
+            "host_path": host_path,
+            "archives": volume_backup.list_archives(client, directory),
+        }
     except volume_backup.PolicyError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
