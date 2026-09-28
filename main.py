@@ -25,6 +25,7 @@ import disk_delete
 import disk_usage
 import files
 import compose_edit
+import container_logs
 import updates
 import networks
 import deploy
@@ -1062,6 +1063,35 @@ async def terminal_socket(websocket: WebSocket):
         cols=size("cols", 80),
         rows=size("rows", 24),
         who=(params.get("by") or "unknown")[:80],
+    )
+
+
+@app.websocket("/containers/{container_id}/logs")
+async def container_logs_socket(websocket: WebSocket, container_id: str):
+    """A container's last ``tail`` lines, then new ones as they arrive —
+    see container_logs.py. Needs only the agent token: it reads."""
+    await websocket.accept()
+    token = websocket.headers.get("x-agent-token")
+    if AGENT_TOKEN and not secrets.compare_digest(token or "", AGENT_TOKEN):
+        await websocket.close(code=4401, reason="invalid agent token")
+        return
+    params = websocket.query_params
+    await container_logs.stream(
+        websocket, client, container_id,
+        tail=params.get("tail", 500), timestamps=params.get("timestamps") in ("1", "true"),
+    )
+
+
+@app.get("/containers/{container_id}/logs/download")
+def container_logs_download(container_id: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    try:
+        chunks, name = container_logs.download(client, container_id)
+    except docker.errors.NotFound:
+        return JSONResponse(status_code=404, content={"error": "no such container"})
+    return StreamingResponse(
+        chunks, media_type="text/plain",
+        headers={"Content-Disposition": _disposition(f"{name}.log", False)},
     )
 
 
