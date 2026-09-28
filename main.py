@@ -26,6 +26,7 @@ import disk_usage
 import files
 import compose_edit
 import container_logs
+import host_control
 import updates
 import networks
 import deploy
@@ -808,6 +809,7 @@ def startup_event():
     terminal.cleanup_helpers(client)
     start_cache_worker()
     updates.start_loop(client)
+    host_control.start_loop(client)
     stack_backup.start()
     registrar.start()
 
@@ -878,6 +880,9 @@ def get_containers():
         "containers": containers,
         # So the dashboard only offers a shell where one will open.
         "terminal": terminal.enabled(),
+        # Failed services, pending OS updates, reboot needed — gathered in
+        # the background when host control is on. See host_control.py.
+        "host": host_control.facts() if host_control.enabled() else None,
     }
 
 
@@ -1093,6 +1098,66 @@ def container_logs_download(container_id: str, x_agent_token: str | None = Heade
         chunks, media_type="text/plain",
         headers={"Content-Disposition": _disposition(f"{name}.log", False)},
     )
+
+
+def _host_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except host_control.HostError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+@app.get("/host/services")
+def get_host_services(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _host_call(lambda: {"services": host_control.services(client)})
+
+
+@app.post("/host/services/{unit}/{action}")
+def post_host_service(unit: str, action: str, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _host_call(host_control.service_action, client, unit, action)
+
+
+@app.get("/host/services/{unit}/logs")
+def get_host_service_logs(unit: str, lines: int = 200, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _host_call(lambda: {"log": host_control.service_logs(client, unit, lines)})
+
+
+@app.get("/host/os-updates")
+def get_os_updates(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _host_call(host_control.os_updates, client)
+
+
+@app.post("/host/os-updates/upgrade")
+def post_os_upgrade(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _host_call(host_control.start_upgrade, client)
+
+
+@app.get("/host/os-updates/status")
+def get_os_upgrade_status(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _host_call(host_control.upgrade_status, client)
+
+
+@app.post("/host/facts/refresh")
+def post_host_facts(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    def refresh():
+        host_control._require()
+        return host_control.refresh_facts(client)
+
+    return _host_call(refresh)
+
+
+@app.post("/host/power")
+def post_host_power(body: dict, x_agent_token: str | None = Header(default=None)):
+    """Reboot or power off, scheduled a few seconds out on the host."""
+    require_agent_token(x_agent_token)
+    return _host_call(host_control.power, client, str(body.get("action", "")))
 
 
 @app.get("/connections")

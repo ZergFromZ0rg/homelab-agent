@@ -151,10 +151,11 @@ SETTINGS: list[dict] = [
     },
     {
         "key": "TERMINAL_ENABLED", "kind": "bool", "scope": "live",
-        "group": "Updates", "label": "Allow terminals from the dashboard",
-        "help": "Shells into this host's containers, and a shell on the "
-                "host itself — as the user who owns the agent's checkout, "
-                "or root. Anyone signed in to the dashboard gets them.",
+        "group": "Updates", "label": "Allow terminals and host control",
+        "help": "Shells into this host's containers and on the host itself "
+                "(as the user who owns the agent's checkout, or root), plus "
+                "systemd services, OS updates, reboot and power off. Root "
+                "on this machine for anyone signed in to the dashboard.",
         "danger": True,
     },
     {
