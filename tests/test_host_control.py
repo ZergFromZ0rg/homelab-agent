@@ -96,3 +96,13 @@ def test_off_means_off(monkeypatch):
     monkeypatch.delenv("TERMINAL_ENABLED")
     with pytest.raises(HostError, match="host control is off"):
         host_control.services(None)
+
+
+def test_journal_filters_are_quoted_and_bounded(monkeypatch):
+    calls = fake_run(monkeypatch, "-- No entries --\n")
+    host_control.journal(None, since="24h", priority="err", lines=99999, grep="it's $(bad)")
+    cmd = calls[-1]
+    assert "journalctl" in cmd and "-24h" in cmd and "-p err" in cmd and "-n 5000" in cmd
+    assert "'it'\"'\"'s $(bad)'" in cmd  # a search can't break out of its quotes
+    host_control.journal(None, since="bogus", priority="bogus")
+    assert "-1h" in calls[-1] and "-p warning" in calls[-1]

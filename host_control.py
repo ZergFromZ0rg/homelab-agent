@@ -189,6 +189,27 @@ def service_logs(client, unit: str, lines: int = 200) -> str:
     return output
 
 
+JOURNAL_PRIORITIES = {"err": "err", "warning": "warning", "info": "info"}
+JOURNAL_SINCE = {"15m": "-15min", "1h": "-1h", "24h": "-24h", "7d": "-7d"}
+
+
+def journal(client, *, since: str = "1h", priority: str = "warning", lines: int = 500,
+            grep: str | None = None, unit: str | None = None) -> str:
+    """The machine's system journal — every service, the kernel — filtered
+    by how bad (``err``/``warning``/``info``), how recent, and a search."""
+    _require()
+    lines = max(10, min(int(lines), 5000))
+    args = ["journalctl", "--no-pager", "-o", "short-iso", "-n", str(lines),
+            "--since", JOURNAL_SINCE.get(since, "-1h"),
+            "-p", JOURNAL_PRIORITIES.get(priority, "warning")]
+    if unit:
+        args += ["-u", _unit(unit)]
+    if grep:
+        args += ["--grep", grep[:200], "--case-sensitive=false"]
+    code, output = run(client, " ".join(shlex.quote(a) for a in args) + " 2>&1")
+    return output
+
+
 # --- OS updates -------------------------------------------------------------------
 
 def os_updates(client) -> dict:

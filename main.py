@@ -1085,6 +1085,7 @@ async def container_logs_socket(websocket: WebSocket, container_id: str):
     await container_logs.stream(
         websocket, client, container_id,
         tail=params.get("tail", 500), timestamps=params.get("timestamps") in ("1", "true"),
+        since=params.get("since"),
     )
 
 
@@ -1124,6 +1125,17 @@ def post_host_service(unit: str, action: str, x_agent_token: str | None = Header
 def get_host_service_logs(unit: str, lines: int = 200, x_agent_token: str | None = Header(default=None)):
     require_agent_token(x_agent_token)
     return _host_call(lambda: {"log": host_control.service_logs(client, unit, lines)})
+
+
+@app.get("/host/journal")
+def get_host_journal(
+    since: str = "1h", priority: str = "warning", lines: int = 500, grep: str | None = None,
+    x_agent_token: str | None = Header(default=None),
+):
+    """The system journal: every service and the kernel, filtered."""
+    require_agent_token(x_agent_token)
+    return _host_call(lambda: {"log": host_control.journal(client, since=since, priority=priority,
+                                                          lines=lines, grep=grep)})
 
 
 @app.get("/host/os-updates")

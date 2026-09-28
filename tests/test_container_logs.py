@@ -65,3 +65,10 @@ def test_tail_then_follow_then_end(web, monkeypatch):
         assert b"line-2" in got.content and got.headers["content-disposition"].startswith("attachment")
     finally:
         c.remove(force=True)
+
+
+def test_since_means_seconds_back():
+    import container_logs
+    now = int(time.time())
+    assert abs(container_logs._since(3600) - (now - 3600)) <= 1
+    assert container_logs._since(0) is None and container_logs._since("junk") is None

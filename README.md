@@ -1565,7 +1565,7 @@ agent's own stack updates with a rebuild instead.
 
 ## Container logs
 
-`WS /containers/{id}/logs?tail=500` sends a container's last lines, then
+`WS /containers/{id}/logs?tail=500&since=3600&timestamps=1` sends a container's last lines (or everything in the last `since` seconds), then
 follows until it stops or the viewer leaves (a stopped container just sends
 its tail). `GET /containers/{id}/logs/download` is the whole log with
 timestamps. Reading, so only the agent token — no opt-in.
@@ -1580,6 +1580,7 @@ terminals and host control"): it is root on the machine.
 | `GET /host/services` | every systemd service, failed first |
 | `POST /host/services/{unit}/{start,stop,restart}` | stopping docker, containerd, tailscaled, ssh or the network is refused — it would cut the machine off |
 | `GET /host/services/{unit}/logs?lines=` | its journal |
+| `GET /host/journal?since=1h&priority=warning&grep=` | the whole system journal, filtered (`err` / `warning` / `info`; `15m` / `1h` / `24h` / `7d`) |
 | `GET /host/os-updates` | `apt-get update`, then what would be upgraded |
 | `POST /host/os-updates/upgrade` / `GET .../status` | `apt-get upgrade`, followed |
 | `POST /host/power` | `{"action": "reboot" | "poweroff"}`, five seconds out |

@@ -16,6 +16,7 @@ import asyncio
 import json
 import queue
 import threading
+import time
 
 from log import log
 
@@ -29,7 +30,16 @@ def _clamp_tail(value) -> int:
         return 500
 
 
-async def stream(websocket, client, container_id: str, *, tail, timestamps: bool) -> None:
+def _since(value) -> int | None:
+    """Seconds back from now, as the Unix time Docker wants; None = no limit."""
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return None
+    return int(time.time()) - seconds if seconds > 0 else None
+
+
+async def stream(websocket, client, container_id: str, *, tail, timestamps: bool, since=None) -> None:
     try:
         container = client.containers.get(container_id)
     except Exception as error:  # noqa: BLE001 - shown to the user
@@ -39,8 +49,13 @@ async def stream(websocket, client, container_id: str, *, tail, timestamps: bool
 
     follow = container.status == "running"
     try:
+        start = _since(since)
         logs = client.api.logs(
-            container.id, stream=True, follow=follow, tail=_clamp_tail(tail), timestamps=timestamps
+            container.id, stream=True, follow=follow, timestamps=timestamps,
+            # A time range reads everything in it (up to MAX_TAIL lines);
+            # otherwise the last `tail` lines.
+            tail=MAX_TAIL if start else _clamp_tail(tail),
+            **({"since": start} if start else {}),
         )
     except Exception as error:  # noqa: BLE001
         await websocket.send_text(json.dumps({"type": "error", "message": f"can't read logs: {error}"}))
