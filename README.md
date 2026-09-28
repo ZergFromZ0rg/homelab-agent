@@ -1563,6 +1563,34 @@ agent's own stack updates with a rebuild instead.
 | `UPDATE_CHECK_HOURS` | `6` | Hours between registry checks. |
 | `AUTO_UPDATE_AT` | *(off)* | `HH:MM`, this host's time zone: update everything with an update, nightly. Settable from the dashboard. |
 
+## Container logs
+
+`WS /containers/{id}/logs?tail=500` sends a container's last lines, then
+follows until it stops or the viewer leaves (a stopped container just sends
+its tail). `GET /containers/{id}/logs/download` is the whole log with
+timestamps. Reading, so only the agent token — no opt-in.
+
+## Host control
+
+Behind the same switch as host shells, `TERMINAL_ENABLED` ("Allow
+terminals and host control"): it is root on the machine.
+
+| Route | |
+| --- | --- |
+| `GET /host/services` | every systemd service, failed first |
+| `POST /host/services/{unit}/{start,stop,restart}` | stopping docker, containerd, tailscaled, ssh or the network is refused — it would cut the machine off |
+| `GET /host/services/{unit}/logs?lines=` | its journal |
+| `GET /host/os-updates` | `apt-get update`, then what would be upgraded |
+| `POST /host/os-updates/upgrade` / `GET .../status` | `apt-get upgrade`, followed |
+| `POST /host/power` | `{"action": "reboot" | "poweroff"}`, five seconds out |
+
+Commands run through the host-shell helper (`nsenter -t 1 -a`). Upgrades
+and power actions run as **transient systemd units** (`systemd-run`), not
+in the helper: an upgrade that includes Docker restarts the Docker daemon
+and would kill a helper mid-dpkg. Facts (failed services, pending
+updates, reboot needed) are gathered every 15 minutes (package lists
+refreshed daily) and ride `GET /containers` as `host_facts`.
+
 ## Dashboard Registration
 
 A homelab-dashboard instance normally has to be told about every agent it
@@ -1629,6 +1657,8 @@ homelab-agent/
 ├── terminal.py
 ├── updates.py
 ├── files.py
+├── host_control.py
+├── container_logs.py
 ├── compose_edit.py
 ├── setup.sh
 ├── install.sh

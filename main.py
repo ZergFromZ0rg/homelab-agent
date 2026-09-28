@@ -882,7 +882,8 @@ def get_containers():
         "terminal": terminal.enabled(),
         # Failed services, pending OS updates, reboot needed — gathered in
         # the background when host control is on. See host_control.py.
-        "host": host_control.facts() if host_control.enabled() else None,
+        # (Not "host": that key is this host's name, above.)
+        "host_facts": host_control.facts() if host_control.enabled() else None,
     }
 
 
