@@ -391,13 +391,17 @@ def _tar_stream(name: str, size: int, source, uid: int, gid: int, mode: int):
     yield b"\0" * 1024
 
 
-def _helper(client, folder: str, command: list[str], uid: int, gid: int, extra: dict | None = None):
+def _helper(client, folder: str, command: list[str], uid: int, gid: int,
+            extra: list[tuple[str, str, str]] | None = None):
+    """``extra`` is (host folder, mount point, mode). Binds are a list, not a
+    dict keyed by host folder: a copy or move inside one folder mounts it
+    twice, and a dict would silently drop the first."""
     return client.containers.create(
         rebuild.helper_image(client),
         command=command,
         user=f"{uid}:{gid}",
         working_dir="/target",
-        volumes={folder: {"bind": "/target", "mode": "rw"}, **(extra or {})},
+        volumes=[f"{folder}:/target:rw", *(f"{host}:{bind}:{mode}" for host, bind, mode in extra or [])],
         network_disabled=True,
         labels={"homelab-agent-files": folder},
     )
@@ -564,7 +568,7 @@ def _two_folder_helper(client, src_folder: str, dest_folder: str, command: list[
                        uid: int, gid: int, *, src_mode: str):
     return _helper(
         client, dest_folder, command, uid, gid,
-        extra={src_folder: {"bind": "/source", "mode": src_mode}},
+        extra=[(src_folder, "/source", src_mode)],
     )
 
 
@@ -581,7 +585,7 @@ def move(client, path: str, dest: str, owner_uid: int | None) -> dict:
     # remove the original); the destination folder is mounted beside it.
     container = _helper(
         client, src_folder, ["mv", "-n", "--", src_name, f"/dest/{dest_name}"], uid, gid,
-        extra={dest_folder: {"bind": "/dest", "mode": "rw"}},
+        extra=[(dest_folder, "/dest", "rw")],
     )
     _run(container)
     if not os.path.lexists(disk_usage._on_host(dest)):

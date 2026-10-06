@@ -252,8 +252,8 @@ class Helpers:
 
     def make(self, client, folder, command, uid, gid, extra=None):
         mounts = {"/target": folder}
-        for host, spec in (extra or {}).items():
-            mounts[spec["bind"]] = host
+        for host, bind, _mode in extra or []:
+            mounts[bind] = host
         return {"command": command, "mounts": mounts, "extra": extra, "user": (uid, gid)}
 
     def run(self, helper):
@@ -334,7 +334,7 @@ def test_copy_reads_from_anywhere_and_writes_where_allowed(helpers, tmp_path, mo
     assert (dest / "n copy.txt").read_text() == "n"
     assert (src / "n.txt").exists()
     assert out["path"] == str(dest / "n copy.txt")
-    assert helpers.ran[0]["extra"][str(src)]["mode"] == "ro"
+    assert helpers.ran[0]["extra"] == [(str(src), "/source", "ro")]
 
     with pytest.raises(DiskUsageError, match="root-owned"):
         files.copy(no_containers(), str(src / "n.txt"), "/srv/elsewhere/n.txt", None)
@@ -382,3 +382,16 @@ def test_new_routes(tmp_path, monkeypatch):
         ("delete", {"path": str(tmp_path / "a")}),
     ):
         assert web.post(f"/files/{route}", json=body).status_code == 400  # refused by policy
+
+
+def test_copy_and_move_inside_one_folder_keep_both_mounts(helpers, tmp_path):
+    (tmp_path / "a.txt").write_text("a")
+    files.copy(no_containers(), str(tmp_path / "a.txt"), str(tmp_path / "b.txt"), None)
+    files.move(no_containers(), str(tmp_path / "b.txt"), str(tmp_path / "c.txt"), None)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["a.txt", "c.txt"]
+
+
+def test_helper_binds_survive_the_same_folder_twice():
+    client = mock.MagicMock()
+    files._helper(client, "/h/x", ["true"], 1, 1, extra=[("/h/x", "/source", "ro")])
+    assert client.containers.create.call_args.kwargs["volumes"] == ["/h/x:/target:rw", "/h/x:/source:ro"]
