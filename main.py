@@ -1206,6 +1206,16 @@ def get_disk_usage(
         return JSONResponse(status_code=400, content={"error": str(error)})
 
 
+@app.get("/network/self")
+def get_network_self(x_agent_token: str | None = Header(default=None)):
+    """This host's own private LAN addresses (IP and MAC)."""
+    require_agent_token(x_agent_token)
+    try:
+        return lan_scan.identity(client)
+    except lan_scan.ScanError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+
+
 @app.post("/network/scan")
 def post_network_scan(body: dict | None = None, x_agent_token: str | None = Header(default=None)):
     """Start a sweep of this host's LAN — see lan_scan.py for what it does and

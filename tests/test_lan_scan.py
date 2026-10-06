@@ -145,3 +145,24 @@ def test_routes(monkeypatch):
     monkeypatch.setattr(lan_scan, "start", refuse)
     resp = web.post("/network/scan", json={})
     assert resp.status_code == 400 and "no private" in resp.json()["error"]
+
+
+def test_identity_lists_only_this_hosts_private_lan_addresses(monkeypatch):
+    host = {
+        "default": "eth0",
+        "ifaces": [
+            {"name": "docker0", "ip": "172.17.0.1", "mask": "255.255.0.0", "mac": "02:42:00:00:00:01"},
+            {"name": "tailscale0", "ip": "100.64.0.5", "mask": "255.192.0.0", "mac": None},
+            {"name": "eth0", "ip": "192.168.1.10", "mask": "255.255.255.0", "mac": "d8:5e:d3:42:10:10"},
+        ],
+        "arp": [],
+    }
+    client = mock.MagicMock()
+    client.containers.run.return_value = json.dumps(host).encode()
+    monkeypatch.setattr(lan_scan.rebuild, "helper_image", lambda c: "img")
+    monkeypatch.setattr(lan_scan, "_ident", None)
+    assert lan_scan.identity(client)["addresses"] == [
+        {"iface": "eth0", "ip": "192.168.1.10", "mac": "d8:5e:d3:42:10:10"}
+    ]
+    lan_scan.identity(client)  # cached
+    assert client.containers.run.call_count == 1

@@ -75,7 +75,11 @@ except OSError:
 for name in sorted(os.listdir('/sys/class/net')):
     ip, mask = addr(name, 0x8915), addr(name, 0x891b)
     if ip and mask:
-        out['ifaces'].append({'name': name, 'ip': ip, 'mask': mask})
+        try:
+            mac = open('/sys/class/net/%s/address' % name).read().strip()
+        except OSError:
+            mac = None
+        out['ifaces'].append({'name': name, 'ip': ip, 'mask': mask, 'mac': mac})
 for line in open('/proc/net/arp').read().splitlines()[1:]:
     f = line.split()
     if len(f) >= 6:
@@ -135,6 +139,32 @@ def choose_network(host: dict, iface: str | None = None) -> tuple[str, ipaddress
     if net.num_addresses - 2 > MAX_HOSTS:
         raise ScanError(f"{net} is larger than a /22 — refusing to sweep it")
     return name, net, own
+
+
+_ident: tuple[float, dict] | None = None
+
+
+def identity(client) -> dict:
+    """This host's own LAN addresses, so the dashboard can tell which device
+    on a scan is one of its nodes. Cached a minute: it costs a container run."""
+    global _ident
+    now = time.time()
+    if _ident and now - _ident[0] < 60:
+        return _ident[1]
+    host = read_host(client)
+    mine = []
+    for i in host.get("ifaces", []):
+        if i["name"].startswith(SKIP_IFACE):
+            continue
+        try:
+            if not ipaddress.ip_address(i["ip"]).is_private:
+                continue
+        except ValueError:
+            continue
+        mine.append({"iface": i["name"], "ip": i["ip"], "mac": i.get("mac")})
+    out = {"addresses": mine, "default": host.get("default")}
+    _ident = (now, out)
+    return out
 
 
 # --- probing -----------------------------------------------------------------
