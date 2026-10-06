@@ -23,6 +23,9 @@ from disk_usage import DiskUsageError
 
 @pytest.fixture(autouse=True)
 def _host(monkeypatch, tmp_path):
+    # Tests run as a normal user, so tmp_path would count as "owned by
+    # someone other than root"; default to root-owned unless a test says so.
+    monkeypatch.setattr(files, "_folder_uid", lambda path: 0)
     monkeypatch.setenv("HOST_ROOT", "")
     monkeypatch.setattr(files, "_roots_cache", None)
     monkeypatch.delenv("FILES_WRITABLE_PATHS", raising=False)
@@ -48,7 +51,7 @@ def test_listing_marks_kinds_and_writability(tmp_path, monkeypatch):
     kinds = {e["name"]: e["kind"] for e in ro["entries"]}
     assert kinds == {"a.txt": "file", "sub": "dir", "link": "link"}
     assert ro["writable"] is False
-    assert "outside" in ro["why_not"]
+    assert "root-owned" in ro["why_not"]
 
     with_root(monkeypatch, tmp_path)
     files._roots_cache = None
@@ -67,6 +70,15 @@ def test_compose_folders_and_the_owners_home_are_roots(tmp_path, monkeypatch):
     client.containers.list.return_value = [stack]
 
     assert files.write_roots(client, 1000) == ["/home/zerg", "/srv/media"]
+
+
+def test_a_non_root_owned_folder_is_changeable_without_being_a_root(tmp_path, monkeypatch):
+    target = str(tmp_path / "media" / "clip.mp4")
+    assert "FILES_WRITABLE_PATHS" in files.why_not_writable(target, [])
+    monkeypatch.setattr(files, "_folder_uid", lambda path: 1000)
+    assert files.why_not_writable(target, []) is None
+    assert "operating system" in files.why_not_writable("/etc/passwd", [])
+    assert "top-level" in files.why_not_writable("/mnt", [])
 
 
 def test_the_os_and_the_root_are_never_roots(monkeypatch):
@@ -115,7 +127,7 @@ def test_folder_archive_streams_a_real_tarball(tmp_path):
 
 def test_writes_outside_roots_are_refused_before_any_helper(tmp_path):
     client = no_containers()
-    with pytest.raises(DiskUsageError, match="outside"):
+    with pytest.raises(DiskUsageError, match="root-owned"):
         files.write_file(client, str(tmp_path / "x"), io.BytesIO(b"x"), 1, None, overwrite=False)
     client.containers.create.assert_not_called()
 
@@ -223,3 +235,150 @@ def test_upload_route_end_to_end(writable, monkeypatch):
     assert (writable / "blob.bin").read_bytes() == payload
     again = web.post("/files/upload", params={"path": str(writable / "blob.bin")}, content=b"x")
     assert again.status_code == 409
+
+
+# --- move / copy / new file / delete, with the helper run in-process --------
+
+
+class Helpers:
+    """Stands in for the helper container: records the command and carries
+    it out on the real temp folders (/target, /dest, /source are mapped)."""
+
+    def __init__(self, monkeypatch):
+        self.ran = []
+        monkeypatch.setattr(files, "_owner", lambda p: (1000, 1000))
+        monkeypatch.setattr(files, "_helper", self.make)
+        monkeypatch.setattr(files, "_run", self.run)
+
+    def make(self, client, folder, command, uid, gid, extra=None):
+        mounts = {"/target": folder}
+        for host, spec in (extra or {}).items():
+            mounts[spec["bind"]] = host
+        return {"command": command, "mounts": mounts, "extra": extra, "user": (uid, gid)}
+
+    def run(self, helper):
+        import shutil
+        self.ran.append(helper)
+        mounts, cmd = helper["mounts"], helper["command"]
+
+        def real(arg):
+            for bind, host in mounts.items():
+                if arg == bind or arg.startswith(bind + "/"):
+                    return host + arg[len(bind):]
+            return os.path.join(mounts["/target"], arg)
+
+        if cmd[0] == "mv":
+            shutil.move(real(cmd[3]), real(cmd[4]))
+        elif cmd[0] == "cp":
+            src, dst = real(cmd[3]), real(cmd[4])
+            (shutil.copytree if os.path.isdir(src) else shutil.copy2)(src, dst)
+
+
+@pytest.fixture
+def helpers(monkeypatch, tmp_path):
+    with_root(monkeypatch, tmp_path)
+    return Helpers(monkeypatch)
+
+
+def test_move_to_another_folder(helpers, tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    (tmp_path / "a" / "f.txt").write_text("x")
+
+    out = files.move(no_containers(), str(tmp_path / "a" / "f.txt"), str(tmp_path / "b" / "g.txt"), None)
+
+    assert out["path"] == str(tmp_path / "b" / "g.txt")
+    assert (tmp_path / "b" / "g.txt").read_text() == "x"
+    assert not (tmp_path / "a" / "f.txt").exists()
+    # Source folder is writable and runs the move; destination is beside it.
+    assert helpers.ran[0]["mounts"]["/target"] == str(tmp_path / "a")
+
+
+def test_move_refuses_into_itself_onto_existing_and_roots(helpers, tmp_path):
+    (tmp_path / "d").mkdir()
+    (tmp_path / "e.txt").write_text("1")
+    (tmp_path / "f.txt").write_text("2")
+    client = no_containers()
+
+    with pytest.raises(DiskUsageError, match="into itself"):
+        files.move(client, str(tmp_path / "d"), str(tmp_path / "d" / "sub"), None)
+    with pytest.raises(files.Conflict, match="already exists"):
+        files.move(client, str(tmp_path / "e.txt"), str(tmp_path / "f.txt"), None)
+    with pytest.raises(DiskUsageError, match="is a root"):
+        files.move(client, str(tmp_path), str(tmp_path.parent / "other"), None)
+    assert helpers.ran == []
+
+
+def test_move_refuses_a_folder_a_container_is_using(helpers, tmp_path):
+    (tmp_path / "data").mkdir()
+    client = no_containers()
+    running = mock.MagicMock()
+    running.name = "jellyfin"
+    running.attrs = {"Mounts": [{"Type": "bind", "Source": str(tmp_path / "data")}]}
+    client.containers.list.return_value = [running]
+
+    with pytest.raises(DiskUsageError, match="jellyfin is using"):
+        files.move(client, str(tmp_path / "data"), str(tmp_path / "data2"), None)
+    assert helpers.ran == []
+
+
+def test_copy_reads_from_anywhere_and_writes_where_allowed(helpers, tmp_path, monkeypatch):
+    src = tmp_path / "ro"
+    src.mkdir()
+    (src / "n.txt").write_text("n")
+    dest = tmp_path / "w"
+    dest.mkdir()
+
+    out = files.copy(no_containers(), str(src / "n.txt"), str(dest / "n copy.txt"), None)
+
+    assert (dest / "n copy.txt").read_text() == "n"
+    assert (src / "n.txt").exists()
+    assert out["path"] == str(dest / "n copy.txt")
+    assert helpers.ran[0]["extra"][str(src)]["mode"] == "ro"
+
+    with pytest.raises(DiskUsageError, match="root-owned"):
+        files.copy(no_containers(), str(src / "n.txt"), "/srv/elsewhere/n.txt", None)
+    with pytest.raises(files.Conflict):
+        files.copy(no_containers(), str(src / "n.txt"), str(dest / "n copy.txt"), None)
+
+
+def test_new_file_is_an_empty_write(helpers, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_write(client, path, source, size, uid, *, overwrite, expected_modified=None):
+        seen.update(path=path, size=size, data=source.read(), overwrite=overwrite)
+        return {"success": True}
+
+    monkeypatch.setattr(files, "write_file", fake_write)
+    files.new_file(no_containers(), str(tmp_path / "x.txt"), None)
+    assert seen == {"path": str(tmp_path / "x.txt"), "size": 0, "data": b"", "overwrite": False}
+
+
+def test_delete_follows_the_same_rule_as_writes(tmp_path, monkeypatch):
+    client = no_containers()
+    (tmp_path / "f").write_text("x")
+    # Root-owned and outside every root: refused before disk_delete runs.
+    monkeypatch.setattr(files.disk_delete, "delete", mock.Mock(side_effect=AssertionError))
+    with pytest.raises(DiskUsageError, match="root-owned"):
+        files.delete(client, str(tmp_path / "f"), None)
+
+    with_root(monkeypatch, tmp_path)
+    files._roots_cache = None
+    monkeypatch.setattr(files.disk_delete, "delete", lambda c, p: {"success": True, "path": p})
+    assert files.delete(client, str(tmp_path / "f"), None)["success"]
+    with pytest.raises(DiskUsageError, match="is a root"):
+        files.delete(client, str(tmp_path), None)
+
+
+def test_new_routes(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "AGENT_TOKEN", "")
+    monkeypatch.setattr(main, "_owner_uid", lambda: None)
+    monkeypatch.setattr(main, "client", no_containers())
+    web = TestClient(main.app)
+    for route, body in (
+        ("newfile", {"path": str(tmp_path / "n")}),
+        ("move", {"path": str(tmp_path / "a"), "dest": str(tmp_path / "b")}),
+        ("copy", {"path": str(tmp_path / "a"), "dest": str(tmp_path / "b")}),
+        ("delete", {"path": str(tmp_path / "a")}),
+    ):
+        assert web.post(f"/files/{route}", json=body).status_code == 400  # refused by policy

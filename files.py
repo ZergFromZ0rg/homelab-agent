@@ -1,18 +1,22 @@
-"""The file browser: list, read, download, and — inside allowed roots —
-write, upload, rename and make folders.
+"""The file browser: list, read, download, and — where policy allows —
+write, upload, create, rename, move, copy and delete.
 
 Reading goes through the read-only ``/:/host`` mount, like the disk
-explorer, and is allowed anywhere it is. **Writing is scoped.** A path is
-writable only under a *root*:
+explorer, and is allowed anywhere it is. **One rule decides every change**
+(write, create, rename, move, copy-to, delete — ``why_not_writable``). A
+path is changeable when it is not an operating-system folder or a top-level
+folder, has no symlink on the way down, and either
 
-- the home folder of whoever owns this agent's checkout (the person who
-  installed it),
-- every Compose project folder on this host (where the configs live),
-- ``STACK_DIRS``, and ``FILES_WRITABLE_PATHS`` for anything else.
+- sits under a *root*: the home folder of whoever owns this agent's checkout,
+  every Compose project folder on this host, ``STACK_DIRS`` and
+  ``FILES_WRITABLE_PATHS``; or
+- sits in a folder owned by someone other than root. The helper runs as that
+  owner, so the operating system's own permissions still apply and nothing
+  root-owned is touched unless it is under a root.
 
 Never ``/`` and never an operating-system folder, whatever the roots say.
-No symlinks anywhere on the way down, so a link can't carry a write out of
-its root.
+Moving, renaming and deleting additionally refuse a root itself, a mount
+point, and anything a running container has mounted.
 
 **Writes run as the owner, not as root.** The agent's own view of the host
 stays read-only; a write is a throwaway helper container with just the
@@ -30,6 +34,7 @@ reading the old one.
 
 from __future__ import annotations
 
+import io
 import os
 import posixpath
 import queue
@@ -40,6 +45,7 @@ import threading
 import time
 
 import config
+import disk_delete
 import disk_usage
 import rebuild
 from disk_delete import PROTECTED, _container_mounts, _under
@@ -114,16 +120,41 @@ def root_for(path: str, roots: list[str]) -> str | None:
     return max(matches, key=len) if matches else None
 
 
+def _folder_uid(path: str) -> int | None:
+    """Owner of the nearest existing folder at or above ``path``."""
+    current = path
+    while True:
+        try:
+            return os.lstat(disk_usage._on_host(current)).st_uid
+        except OSError:
+            if current in ("/", ""):
+                return None
+            current = posixpath.dirname(current) or "/"
+
+
 def why_not_writable(path: str, roots: list[str]) -> str | None:
-    """None when ``path`` may be written; otherwise the reason."""
+    """None when ``path`` may be changed; otherwise the reason."""
     if any(_under(path, p) for p in PROTECTED):
         return f"{path} is part of the operating system"
+    if path.count("/") < 2:
+        return f"{path} is a top-level folder — change what's inside it instead"
     root = root_for(path, roots)
     if root is None:
-        return "outside the folders this host allows writing to (its owner's home and compose stacks)"
-    # No symlink between the root and the path, root included.
+        if _folder_uid(posixpath.dirname(path)) in (None, 0):
+            return (
+                "root-owned and outside the folders this host allows writing to "
+                "(its owner's home and compose stacks) — add it to FILES_WRITABLE_PATHS"
+            )
+        # The first folder (/mnt, /home) is the host's own layout; links
+        # below it are what could carry a change somewhere else.
+        root = "/" + path.strip("/").split("/")[0]
+        start = 1
+    else:
+        start = 0
+    # No symlink between the root and the path, root included for real roots.
     current = root
-    for part in [""] + path[len(root):].strip("/").split("/"):
+    parts = path[len(root):].strip("/").split("/")
+    for part in ([""] if start == 0 else []) + parts:
         current = posixpath.join(current, part) if part else current
         try:
             if stat.S_ISLNK(os.lstat(disk_usage._on_host(current)).st_mode):
@@ -360,13 +391,13 @@ def _tar_stream(name: str, size: int, source, uid: int, gid: int, mode: int):
     yield b"\0" * 1024
 
 
-def _helper(client, folder: str, command: list[str], uid: int, gid: int):
+def _helper(client, folder: str, command: list[str], uid: int, gid: int, extra: dict | None = None):
     return client.containers.create(
         rebuild.helper_image(client),
         command=command,
         user=f"{uid}:{gid}",
         working_dir="/target",
-        volumes={folder: {"bind": "/target", "mode": "rw"}},
+        volumes={folder: {"bind": "/target", "mode": "rw"}, **(extra or {})},
         network_disabled=True,
         labels={"homelab-agent-files": folder},
     )
@@ -448,6 +479,23 @@ def _mounted_by_container(client, path: str) -> str | None:
     return None
 
 
+def _guard_source(client, path: str, roots: list[str], verb: str) -> None:
+    """What moving, renaming or deleting ``path`` must not break."""
+    if path in roots:
+        raise DiskUsageError(f"{path} is a root — {verb} it would break what uses it")
+    _require_writable(path, roots)
+    host_path = disk_usage._on_host(path)
+    try:
+        st = os.lstat(host_path)
+    except FileNotFoundError as error:
+        raise DiskUsageError(f"{path} doesn't exist") from error
+    if stat.S_ISDIR(st.st_mode) and st.st_dev != os.lstat(os.path.dirname(host_path)).st_dev:
+        raise DiskUsageError(f"{path} is a mount point — unmount it instead")
+    user = _mounted_by_container(client, path)
+    if user:
+        raise DiskUsageError(f"{user} is using {path} — stop it before {verb} it")
+
+
 def rename(client, path: str, new_name: str, owner_uid: int | None) -> dict:
     path = normalize(path)
     new_name = (new_name or "").strip()
@@ -456,13 +504,8 @@ def rename(client, path: str, new_name: str, owner_uid: int | None) -> dict:
     folder, name = posixpath.split(path)
     roots = write_roots(client, owner_uid)
     target = posixpath.join(folder, new_name)
-    if path in roots:
-        raise DiskUsageError(f"{path} is a root — renaming it would break what uses it")
-    _require_writable(path, roots)
+    _guard_source(client, path, roots, "renaming")
     _require_writable(target, roots)
-    user = _mounted_by_container(client, path)
-    if user:
-        raise DiskUsageError(f"{user} is using {path} — stop it before renaming")
     host_folder = disk_usage._on_host(folder)
     if not os.path.lexists(os.path.join(host_folder, name)):
         raise DiskUsageError(f"{path} doesn't exist")
@@ -490,3 +533,89 @@ def make_folder(client, path: str, owner_uid: int | None) -> dict:
     _run(_helper(client, folder, ["mkdir", "--", name], uid, gid))
     audit.info("files: made folder %s", path)
     return {"success": True, "path": path}
+
+
+def new_file(client, path: str, owner_uid: int | None) -> dict:
+    """An empty file; refuses one that already exists."""
+    return write_file(client, path, io.BytesIO(b""), 0, owner_uid, overwrite=False)
+
+
+def _destination(path: str, dest: str, roots: list[str], verb: str) -> tuple[str, str, str]:
+    """(dest, dest folder, dest name) once ``dest`` is known to be free,
+    inside a folder, not inside ``path`` itself, and changeable."""
+    dest = normalize(dest)
+    folder, name = posixpath.split(dest)
+    if not name or name in (".", ".."):
+        raise DiskUsageError("a destination name is required")
+    if dest == path:
+        raise DiskUsageError(f"that's where {posixpath.basename(path)} already is")
+    if _under(dest, path):
+        raise DiskUsageError(f"can't {verb} a folder into itself")
+    _require_writable(dest, roots)
+    host_folder = disk_usage._on_host(folder)
+    if not os.path.isdir(host_folder):
+        raise DiskUsageError(f"{folder} isn't a folder")
+    if os.path.lexists(os.path.join(host_folder, name)):
+        raise Conflict(f"{name} already exists in {folder}")
+    return dest, folder, name
+
+
+def _two_folder_helper(client, src_folder: str, dest_folder: str, command: list[str],
+                       uid: int, gid: int, *, src_mode: str):
+    return _helper(
+        client, dest_folder, command, uid, gid,
+        extra={src_folder: {"bind": "/source", "mode": src_mode}},
+    )
+
+
+def move(client, path: str, dest: str, owner_uid: int | None) -> dict:
+    """Move ``path`` to the full path ``dest`` — another folder, another name,
+    or both. ``mv`` copies across disks and removes the original after."""
+    path = normalize(path)
+    roots = write_roots(client, owner_uid)
+    _guard_source(client, path, roots, "moving")
+    dest, dest_folder, dest_name = _destination(path, dest, roots, "move")
+    src_folder, src_name = posixpath.split(path)
+    uid, gid = _owner(disk_usage._on_host(src_folder))
+    # The helper's /target is the source folder (it needs write there to
+    # remove the original); the destination folder is mounted beside it.
+    container = _helper(
+        client, src_folder, ["mv", "-n", "--", src_name, f"/dest/{dest_name}"], uid, gid,
+        extra={dest_folder: {"bind": "/dest", "mode": "rw"}},
+    )
+    _run(container)
+    if not os.path.lexists(disk_usage._on_host(dest)):
+        raise DiskUsageError("the move didn't happen")
+    audit.info("files: moved %s -> %s", path, dest)
+    return {"success": True, "path": dest}
+
+
+def copy(client, path: str, dest: str, owner_uid: int | None) -> dict:
+    """Copy ``path`` to the full path ``dest``. The source may be anywhere
+    readable — only the destination has to be changeable."""
+    path = normalize(path)
+    try:
+        os.lstat(disk_usage._on_host(path))
+    except FileNotFoundError as error:
+        raise DiskUsageError(f"{path} doesn't exist") from error
+    roots = write_roots(client, owner_uid)
+    dest, dest_folder, dest_name = _destination(path, dest, roots, "copy")
+    src_folder, src_name = posixpath.split(path)
+    uid, gid = _owner(disk_usage._on_host(dest_folder))
+    container = _two_folder_helper(
+        client, src_folder, dest_folder,
+        ["cp", "-a", "--", f"/source/{src_name}", dest_name], uid, gid, src_mode="ro",
+    )
+    _run(container)
+    if not os.path.lexists(disk_usage._on_host(dest)):
+        raise DiskUsageError("the copy didn't happen")
+    audit.info("files: copied %s -> %s", path, dest)
+    return {"success": True, "path": dest}
+
+
+def delete(client, path: str, owner_uid: int | None) -> dict:
+    """Delete under the same rule as every other change, plus the guards
+    for removing things (see ``_guard_source`` and disk_delete.check)."""
+    path = normalize(path)
+    _guard_source(client, path, write_roots(client, owner_uid), "deleting")
+    return disk_delete.delete(client, path)

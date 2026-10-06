@@ -21,7 +21,6 @@ from stack_backup import StackBackup
 from register import Registrar
 import config
 import connections
-import disk_delete
 import disk_usage
 import files
 import compose_edit
@@ -1211,7 +1210,7 @@ def post_disk_delete(body: dict, x_agent_token: str | None = Header(default=None
     """Delete one file or folder — see disk_delete.py for what is refused."""
     require_agent_token(x_agent_token)
     try:
-        return disk_delete.delete(client, str(body.get("path", "")))
+        return files.delete(client, str(body.get("path", "")), _owner_uid())
     except disk_usage.DiskUsageError as error:
         return JSONResponse(status_code=400, content={"success": False, "error": str(error)})
 
@@ -1324,6 +1323,34 @@ def post_files_rename(body: dict, x_agent_token: str | None = Header(default=Non
     return _files_call(
         files.rename, client, str(body.get("path", "")), str(body.get("name", "")), _owner_uid()
     )
+
+
+@app.post("/files/newfile")
+def post_files_newfile(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(files.new_file, client, str(body.get("path", "")), _owner_uid())
+
+
+@app.post("/files/move")
+def post_files_move(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(
+        files.move, client, str(body.get("path", "")), str(body.get("dest", "")), _owner_uid()
+    )
+
+
+@app.post("/files/copy")
+def post_files_copy(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(
+        files.copy, client, str(body.get("path", "")), str(body.get("dest", "")), _owner_uid()
+    )
+
+
+@app.post("/files/delete")
+def post_files_delete(body: dict, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return _files_call(files.delete, client, str(body.get("path", "")), _owner_uid())
 
 
 @app.post("/files/mkdir")
