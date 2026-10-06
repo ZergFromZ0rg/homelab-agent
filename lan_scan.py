@@ -241,7 +241,8 @@ def _run(client, job, net, own, host_before):
                 # Found by TCP already: just add the MAC. Otherwise the
                 # neighbour table is the only thing that saw it.
                 _upsert(job, ip, mac=mac, **({} if ip in known else {"via": "arp"}))
-            if own and not any(d["ip"] == own for d in job["devices"]):
+            if own:
+                # The scanning host itself: it isn't in its own ARP table.
                 _upsert(job, own, via="self")
 
         job["phase"] = "ports"
