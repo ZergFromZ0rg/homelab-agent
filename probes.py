@@ -53,6 +53,10 @@ class Result:
     # The probe couldn't be run at all (the dashboard couldn't reach the host
     # it was asked to probe from), so this says nothing about the target.
     inconclusive: bool = False
+    # Ping with several echoes: the share that got no answer (percent) and the
+    # average change in round trip from one answer to the next (ms).
+    loss: float | None = None
+    jitter: float | None = None
 
 
 def _short(text: object) -> str:
@@ -283,7 +287,106 @@ ICMP_DENIED = (
 )
 
 
+# Echoes in a burst go out this far apart, so they sample the link over about a
+# second rather than hitting one instant; the burst has to fit in the timeout.
+PING_GAP = 0.2
+MAX_PING_COUNT = 10
+
+
+def _jitter(rtts: list[float]) -> float | None:
+    """Mean change between consecutive round trips (ms); None below two."""
+    if len(rtts) < 2:
+        return None
+    return sum(abs(b - a) for a, b in zip(rtts, rtts[1:])) / (len(rtts) - 1)
+
+
+def _burst_result(rtts: list[float | None], timeout: float, address: str) -> Result:
+    """``rtts`` is one entry per echo sent, in order; None = never answered."""
+    answered = [r for r in rtts if r is not None]
+    if not answered:
+        return Result(False, None, f"no reply within {timeout:g}s", loss=100.0)
+    jitter = _jitter(answered)
+    detail = f"{len(answered)}/{len(rtts)} replies from {address}"
+    if jitter is not None:
+        detail += f" · jitter {jitter:.1f} ms"
+    return Result(
+        True,
+        sum(answered) / len(answered),
+        detail,
+        loss=round(100.0 * (len(rtts) - len(answered)) / len(rtts), 1),
+        jitter=jitter,
+    )
+
+
+def _probe_ping_burst(spec: dict) -> Result:
+    """``count`` echoes, ``PING_GAP`` apart, all inside the timeout. Up if any
+    answers; loss and jitter say how well."""
+    host = spec["target"]
+    timeout = spec["timeout"]
+    count = max(1, min(int(spec["count"]), MAX_PING_COUNT, int(timeout / PING_GAP)))
+
+    try:
+        address = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
+    except socket.gaierror:
+        return Result(False, None, "DNS lookup failed (IPv4 only)")
+
+    try:
+        sock, raw = _open_icmp_socket()
+    except OSError:
+        return Result(False, None, ICMP_DENIED)
+
+    ident = random.randrange(1, 0xFFFF)
+    first = random.randrange(1, 0xFFFF - count)
+    seqs = [first + i for i in range(count)]
+    sent: dict[int, float] = {}
+    rtt: dict[int, float] = {}
+    started = time.perf_counter()
+    deadline = started + timeout
+
+    try:
+        while True:
+            now = time.perf_counter()
+            while len(sent) < count and now - started >= len(sent) * PING_GAP:
+                seq = seqs[len(sent)]
+                try:
+                    sock.sendto(_echo_request(ident, seq), (address, 0))
+                except PermissionError:
+                    return Result(False, None, ICMP_DENIED)
+                except OSError as error:
+                    return Result(False, None, _short(f"send failed: {error}"))
+                sent[seq] = time.perf_counter()
+            if len(rtt) == count or now >= deadline:
+                break
+
+            due = started + len(sent) * PING_GAP if len(sent) < count else deadline
+            sock.settimeout(max(0.001, min(due, deadline) - now))
+            try:
+                data, _ = sock.recvfrom(1024)
+            except (socket.timeout, TimeoutError):
+                continue
+            except OSError as error:
+                return Result(False, None, _short(f"receive failed: {error}"))
+
+            arrived = time.perf_counter()
+            message = _icmp_body(data)
+            if len(message) < 8:
+                continue
+            kind, _code, _sum, got_ident, got_seq = struct.unpack("!BBHHH", message[:8])
+            if kind == 0 and got_seq in sent and got_seq not in rtt and (not raw or got_ident == ident):
+                rtt[got_seq] = (arrived - sent[got_seq]) * 1000
+            elif kind == 3:
+                return Result(False, None, "host unreachable")
+            elif kind == 11:
+                return Result(False, None, "TTL exceeded in transit")
+    finally:
+        sock.close()
+
+    return _burst_result([rtt.get(seq) for seq in seqs], timeout, address)
+
+
 def _probe_ping(spec: dict) -> Result:
+    if (spec.get("count") or 1) > 1:
+        return _probe_ping_burst(spec)
     host = spec["target"]
     timeout = spec["timeout"]
 

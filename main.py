@@ -1221,8 +1221,11 @@ def _probe_spec(body: dict) -> dict:
         expect = body.get("expect_status")
         expect = None if expect in (None, "") else int(expect)
         warn_days = int(body.get("warn_days") or probes.DEFAULT_WARN_DAYS)
+        count = int(body.get("count") or 1)
     except (TypeError, ValueError):
-        raise ValueError("timeout, expect_status and warn_days must be numbers") from None
+        raise ValueError("timeout, expect_status, warn_days and count must be numbers") from None
+    if not 1 <= count <= probes.MAX_PING_COUNT:
+        raise ValueError(f"count must be between 1 and {probes.MAX_PING_COUNT}")
     if not 1 <= timeout <= 30:
         raise ValueError("timeout must be between 1 and 30 seconds")
     mode = body.get("keyword_mode") or "present"
@@ -1239,6 +1242,7 @@ def _probe_spec(body: dict) -> dict:
         "keyword": body.get("keyword"),
         "keyword_mode": mode,
         "warn_days": warn_days,
+        "count": count,
     }
 
 
@@ -1253,7 +1257,10 @@ def post_probe(body: dict, x_agent_token: str | None = Header(default=None)):
     except ValueError as error:
         return JSONResponse(status_code=400, content={"error": str(error)})
     result = probes.probe(spec)
-    return {"ok": result.ok, "ms": result.ms, "detail": result.detail}
+    return {
+        "ok": result.ok, "ms": result.ms, "detail": result.detail,
+        "loss": result.loss, "jitter": result.jitter,
+    }
 
 
 @app.get("/network/self")

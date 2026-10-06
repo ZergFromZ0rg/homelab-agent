@@ -52,7 +52,7 @@ def test_a_failed_probe_is_still_a_200_with_ok_false(client):
     port = sock.getsockname()[1]
     sock.close()
     down = client.post("/probe", json={"type": "tcp", "target": f"127.0.0.1:{port}"}, headers=HEAD)
-    assert down.status_code == 200 and down.json() == {"ok": False, "ms": None, "detail": "connection refused"}
+    assert down.status_code == 200 and down.json() == {"ok": False, "ms": None, "detail": "connection refused", "loss": None, "jitter": None}
 
 
 def test_dns_probe(client):
@@ -77,4 +77,18 @@ def test_only_the_probe_fields_reach_the_probe(client, monkeypatch):
     seen = {}
     monkeypatch.setattr(probes, "probe", lambda spec: seen.update(spec) or probes.Result(True, 1.0, "ok"))
     client.post("/probe", json={"type": "tcp", "target": "h:1", "group": "x", "command": "rm -rf /"}, headers=HEAD)
-    assert set(seen) == {"type", "target", "timeout", "expect_status", "verify_tls", "keyword", "keyword_mode", "warn_days"}
+    assert set(seen) == {"type", "target", "timeout", "expect_status", "verify_tls", "keyword", "keyword_mode", "warn_days", "count"}
+
+
+def test_a_ping_burst_reports_loss_and_jitter(client, monkeypatch):
+    monkeypatch.setattr(
+        probes, "probe", lambda spec: probes.Result(True, 2.0, "4/5 replies", loss=20.0, jitter=0.5) if spec["count"] == 5 else None
+    )
+    body = client.post("/probe", json={"type": "ping", "target": "h", "count": 5}, headers=HEAD).json()
+    assert body == {"ok": True, "ms": 2.0, "detail": "4/5 replies", "loss": 20.0, "jitter": 0.5}
+
+
+@pytest.mark.parametrize("count", [11, -1, "many"])
+def test_a_bad_echo_count_is_refused(client, count):
+    response = client.post("/probe", json={"type": "ping", "target": "h", "count": count}, headers=HEAD)
+    assert response.status_code == 400 and "count" in response.json()["error"]
