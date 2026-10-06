@@ -21,6 +21,7 @@ from stack_backup import StackBackup
 from register import Registrar
 import config
 import connections
+import lan_scan
 import disk_usage
 import files
 import compose_edit
@@ -1203,6 +1204,23 @@ def get_disk_usage(
         return disk_usage.usage(path, refresh=refresh)
     except disk_usage.DiskUsageError as error:
         return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+@app.post("/network/scan")
+def post_network_scan(body: dict | None = None, x_agent_token: str | None = Header(default=None)):
+    """Start a sweep of this host's LAN — see lan_scan.py for what it does and
+    refuses. Token-gated like the other mutating routes."""
+    require_agent_token(x_agent_token)
+    try:
+        return lan_scan.start(client, (body or {}).get("iface"))
+    except lan_scan.ScanError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+@app.get("/network/scan")
+def get_network_scan(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return lan_scan.snapshot()
 
 
 @app.post("/disk/delete")
