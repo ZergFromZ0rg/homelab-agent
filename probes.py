@@ -10,7 +10,8 @@ dashboard repo; edit it there and copy it over, don't fork it.
              response headers.
     keyword  like http, and the page must also contain (or, inverted, must
              NOT contain) some text. Latency = time to download the page.
-    ping     one ICMP echo to an IPv4 host. Latency = round trip.
+    ping     ICMP echo(es) to an IPv4 host. Latency = round trip; with
+             ``count`` > 1 also packet loss and jitter.
     tcp      open a TCP connection to host:port. Latency = connect time.
     dns      resolve a hostname with this machine's resolver. Latency = lookup.
     tls      TLS handshake to host[:port]; up while the certificate has at

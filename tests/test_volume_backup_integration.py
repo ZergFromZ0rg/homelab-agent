@@ -36,7 +36,24 @@ def daemon():
 
 
 CLIENT = daemon()
-needs_docker = pytest.mark.skipif(CLIENT is None, reason="no Docker daemon")
+HELPER = "homelab-agent"
+
+
+def _has_helper_image() -> bool:
+    """The backup runs in a helper built from the agent's own image, which
+    only exists where the agent was built (a host, not a dev laptop)."""
+    if CLIENT is None:
+        return False
+    try:
+        CLIENT.images.get(HELPER)
+        return True
+    except Exception:  # noqa: BLE001 - not there, or can't tell
+        return False
+
+
+needs_docker = pytest.mark.skipif(
+    not _has_helper_image(), reason=f"needs Docker and a local {HELPER} image"
+)
 
 CONTENT = {"a.txt": b"hello volume", "sub/blob.bin": bytes(range(256)) * 40}
 
