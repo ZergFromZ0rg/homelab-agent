@@ -29,6 +29,7 @@ import container_logs
 import host_control
 import updates
 import networks
+import probes
 import deploy
 import rebuild
 import terminal
@@ -1204,6 +1205,55 @@ def get_disk_usage(
         return disk_usage.usage(path, refresh=refresh)
     except disk_usage.DiskUsageError as error:
         return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+def _probe_spec(body: dict) -> dict:
+    """The check the dashboard wants run, validated down to what the probes
+    read. Raises ValueError with a message fit for the caller."""
+    kind = body.get("type")
+    if kind not in probes.PROBE_TYPES:
+        raise ValueError(f"type must be one of: {', '.join(probes.PROBE_TYPES)}")
+    target = body.get("target")
+    if not isinstance(target, str) or not 1 <= len(target) <= 500:
+        raise ValueError("target is required")
+    try:
+        timeout = float(body.get("timeout") or 5)
+        expect = body.get("expect_status")
+        expect = None if expect in (None, "") else int(expect)
+        warn_days = int(body.get("warn_days") or probes.DEFAULT_WARN_DAYS)
+    except (TypeError, ValueError):
+        raise ValueError("timeout, expect_status and warn_days must be numbers") from None
+    if not 1 <= timeout <= 30:
+        raise ValueError("timeout must be between 1 and 30 seconds")
+    mode = body.get("keyword_mode") or "present"
+    if mode not in ("present", "absent"):
+        raise ValueError("keyword_mode must be 'present' or 'absent'")
+    if kind == "keyword" and not str(body.get("keyword") or "").strip():
+        raise ValueError("keyword is required")
+    return {
+        "type": kind,
+        "target": target.strip(),
+        "timeout": timeout,
+        "expect_status": expect,
+        "verify_tls": body.get("verify_tls") is not False,
+        "keyword": body.get("keyword"),
+        "keyword_mode": mode,
+        "warn_days": warn_days,
+    }
+
+
+@app.post("/probe")
+def post_probe(body: dict, x_agent_token: str | None = Header(default=None)):
+    """Run one service-check probe from this host and report what it saw —
+    how the dashboard asks "can *this machine* reach X?". The answer is the
+    probe's own result, so a failed probe is still a 200."""
+    require_agent_token(x_agent_token)
+    try:
+        spec = _probe_spec(body)
+    except ValueError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+    result = probes.probe(spec)
+    return {"ok": result.ok, "ms": result.ms, "detail": result.detail}
 
 
 @app.get("/network/self")
