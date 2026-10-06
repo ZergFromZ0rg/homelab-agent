@@ -166,3 +166,19 @@ def test_identity_lists_only_this_hosts_private_lan_addresses(monkeypatch):
     ]
     lan_scan.identity(client)  # cached
     assert client.containers.run.call_count == 1
+
+
+def test_identity_reports_the_default_gateway(monkeypatch):
+    host = {"default": "eth0", "gateway": "192.168.1.1", "ifaces": [], "arp": []}
+    client = mock.MagicMock()
+    client.containers.run.return_value = json.dumps(host).encode()
+    monkeypatch.setattr(lan_scan.rebuild, "helper_image", lambda c: "img")
+    monkeypatch.setattr(lan_scan, "_ident", None)
+    assert lan_scan.identity(client)["gateway"] == "192.168.1.1"
+
+
+def test_helper_script_turns_the_route_table_entry_into_a_dotted_gateway():
+    # /proc/net/route stores the gateway as little-endian hex: 0101A8C0 is 192.168.1.1
+    import socket, struct
+    assert socket.inet_ntoa(struct.pack("<L", int("0101A8C0", 16))) == "192.168.1.1"
+    assert "struct.pack('<L', int(f[2], 16))" in lan_scan._HELPER_SCRIPT

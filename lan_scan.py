@@ -63,12 +63,13 @@ def addr(name, req):
         return socket.inet_ntoa(fcntl.ioctl(s.fileno(), req, struct.pack('256s', name[:15].encode()))[20:24])
     except OSError:
         return None
-out = {"ifaces": [], "arp": [], "default": None}
+out = {"ifaces": [], "arp": [], "default": None, "gateway": None}
 try:
     for line in open('/proc/net/route').read().splitlines()[1:]:
         f = line.split()
         if f[1] == '00000000':
             out['default'] = f[0]
+            out['gateway'] = socket.inet_ntoa(struct.pack('<L', int(f[2], 16)))
             break
 except OSError:
     pass
@@ -162,7 +163,7 @@ def identity(client) -> dict:
         except ValueError:
             continue
         mine.append({"iface": i["name"], "ip": i["ip"], "mac": i.get("mac")})
-    out = {"addresses": mine, "default": host.get("default")}
+    out = {"addresses": mine, "default": host.get("default"), "gateway": host.get("gateway")}
     _ident = (now, out)
     return out
 
