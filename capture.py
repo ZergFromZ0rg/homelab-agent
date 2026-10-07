@@ -15,7 +15,8 @@ Limits, because sniffing is sensitive even on your own network:
   (the one exception is a TLS ClientHello's server name, which is read and
   kept as a hostname — nothing else of the handshake is);
 - nothing is written to disk — stopping or restarting the agent discards it;
-- the filter is a host, a port and a protocol, validated here.
+- the filter is a host, a port, a protocol and/or an expression in the style of
+  tcpdump (capture_filter.py), parsed here before anything starts.
 """
 
 from __future__ import annotations
@@ -26,6 +27,7 @@ import struct
 import threading
 import time
 
+import capture_filter
 import lan_scan
 import rebuild
 from log import audit, log
@@ -48,9 +50,17 @@ class CaptureError(Exception):
 
 
 def validate_filter(raw: dict | None) -> dict:
-    """Only a host, a port and a protocol get through — each checked."""
+    """A host, a port, a protocol and a filter expression get through — each
+    checked, and all of them must match."""
     raw = raw or {}
     out: dict = {}
+    expr = str(raw.get("expr") or "").strip()
+    if expr:
+        try:
+            capture_filter.compile_filter(expr)
+        except capture_filter.FilterError as error:
+            raise CaptureError(f"filter: {error}") from error
+        out["expr"] = expr
     host = str(raw.get("host") or "").strip()
     if host:
         try:

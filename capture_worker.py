@@ -24,6 +24,8 @@ import struct
 import sys
 import time
 
+import capture_filter
+
 ETH_P_ALL = 0x0003
 MAX_PPS = 120  # packets per second sent to the list; totals stay exact
 MAX_FLOWS = 150  # flows per tick line
@@ -207,6 +209,13 @@ def decode_ip(data: bytes, hatype_note: str = "") -> dict | None:
 
 def decode_frame(frame: bytes, hatype: int) -> dict | None:
     """One captured frame → a flat dict, or None for something unreadable."""
+    pkt = _decode_frame(frame, hatype)
+    if pkt is not None:
+        pkt["len"] = len(frame)  # before filtering: ``len > N`` needs it
+    return pkt
+
+
+def _decode_frame(frame: bytes, hatype: int) -> dict | None:
     if hatype in RAW_IP_TYPES:
         out = decode_ip(frame)
         if out:
@@ -238,7 +247,8 @@ def decode_frame(frame: bytes, hatype: int) -> dict | None:
 
 
 def matches(pkt: dict, flt: dict) -> bool:
-    """The filter the agent validated: any of ``host``, ``port``, ``proto``."""
+    """The simple filter the agent validated: any of ``host``, ``port``,
+    ``proto``. An ``expr`` (see capture_filter.py) is applied on top."""
     host = flt.get("host")
     if host and host not in (pkt.get("src"), pkt.get("dst")):
         return False
@@ -279,6 +289,7 @@ def run(config: dict) -> None:
     duration = max(1, min(int(config.get("duration", 60)), 600))
     flt = config.get("filter") or {}
     keep_payload = bool(config.get("payload"))
+    expression = capture_filter.compile_filter(flt["expr"]) if flt.get("expr") else None
     deadline = time.time() + duration
 
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
@@ -322,7 +333,7 @@ def run(config: dict) -> None:
                 break
             ifname, _, pkttype, hatype = addr[0], addr[1], addr[2], addr[3]
             pkt = decode_frame(frame, hatype)
-            if pkt is None or not matches(pkt, flt):
+            if pkt is None or not matches(pkt, flt) or (expression and not expression(pkt)):
                 continue
             size = len(frame)
             totals["pkts"] += 1

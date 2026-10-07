@@ -271,3 +271,105 @@ def test_routes_are_token_gated(monkeypatch):
                          ("get", "/capture/pcap"), ("get", "/capture/interfaces")):
         assert getattr(http, method)(path).status_code == 401, path
     assert http.get("/capture", headers={"X-Agent-Token": "secret"}).json() == {"state": "idle"}
+
+
+# --- filter expressions --------------------------------------------------------
+
+import capture_filter as cf
+
+
+def _pkt(frame):
+    return w.decode_frame(frame, 1)
+
+
+SYN = _pkt(eth(0x0800, ipv4(6, tcp(51000, 443, 0x02))))  # 192.168.1.10:51000 -> 192.168.1.1:443
+UDP_DNS = _pkt(eth(0x0800, ipv4(17, struct.pack("!HHHH", 40000, 53, 8 + len(dns_query("a.com")), 0) + dns_query("a.com"), dst="8.8.8.8")))
+HELLO = _pkt(eth(0x0800, ipv4(6, tcp(51000, 443, 0x18) + client_hello("plex.example.com"))))
+PING = _pkt(eth(0x0800, ipv4(1, bytes([8, 0, 0, 0, 0, 0, 0, 0]))))
+
+
+@pytest.mark.parametrize("expr,expected", [
+    ("host 192.168.1.1", [True, False, True, True]),
+    ("src host 192.168.1.1", [False, False, False, False]),
+    ("dst host 8.8.8.8", [False, True, False, False]),
+    ("port 443", [True, False, True, False]),
+    ("dst port 53", [False, True, False, False]),
+    ("src port 51000", [True, False, True, False]),
+    ("tcp port 443 and not tls", [True, False, False, False]),
+    ("portrange 50000-51000", [True, False, True, False]),
+    ("net 192.168.1.0/24", [True, True, True, True]),
+    ("dst net 8.8.0.0/16", [False, True, False, False]),
+    ("udp or icmp", [False, True, False, True]),
+    ("udp || icmp", [False, True, False, True]),
+    ("not (port 443 or port 53)", [False, False, False, True]),
+    ("! tcp", [False, True, False, True]),
+    ("ip and not ip6", [True, True, True, True]),
+    ("dns", [False, True, False, False]),
+    ("tls", [False, False, True, False]),
+    ("sni *.example.com", [False, False, True, False]),
+    ("sni plex.example.com", [False, False, True, False]),
+    ("sni other.example.com", [False, False, False, False]),
+    ("ether host aa:bb:cc:00:00:01", [True, True, True, True]),
+    ("ether dst host aa:bb:cc:00:00:01", [False, False, False, False]),
+    ("len > 100", [False, False, True, False]),
+    ("less 80", [True, True, False, True]),
+    ("greater 100", [False, False, True, False]),
+    ("TCP PORT 443", [True, False, True, False]),
+])
+def test_filter_expressions(expr, expected):
+    predicate = cf.compile_filter(expr)
+    assert [predicate(p) for p in (SYN, UDP_DNS, HELLO, PING)] == expected, expr
+
+
+def test_and_binds_tighter_than_or():
+    p = cf.compile_filter("icmp or tcp and port 80")  # icmp or (tcp and port 80)
+    assert p(PING) and not p(SYN)
+
+
+def test_arp_has_no_ports_and_ports_never_match_icmp():
+    arp = _pkt(eth(0x0806, struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1, CLIENT_MAC, socket.inet_aton("192.168.1.10"), bytes(6), socket.inet_aton("192.168.1.99"))))
+    assert cf.compile_filter("arp and host 192.168.1.99")(arp)
+    assert not cf.compile_filter("port 1 or portrange 1-65535")(arp)
+    assert not cf.compile_filter("port 443")(PING)
+
+
+@pytest.mark.parametrize("expr,message", [
+    ("", "empty"),
+    ("host", "ends too soon"),
+    ("host nope", "isn't an IP"),
+    ("port 99999", "isn't a port"),
+    ("portrange 80", "needs a range"),
+    ("portrange 90-80", "backwards"),
+    ("net 10.0.0.0/99", "isn't a network"),
+    ("ether host zz", "isn't a MAC"),
+    ("tcp[13] = 2", "isn't supported"),
+    ("vlan", "isn't supported"),
+    ("(port 80", "never closed"),
+    ("port 80 port 443", "join conditions"),
+    ("icmp port 80", "has no ports"),
+    ("len ~ 5", "after 'len'"),
+    ("frobnicate", "don't know"),
+    ("host 1.2.3.4 &", "unexpected"),
+    ("x" * 400, "longer than"),
+    ("(" * 40 + "tcp" + ")" * 40, "nested"),
+])
+def test_bad_expressions_say_why(expr, message):
+    with pytest.raises(cf.FilterError, match=message):
+        cf.compile_filter(expr)
+
+
+def test_the_agent_validates_the_expression_before_starting():
+    assert capture.validate_filter({"expr": "  tcp and port 443 "}) == {"expr": "tcp and port 443"}
+    with pytest.raises(capture.CaptureError, match="filter: .*isn't a port"):
+        capture.validate_filter({"expr": "port 99999"})
+    client = _client(FakeContainer([]))
+    with pytest.raises(capture.CaptureError, match="filter:"):
+        capture.start(client, {"filter": {"expr": "host"}})
+    client.containers.run.assert_not_called()
+
+
+def test_the_worker_applies_the_expression_on_top_of_the_simple_fields():
+    flt = {"proto": "tcp", "expr": "port 443"}
+    expression = cf.compile_filter(flt["expr"])
+    keep = lambda p: w.matches(p, flt) and expression(p)  # noqa: E731
+    assert keep(SYN) and not keep(UDP_DNS) and not keep(PING)
