@@ -14,12 +14,13 @@ from urllib.parse import quote
 import docker
 
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from log import log, audit
 from stack_backup import StackBackup
 from register import Registrar
 import config
+import capture
 import connections
 import lan_scan
 import disk_usage
@@ -1288,6 +1289,48 @@ def post_network_scan(body: dict | None = None, x_agent_token: str | None = Head
 def get_network_scan(x_agent_token: str | None = Header(default=None)):
     require_agent_token(x_agent_token)
     return lan_scan.snapshot()
+
+
+@app.get("/capture/interfaces")
+def get_capture_interfaces(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    try:
+        return capture.interfaces(client)
+    except lan_scan.ScanError as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+@app.post("/capture")
+def post_capture(body: dict | None = None, x_agent_token: str | None = Header(default=None)):
+    """Start a packet capture on this host — see capture.py for what it keeps
+    and refuses. Token-gated like the other mutating routes."""
+    require_agent_token(x_agent_token)
+    try:
+        return capture.start(client, body)
+    except (capture.CaptureError, lan_scan.ScanError) as error:
+        return JSONResponse(status_code=400, content={"error": str(error)})
+
+
+@app.get("/capture")
+def get_capture(after: int = 0, x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return capture.snapshot(max(0, after))
+
+
+@app.delete("/capture")
+def delete_capture(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return capture.stop()
+
+
+@app.get("/capture/pcap")
+def get_capture_pcap(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return Response(
+        content=capture.pcap(),
+        media_type="application/vnd.tcpdump.pcap",
+        headers={"Content-Disposition": 'attachment; filename="capture.pcap"'},
+    )
 
 
 @app.post("/disk/delete")
