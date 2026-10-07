@@ -14,8 +14,9 @@ than compiled to kernel BPF, so a mistake costs a message, not a crash.
 Primitives:  [proto] [src|dst] host IP · [proto] [src|dst] net CIDR ·
              [tcp|udp] [src|dst] port N · [tcp|udp] [src|dst] portrange A-B ·
              ether [src|dst] host MAC · len <|<=|>|>=|=|== N · less N · greater N ·
-             sni NAME (a TLS server name, ``*`` wildcards allowed — an addition
-             to pcap-filter, which cannot see inside TLS)
+             sni NAME (a TLS server name, ``*`` wildcards allowed, ``*.example.com``
+             also matches example.com — an addition to pcap-filter, which
+             cannot see inside TLS)
 Protocols:   tcp udp icmp icmp6 arp ip ip6 dns tls
 Combinators: and && · or || · not ! · parentheses
 
@@ -257,7 +258,13 @@ class _Parser:
         pattern = self.take().lower()
         if not re.fullmatch(r"[a-z0-9*._-]{1,253}", pattern):
             raise FilterError(f"{pattern!r} isn't a host name")
-        return lambda p: bool(p.get("sni")) and fnmatch.fnmatchcase(p["sni"].lower(), pattern)
+        bare = pattern[2:] if pattern.startswith("*.") else None  # *.example.com covers example.com too
+
+        def named(p: dict) -> bool:
+            name = (p.get("sni") or "").lower()
+            return bool(name) and (fnmatch.fnmatchcase(name, pattern) or name == bare)
+
+        return named
 
 
 def compile_filter(text: str) -> Predicate:
