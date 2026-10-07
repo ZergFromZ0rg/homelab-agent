@@ -66,6 +66,32 @@ def test_dns_query_and_answer_are_named():
     assert reply["info"] == "A example.com → 93.184.216.34"
 
 
+def client_hello(name: str) -> bytes:
+    sni = name.encode()
+    ext_sni = struct.pack("!HHHBH", 0, len(sni) + 5, len(sni) + 3, 0, len(sni)) + sni
+    ext_other = struct.pack("!HH", 43, 3) + b"\x02\x03\x04"
+    exts = ext_other + ext_sni
+    body = b"\x03\x03" + bytes(32) + b"\x00" + struct.pack("!H", 2) + b"\x13\x01" + b"\x01\x00"
+    body += struct.pack("!H", len(exts)) + exts
+    handshake = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x01" + struct.pack("!H", len(handshake)) + handshake
+
+
+def test_tls_client_hello_names_the_server():
+    pkt = w.decode_frame(eth(0x0800, ipv4(6, tcp(51000, 443, 0x18) + client_hello("jellyfin.example.com"))), 1)
+    assert pkt["sni"] == "jellyfin.example.com" and pkt["app"] == "tls"
+    assert pkt["info"] == "Client Hello → jellyfin.example.com"
+    assert w.matches(pkt, {"proto": "tls"}) and not w.matches(pkt, {"proto": "dns"})
+    assert pkt["hdr"] == 14 + 20 + 20  # the handshake itself is never stored
+
+
+def test_other_tls_traffic_and_truncated_hellos_have_no_name():
+    hello = client_hello("a.example.com")
+    for payload in (b"\x17\x03\x03\x00\x10" + bytes(16), hello[:30], hello[:60], b""):
+        pkt = w.decode_frame(eth(0x0800, ipv4(6, tcp(51000, 443, 0x18) + payload)), 1)
+        assert "sni" not in pkt
+
+
 def test_arp_request_reads_as_who_has():
     arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1, CLIENT_MAC, socket.inet_aton("192.168.1.10"),
                       bytes(6), socket.inet_aton("192.168.1.99"))
@@ -163,7 +189,7 @@ def _wait_done():
 def test_a_capture_collects_packets_totals_flows_and_protocols():
     pkt = {"t": "pkt", "ts": 100.5, "len": 74, "hex": "aabb", "proto": "TCP", "src": "a", "dst": "b", "l2": 14}
     tick = {"t": "tick", "ts": 101.0, "pkts": 3, "bytes": 300, "protos": {"TCP": [3, 300]}, "skipped": 1,
-            "flows": [["TCP", "192.168.1.1", 443, "192.168.1.10", 51000, 3, 300, 1, 2]]}
+            "flows": [["TCP", "192.168.1.1", 443, "192.168.1.10", 51000, 3, 300, 1, 2, "plex.example.com"]]}
     container = FakeContainer([pkt, tick, tick, {"t": "end", "reason": "finished", "ts": 102.0}])
     client = _client(container)
 
@@ -174,6 +200,7 @@ def test_a_capture_collects_packets_totals_flows_and_protocols():
     assert out["totals"] == {"pkts": 6, "bytes": 600} and out["unlisted"] == 2
     assert out["protocols"]["TCP"] == {"pkts": 6, "bytes": 600}
     assert out["flows"][0]["pkts"] == 6 and out["flows"][0]["in"] == 4
+    assert out["flows"][0]["name"] == "plex.example.com"
     assert [p["n"] for p in out["packets"]] == [1]
     assert capture.snapshot(after=1)["packets"] == []  # polling only carries what is new
     time.sleep(0.1)

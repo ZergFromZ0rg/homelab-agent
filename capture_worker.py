@@ -107,6 +107,33 @@ def decode_dns(data: bytes) -> str | None:
         return f"{ident:#06x} (truncated)"
 
 
+def tls_server_name(data: bytes) -> str | None:
+    """The server name a TLS ClientHello asks for (the SNI extension), or None
+    when this isn't a ClientHello or has no name. Reads only that field."""
+    try:
+        if len(data) < 44 or data[0] != 0x16 or data[5] != 0x01:
+            return None
+        pos = 43  # record header (5) + handshake header (4) + version (2) + random (32)
+        pos += 1 + data[pos]  # session id
+        pos += 2 + struct.unpack("!H", data[pos:pos + 2])[0]  # cipher suites
+        pos += 1 + data[pos]  # compression methods
+        end = min(len(data), pos + 2 + struct.unpack("!H", data[pos:pos + 2])[0])
+        pos += 2
+        while pos + 4 <= end:
+            kind, length = struct.unpack("!HH", data[pos:pos + 4])
+            pos += 4
+            if kind == 0 and length >= 5:  # server_name: list length, type (0 = host name), name length, name
+                size = struct.unpack("!H", data[pos + 3:pos + 5])[0]
+                name = data[pos + 5:pos + 5 + size]
+                if data[pos + 2] == 0 and name and len(name) == size:
+                    return name.decode("ascii", "replace")
+                return None
+            pos += length
+    except (IndexError, struct.error):
+        return None
+    return None
+
+
 def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
     """Ports, flags and a one-line summary for the transport layer; ``hdr``
     is how many bytes of ``data`` are header (the rest is payload)."""
@@ -117,6 +144,9 @@ def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
         names = "".join(n for n, bit in TCP_FLAGS if flags & bit) or "."
         out.update(sport=sport, dport=dport, hdr=min(hdr, len(data)), flags=names, win=win, seq=seq, ack=ack)
         out["info"] = f"{sport} → {dport} [{names}] win {win}"
+        name = tls_server_name(data[hdr:])
+        if name:
+            out.update(sni=name, app="tls", info=f"Client Hello → {name}")
     elif proto == 17 and len(data) >= 8:
         sport, dport, length = struct.unpack("!HHH", data[:6])
         out.update(sport=sport, dport=dport, hdr=8)
@@ -217,8 +247,8 @@ def matches(pkt: dict, flt: dict) -> bool:
         return False
     proto = flt.get("proto")
     if proto:
-        if proto == "dns":
-            return pkt.get("app") == "dns"
+        if proto in ("dns", "tls"):
+            return pkt.get("app") == proto
         if proto != pkt.get("proto", "").lower():
             return False
     return True
@@ -278,7 +308,7 @@ def run(config: dict) -> None:
                 emit({
                     "t": "tick", "ts": now, "pkts": totals["pkts"], "bytes": totals["bytes"],
                     "protos": protos, "skipped": skipped_list,
-                    "flows": [[*k, v[0], v[1], v[2], v[3]] for k, v in top],
+                    "flows": [[*k, *v] for k, v in top],
                 })
                 totals, protos, flows = {"pkts": 0, "bytes": 0}, {}, {}
                 skipped_list = 0
@@ -301,7 +331,9 @@ def run(config: dict) -> None:
             row[0] += 1
             row[1] += size
             key = flow_key(pkt)
-            flow = flows.setdefault(key, [0, 0, 0, 0])  # pkts, bytes, out pkts, in pkts
+            flow = flows.setdefault(key, [0, 0, 0, 0, None])  # pkts, bytes, out pkts, in pkts, server name
+            if pkt.get("sni"):
+                flow[4] = pkt["sni"]
             flow[0] += 1
             flow[1] += size
             flow[2 if pkttype == 4 else 3] += 1

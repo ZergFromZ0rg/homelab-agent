@@ -11,7 +11,9 @@ and the busiest conversations.
 Limits, because sniffing is sensitive even on your own network:
 
 - one capture at a time, ten minutes at most, then it stops by itself;
-- headers only unless payload is asked for, and then only 64 bytes of it;
+- headers only unless payload is asked for, and then only 64 bytes of it
+  (the one exception is a TLS ClientHello's server name, which is read and
+  kept as a hostname — nothing else of the handshake is);
 - nothing is written to disk — stopping or restarting the agent discards it;
 - the filter is a host, a port and a protocol, validated here.
 """
@@ -33,7 +35,7 @@ DEFAULT_DURATION = 60
 MAX_PACKETS = 3000  # the ring the list and the pcap read from
 MAX_SERIES = 600  # one point a second
 MAX_FLOWS = 200
-FILTER_PROTOS = ("tcp", "udp", "icmp", "arp", "dns", "icmpv6")
+FILTER_PROTOS = ("tcp", "udp", "icmp", "arp", "dns", "tls", "icmpv6")
 LABEL = "homelab-agent-capture"
 
 _lock = threading.RLock()
@@ -125,7 +127,7 @@ def _ingest(job: dict, line: str) -> None:
                 row = job["protocols"].setdefault(name, {"pkts": 0, "bytes": 0})
                 row["pkts"] += pkts
                 row["bytes"] += size
-            for proto, a, ap, b, bp, pkts, size, out, inn in msg.get("flows", []):
+            for proto, a, ap, b, bp, pkts, size, out, inn, *extra in msg.get("flows", []):
                 key = f"{proto}|{a}|{ap}|{b}|{bp}"
                 flow = job["flows"].get(key)
                 if flow is None:
@@ -133,12 +135,14 @@ def _ingest(job: dict, line: str) -> None:
                         continue  # a scan or flood: keep what we have, stay bounded
                     flow = job["flows"][key] = {
                         "proto": proto, "a": a, "a_port": ap, "b": b, "b_port": bp,
-                        "pkts": 0, "bytes": 0, "out": 0, "in": 0, "first": msg["ts"],
+                        "pkts": 0, "bytes": 0, "out": 0, "in": 0, "name": None, "first": msg["ts"],
                     }
                 flow["pkts"] += pkts
                 flow["bytes"] += size
                 flow["out"] += out
                 flow["in"] += inn
+                if extra and extra[0]:
+                    flow["name"] = extra[0]
                 flow["last"] = msg["ts"]
         elif kind == "end":
             reason = msg.get("reason", "")
