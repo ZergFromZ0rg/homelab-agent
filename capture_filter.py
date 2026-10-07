@@ -32,6 +32,7 @@ from __future__ import annotations
 import fnmatch
 import ipaddress
 import re
+from functools import lru_cache
 from typing import Callable
 
 MAX_LENGTH = 300
@@ -77,6 +78,17 @@ def _protocol(name: str) -> Predicate:
         return lambda p: p.get("app") == name
     wanted = name.upper()
     return lambda p: p.get("proto") == wanted
+
+
+@lru_cache(maxsize=4096)
+def _in_network(net: ipaddress.IPv4Network | ipaddress.IPv6Network, value: str) -> bool:
+    """Whether a packet's address is in ``net``. Cached: the same few hundred
+    addresses are asked about for every packet, and parsing one costs more
+    than the rest of the filter put together."""
+    try:
+        return ipaddress.ip_address(value) in net
+    except ValueError:
+        return False
 
 
 def _address(value: str) -> str:
@@ -215,13 +227,7 @@ class _Parser:
             except ValueError as error:
                 raise FilterError(f"{spec!r} isn't a network (try 192.168.1.0/24)") from error
 
-            def inside(value) -> bool:
-                try:
-                    return ipaddress.ip_address(value) in net
-                except ValueError:
-                    return False
-
-            return _and(kind_proto, _side(direction, "src", "dst", inside))
+            return _and(kind_proto, _side(direction, "src", "dst", lambda value: _in_network(net, value)))
         if word in ("port", "portrange"):
             if qualifier in ("icmp", "icmp6", "arp"):
                 raise FilterError(f"{qualifier!r} has no ports")
@@ -288,3 +294,19 @@ def compile_filter(text: str) -> Predicate:
     if len(text) > MAX_LENGTH:
         raise FilterError(f"the filter is longer than {MAX_LENGTH} characters")
     return _Parser(_tokens(text)).parse()
+
+
+def combine(selected: dict) -> str | None:
+    """One expression for everything a validated capture filter asks for: its
+    ``expr`` plus the older ``host`` / ``port`` / ``proto`` fields, all of
+    which must match. Lets the sniffer evaluate a single thing."""
+    parts = []
+    if selected.get("host"):
+        parts.append(f"host {selected['host']}")
+    if selected.get("port"):
+        parts.append(f"port {selected['port']}")
+    if selected.get("proto"):
+        parts.append({"icmpv6": "icmp6"}.get(selected["proto"], selected["proto"]))
+    if selected.get("expr"):
+        parts.append(f"({selected['expr']})")
+    return " and ".join(parts) or None

@@ -31,6 +31,7 @@ import socket
 import struct
 import sys
 import time
+import traceback
 
 import capture_filter
 
@@ -64,6 +65,9 @@ SERVICES = {
     443: "https", 445: "smb", 1900: "ssdp", 3000: "http", 5353: "mdns", 8080: "http", 8096: "jellyfin",
     8123: "agent", 32400: "plex", 41641: "tailscale",
 }
+
+# sockaddr_ll.sll_pkttype: sent by this host, or (promiscuous) meant for someone else.
+PACKET_TYPES = {4: "out", 3: "other"}
 
 # hatype values from linux/if_arp.h whose frames carry no Ethernet header.
 RAW_IP_TYPES = {65534, 519, 768, 769}  # none (tun), ipv6-over-nothing, ipip, ip6tnl
@@ -297,7 +301,7 @@ class TcpHealth:
         return issues
 
 
-def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
+def decode_l4(proto: int, data: bytes) -> dict:
     """Ports, flags and a one-line summary for the transport layer; ``hdr``
     is how many bytes of ``data`` are header (the rest is payload)."""
     out = {"hdr": 0}
@@ -325,7 +329,7 @@ def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
             dns = decode_dns(data[8:])
             if dns:
                 out["info"], out["app"] = dns, "dns" if 53 in (sport, dport) else "mdns"
-        elif {sport, dport} == {67, 68} or (67 in (sport, dport) and 68 in (sport, dport)):
+        elif sport in (67, 68) and dport in (67, 68):  # client↔server, or relay↔server (67↔67)
             out.update(decode_dhcp(data[8:]) or {})
         elif 123 in (sport, dport):
             out.update(decode_ntp(data[8:]) or {})
@@ -339,7 +343,7 @@ def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
     return out
 
 
-def decode_ip(data: bytes, hatype_note: str = "") -> dict | None:
+def decode_ip(data: bytes) -> dict | None:
     if not data:
         return None
     version = data[0] >> 4
@@ -372,7 +376,7 @@ def decode_ip(data: bytes, hatype_note: str = "") -> dict | None:
             pos += ext
         out = {"src": src, "dst": dst, "ttl": hop, "ip": 6, "ip_len": plen + 40}
         end = 40 + plen if 40 + plen <= len(data) and plen else len(data)
-        l4 = decode_l4(proto, data[pos:end], v6=True)
+        l4 = decode_l4(proto, data[pos:end])
         out.update(l4)
         out["proto"] = PROTOS.get(proto, f"proto {proto}")
         out["hdr"] = pos + l4["hdr"]
@@ -409,7 +413,8 @@ def _decode_frame(frame: bytes, hatype: int) -> dict | None:
         out.update(src_mac=src_mac, dst_mac=dst_mac, l2=pos)
         out["hdr"] += pos
         return out
-    if ethertype == 0x0806 and len(frame) >= pos + 28:
+    # Ethernet/IPv4 ARP only: another hardware or protocol type has other field sizes.
+    if ethertype == 0x0806 and len(frame) >= pos + 28 and frame[pos:pos + 6] == b"\x00\x01\x08\x00\x06\x04":
         op = struct.unpack("!H", frame[pos + 6:pos + 8])[0]
         sha, spa = mac(frame[pos + 8:pos + 14]), socket.inet_ntoa(frame[pos + 14:pos + 18])
         tpa = socket.inet_ntoa(frame[pos + 24:pos + 28])
@@ -418,24 +423,6 @@ def _decode_frame(frame: bytes, hatype: int) -> dict | None:
     if ethertype == 0x88CC:
         return {"proto": "LLDP", "src": src_mac, "dst": dst_mac, "src_mac": src_mac, "dst_mac": dst_mac, "info": "", "hdr": pos, "l2": pos}
     return {"proto": f"eth {ethertype:#06x}", "src": src_mac, "dst": dst_mac, "src_mac": src_mac, "dst_mac": dst_mac, "info": "", "hdr": pos, "l2": pos}
-
-
-def matches(pkt: dict, flt: dict) -> bool:
-    """The simple filter the agent validated: any of ``host``, ``port``,
-    ``proto``. An ``expr`` (see capture_filter.py) is applied on top."""
-    host = flt.get("host")
-    if host and host not in (pkt.get("src"), pkt.get("dst")):
-        return False
-    port = flt.get("port")
-    if port and port not in (pkt.get("sport"), pkt.get("dport")):
-        return False
-    proto = flt.get("proto")
-    if proto:
-        if proto in ("dns", "tls", "http", "dhcp", "ntp"):
-            return pkt.get("app") == proto
-        if proto != pkt.get("proto", "").lower():
-            return False
-    return True
 
 
 def service(pkt: dict) -> str | None:
@@ -507,11 +494,13 @@ def read_packet(sock: socket.socket, stamped: bool) -> tuple[bytes, tuple, float
 def run(config: dict) -> None:
     iface = config.get("iface") or ""
     duration = max(1, min(int(config.get("duration", 60)), 600))
-    flt = config.get("filter") or {}
+    combined = capture_filter.combine(config.get("filter") or {})
+    expression = capture_filter.compile_filter(combined) if combined else None
     payload_mode = config.get("payload") if config.get("payload") in PAYLOAD_BYTES else "none"
     max_pps = MAX_PPS_FULL if payload_mode == "full" else MAX_PPS
-    expression = capture_filter.compile_filter(flt["expr"]) if flt.get("expr") else None
-    deadline = time.time() + duration
+    # Monotonic for every deadline and interval: a clock step (NTP, a resume)
+    # must not cut a capture short or stretch it. Wall time is only for stamps.
+    deadline = time.monotonic() + duration
 
     sock, stamped = open_socket(iface, bool(config.get("promisc")))
     health = TcpHealth()
@@ -520,26 +509,27 @@ def run(config: dict) -> None:
     protos: dict[str, list[int]] = {}
     flows: dict[tuple, list] = {}
     issue_counts: dict[str, int] = {}
-    sent_this_second, second_start, tick_at = 0, time.time(), time.time() + 1
+    sent_this_second, second_start, tick_at = 0, time.monotonic(), time.monotonic() + 1
     skipped_list = 0
+    reported_error = False
     reason = "finished"
 
     try:
         while True:
-            now = time.time()
-            if now >= deadline:
+            mono = time.monotonic()
+            if mono >= deadline:
                 break
-            if now >= tick_at:
+            if mono >= tick_at:
                 top = sorted(flows.items(), key=lambda kv: kv[1][1], reverse=True)[:MAX_FLOWS]
                 emit({
-                    "t": "tick", "ts": now, "pkts": totals["pkts"], "bytes": totals["bytes"],
+                    "t": "tick", "ts": time.time(), "pkts": totals["pkts"], "bytes": totals["bytes"],
                     "protos": protos, "skipped": skipped_list, "drops": kernel_drops(sock),
                     "issues": issue_counts,
                     "flows": [[*k, *v] for k, v in top],
                 })
                 totals, protos, flows, issue_counts = {"pkts": 0, "bytes": 0}, {}, {}, {}
                 skipped_list = 0
-                tick_at = now + 1
+                tick_at = mono + 1
             try:
                 frame, addr, stamp = read_packet(sock, stamped)
             except socket.timeout:
@@ -548,11 +538,19 @@ def run(config: dict) -> None:
                 reason = f"socket error: {error}"
                 break
             ifname, _, pkttype, hatype = addr[0], addr[1], addr[2], addr[3]
-            pkt = decode_frame(frame, hatype)
-            if pkt is None:
-                continue
-            issues = health.check(pkt)  # before the filter: it needs both directions
-            if not matches(pkt, flt) or (expression and not expression(pkt)):
+            # Every byte here came off the network, so a packet nobody
+            # anticipated must cost one packet, not the whole capture.
+            try:
+                pkt = decode_frame(frame, hatype)
+                if pkt is None:
+                    continue
+                issues = health.check(pkt)  # before the filter: it needs both directions
+                if expression and not expression(pkt):
+                    continue
+            except Exception:  # noqa: BLE001 - see above
+                if not reported_error:
+                    reported_error = True
+                    traceback.print_exc()  # once, to stderr; the agent keeps the last lines
                 continue
             if issues:
                 pkt["issues"] = issues
@@ -576,16 +574,16 @@ def run(config: dict) -> None:
                 flow[5][issue] = flow[5].get(issue, 0) + 1
                 issue_counts[issue] = issue_counts.get(issue, 0) + 1
 
-            if now - second_start >= 1:
-                second_start, sent_this_second = now, 0
+            if mono - second_start >= 1:
+                second_start, sent_this_second = mono, 0
             if sent_this_second >= max_pps:
                 skipped_list += 1
                 continue
             sent_this_second += 1
             offset = pkt.pop("hdr", 0)
             pkt.update(
-                t="pkt", ts=stamp or now, len=size, iface=ifname,
-                dir="out" if pkttype == 4 else "in",
+                t="pkt", ts=stamp or time.time(), len=size, iface=ifname,
+                dir=PACKET_TYPES.get(pkttype, "in"),
                 svc=service(pkt), poff=offset, flow="|".join(str(part) for part in key),
                 hex=frame[:offset + PAYLOAD_BYTES[payload_mode]].hex(),
             )

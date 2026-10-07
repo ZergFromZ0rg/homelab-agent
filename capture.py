@@ -17,7 +17,11 @@ Limits, because sniffing is sensitive even on your own network:
   name — are kept regardless;
 - promiscuous mode (see other devices' traffic on a mirror port) is a
   separate, explicit switch and is recorded with the capture;
-- nothing is written to disk — stopping or restarting the agent discards it;
+- nothing is written to disk — stopping or restarting the agent discards it.
+  That includes Docker's own logs: the helper runs with logging switched off
+  and its output is read through an attach stream, because the default
+  ``json-file`` driver would otherwise keep every packet (payload and all) in a
+  root-owned file under /var/lib/docker until the container is removed;
 - the filter is a host, a port, a protocol and/or an expression in the style of
   tcpdump (capture_filter.py), parsed here before anything starts.
 """
@@ -30,6 +34,8 @@ import struct
 import threading
 import time
 
+from docker.types import LogConfig
+
 import capture_filter
 import lan_scan
 import rebuild
@@ -41,12 +47,16 @@ MAX_PACKETS = 3000  # the ring the list and the pcap read from
 PAYLOAD_MODES = ("none", "64", "full")
 MAX_SERIES = 600  # one point a second
 MAX_FLOWS = 200
+INTERFACES_TTL = 30  # seconds: listing them costs a helper container run
+STDERR_LINES = 5  # kept from the helper, to say why it died
 FILTER_PROTOS = ("tcp", "udp", "icmp", "arp", "dns", "tls", "http", "dhcp", "ntp", "icmpv6")
 LABEL = "homelab-agent-capture"
 
 _lock = threading.RLock()
 _job: dict | None = None
 _container = None
+_starting = False  # a start is between its check and its job; see start()
+_interfaces_cache: tuple[float, dict] | None = None
 
 
 class CaptureError(Exception):
@@ -89,10 +99,19 @@ def validate_filter(raw: dict | None) -> dict:
 
 
 def interfaces(client) -> dict:
-    """What can be captured on, and the one the host routes through."""
+    """What can be captured on, and the one the host routes through. Cached
+    briefly: it costs a helper container run, and the page asks on every open
+    and again on every start."""
+    global _interfaces_cache
+    with _lock:
+        if _interfaces_cache and time.monotonic() - _interfaces_cache[0] < INTERFACES_TTL:
+            return _interfaces_cache[1]
     host = lan_scan.read_host(client)
     names = [i["name"] for i in host.get("ifaces", []) if i.get("ip")]
-    return {"default": host.get("default"), "interfaces": names}
+    found = {"default": host.get("default"), "interfaces": names}
+    with _lock:
+        _interfaces_cache = (time.monotonic(), found)
+    return found
 
 
 def _fresh(config: dict) -> dict:
@@ -118,12 +137,24 @@ def _fresh(config: dict) -> dict:
     }
 
 
-def _ingest(job: dict, line: str) -> None:
+def _ingest(job: dict, line: str) -> bool:
+    """Apply one line from the helper. False when it wasn't one of ours (a
+    traceback, say), so the caller can keep it to explain a failure."""
     try:
         msg = json.loads(line)
-    except ValueError:
-        return
-    kind = msg.get("t")
+        kind = msg.get("t")
+    except (ValueError, AttributeError):
+        return False
+    if kind not in ("pkt", "tick", "end"):
+        return False
+    try:
+        _apply(job, kind, msg)
+    except (KeyError, TypeError, ValueError) as error:
+        log.warning("capture: ignoring a malformed %s line: %s", kind, error)
+    return True
+
+
+def _apply(job: dict, kind: str, msg: dict) -> None:
     with _lock:
         if job is not _job:
             return
@@ -177,16 +208,18 @@ def _ingest(job: dict, line: str) -> None:
                 job["error"] = reason
 
 
-def _read(client, job: dict, container) -> None:
-    """Follow the helper's stdout until it exits, then clean it up."""
+def _read(job: dict, container, stream) -> None:
+    """Follow the helper's output until it exits, then clean it up."""
+    tail: list[str] = []
     try:
         buffer = b""
-        for chunk in container.logs(stream=True, follow=True, stdout=True, stderr=True):
+        for chunk in stream:
             buffer += chunk
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
-                if line.strip():
-                    _ingest(job, line.decode("utf-8", "replace"))
+                text = line.decode("utf-8", "replace").strip()
+                if text and not _ingest(job, text):
+                    tail = [*tail, text[:300]][-STDERR_LINES:]
     except Exception as error:  # noqa: BLE001 - surfaced in the job
         log.warning("capture reader failed: %s", error)
         with _lock:
@@ -197,9 +230,10 @@ def _read(client, job: dict, container) -> None:
     finally:
         with _lock:
             if job is _job and job["state"] == "capturing":
-                # The helper vanished without saying why (killed, OOM, daemon restart).
+                # The helper vanished without saying why (killed, OOM, daemon
+                # restart) — or crashed, in which case its last words are here.
                 job["state"] = "error"
-                job["error"] = "the capture helper stopped unexpectedly"
+                job["error"] = "the capture helper stopped unexpectedly" + (f": {tail[-1]}" if tail else "")
                 job["finished_at"] = time.time()
         try:
             container.remove(force=True)
@@ -217,12 +251,33 @@ def _clear_stale(client) -> None:
 
 
 def start(client, body: dict | None) -> dict:
-    global _job, _container
+    global _job, _container, _starting
     body = body or {}
+    # Check-and-reserve in one step: validating reads the host's interfaces
+    # (a container run), so two near-simultaneous requests would otherwise both
+    # pass the "already running" check and start two sniffers.
     with _lock:
-        if _job and _job["state"] == "capturing":
+        if _starting or (_job and _job["state"] == "capturing"):
             raise CaptureError("a capture is already running — stop it first")
+        _starting = True
+    try:
+        config = _validated(client, body)
+        container, stream = _launch(client, config)
+        job = _fresh(config)
+        with _lock:
+            _job, _container = job, container
+    finally:
+        with _lock:
+            _starting = False
+    audit.info(
+        "packet capture started on %s for %ss filter=%s payload=%s promisc=%s",
+        config["iface"], config["duration"], config["filter"] or "none", config["payload"], config["promisc"],
+    )
+    threading.Thread(target=_read, args=(job, container, stream), daemon=True).start()
+    return snapshot(0)
 
+
+def _validated(client, body: dict) -> dict:
     available = interfaces(client)
     iface = str(body.get("iface") or available["default"] or "").strip()
     if iface != "any" and iface not in available["interfaces"]:
@@ -242,38 +297,45 @@ def start(client, body: dict | None) -> dict:
     promisc = bool(body.get("promisc"))
     if promisc and iface == "any":
         raise CaptureError("promiscuous mode needs one interface, not all of them")
-    config = {
+    return {
         "iface": iface,
         "duration": duration,
         "filter": validate_filter(body.get("filter")),
         "payload": payload,
         "promisc": promisc,
     }
+
+
+def _launch(client, config: dict):
+    """Start the sniffer and return (container, output stream).
+
+    Logging is switched off and the output read through an attach stream: the
+    default json-file driver would write every packet record (payload hex
+    included) to a root-owned file on the host for as long as the container
+    exists. The stream is opened *before* the start so no early line is lost.
+    """
     try:
         _clear_stale(client)
-        container = client.containers.run(
+        container = client.containers.create(
             rebuild.helper_image(client),
             ["python", "/app/capture_worker.py"],
-            detach=True,
             network_mode="host",
             cap_drop=["ALL"],
             cap_add=["NET_RAW"],
             read_only=True,
             environment={"CAPTURE_CONFIG": json.dumps(config)},
             labels={LABEL: "1"},
+            log_config=LogConfig(type=LogConfig.types.NONE),
         )
+        try:
+            stream = container.attach(stream=True, stdout=True, stderr=True)
+            container.start()
+        except Exception:
+            container.remove(force=True)
+            raise
+        return container, stream
     except Exception as error:  # noqa: BLE001 - reported as-is
         raise CaptureError(f"couldn't start the capture helper: {error}") from error
-
-    job = _fresh(config)
-    with _lock:
-        _job, _container = job, container
-    audit.info(
-        "packet capture started on %s for %ss filter=%s payload=%s promisc=%s",
-        iface, duration, config["filter"] or "none", config["payload"], config["promisc"],
-    )
-    threading.Thread(target=_read, args=(client, job, container), daemon=True).start()
-    return snapshot(0)
 
 
 def stop() -> dict:
@@ -292,9 +354,11 @@ def stop() -> dict:
     return snapshot(0)
 
 
-def snapshot(after: int = 0, limit: int = 400) -> dict:
+def snapshot(after: int = 0, limit: int = MAX_PACKETS) -> dict:
     """The job as it stands. ``after`` is the last packet number the caller
-    has, so a poll only carries what is new; with 0 you get the latest ones."""
+    has, so a poll only carries what is new; with 0 you get the latest ones.
+    The limit defaults to the whole ring: a smaller one would silently drop
+    packets between two polls once traffic passes ``limit`` per interval."""
     with _lock:
         if _job is None:
             return {"state": "idle"}

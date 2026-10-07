@@ -1312,7 +1312,7 @@ def post_capture(body: dict | None = None, x_agent_token: str | None = Header(de
 
 
 @app.get("/capture")
-def get_capture(after: int = 0, limit: int = 400, x_agent_token: str | None = Header(default=None)):
+def get_capture(after: int = 0, limit: int = capture.MAX_PACKETS, x_agent_token: str | None = Header(default=None)):
     require_agent_token(x_agent_token)
     return capture.snapshot(max(0, after), max(1, min(limit, capture.MAX_PACKETS)))
 

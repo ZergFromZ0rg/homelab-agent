@@ -5,6 +5,7 @@ import json
 import socket
 import struct
 import sys
+import threading
 import time
 from unittest import mock
 
@@ -81,7 +82,8 @@ def test_tls_client_hello_names_the_server():
     pkt = w.decode_frame(eth(0x0800, ipv4(6, tcp(51000, 443, 0x18) + client_hello("jellyfin.example.com"))), 1)
     assert pkt["sni"] == "jellyfin.example.com" and pkt["app"] == "tls"
     assert pkt["info"] == "Client Hello → jellyfin.example.com"
-    assert w.matches(pkt, {"proto": "tls"}) and not w.matches(pkt, {"proto": "dns"})
+    assert cf.compile_filter(cf.combine({"proto": "tls"}))(pkt)
+    assert not cf.compile_filter(cf.combine({"proto": "dns"}))(pkt)
     assert pkt["hdr"] == 14 + 20 + 20  # the handshake itself is never stored
 
 
@@ -110,13 +112,21 @@ def test_garbage_and_truncated_frames_do_not_raise():
     assert w.decode_frame(eth(0x0800, ipv4(6, b"\x00" * 4)), 1)["proto"] == "TCP"
 
 
-def test_filter_matches_host_port_and_protocol():
+def test_the_older_host_port_proto_fields_become_one_expression():
     pkt = w.decode_frame(eth(0x0800, ipv4(6, tcp(51000, 443, 0x10))), 1)
-    assert w.matches(pkt, {})
-    assert w.matches(pkt, {"host": "192.168.1.1", "port": 443, "proto": "tcp"})
-    assert not w.matches(pkt, {"host": "10.0.0.1"})
-    assert not w.matches(pkt, {"port": 80})
-    assert not w.matches(pkt, {"proto": "udp"})
+
+    def passes(selected):
+        expression = cf.combine(selected)
+        return expression is None or cf.compile_filter(expression)(pkt)
+
+    assert cf.combine({}) is None and passes({})
+    assert passes({"host": "192.168.1.1", "port": 443, "proto": "tcp"})
+    assert not passes({"host": "10.0.0.1"})
+    assert not passes({"port": 80})
+    assert not passes({"proto": "udp"})
+    assert cf.combine({"proto": "icmpv6"}) == "icmp6"
+    assert cf.combine({"host": "10.0.0.1", "expr": "port 80 or port 8080"}) == "host 10.0.0.1 and (port 80 or port 8080)"
+    assert not passes({"host": "192.168.1.1", "expr": "port 80 or port 8080"})  # all of them must match
 
 
 def test_both_directions_share_a_flow_key():
@@ -148,9 +158,16 @@ class FakeContainer:
         self.killed = False
         self.removed = False
 
-    def logs(self, **kwargs):
-        for line in self.lines:
-            yield (json.dumps(line) + "\n").encode()
+    def attach(self, **kwargs):
+        self.attached = True
+        return self._stream()
+
+    def _stream(self):
+        for line in self.lines:  # a dict is a message from the worker, a str a stray line (a traceback)
+            yield ((line if isinstance(line, str) else json.dumps(line)) + "\n").encode()
+
+    def start(self):
+        self.started = True
 
     def kill(self):
         self.killed = True
@@ -161,20 +178,22 @@ class FakeContainer:
 
 def _client(container):
     client = mock.MagicMock()
-    client.containers.run.return_value = container
+    client.containers.create.return_value = container
     client.containers.list.return_value = []
     return client
 
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
-    capture._job = capture._container = None
+    capture._job = capture._container = capture._interfaces_cache = None
+    capture._starting = False
     monkeypatch.setattr(capture.rebuild, "helper_image", lambda c: "img")
     monkeypatch.setattr(capture.lan_scan, "read_host", lambda c: {
         "default": "eth0", "ifaces": [{"name": "eth0", "ip": "192.168.1.10"}, {"name": "lo", "ip": "127.0.0.1"}],
     })
     yield
-    capture._job = capture._container = None
+    capture._job = capture._container = capture._interfaces_cache = None
+    capture._starting = False
 
 
 def _wait_done():
@@ -205,9 +224,12 @@ def test_a_capture_collects_packets_totals_flows_and_protocols():
     assert capture.snapshot(after=1)["packets"] == []  # polling only carries what is new
     time.sleep(0.1)
     assert container.removed
-    run = client.containers.run.call_args
+    run = client.containers.create.call_args
     assert run.kwargs["network_mode"] == "host" and run.kwargs["cap_add"] == ["NET_RAW"]
     assert run.kwargs["cap_drop"] == ["ALL"]
+    # Nothing may be left in Docker's own logs: they'd hold every packet, payload included.
+    assert run.kwargs["log_config"]["Type"] == "none"
+    assert container.attached and container.started
     assert json.loads(run.kwargs["environment"]["CAPTURE_CONFIG"])["filter"] == {"proto": "tcp"}
 
 
@@ -226,7 +248,7 @@ def test_a_helper_that_vanishes_is_an_error_not_a_hang():
 
 def test_only_one_capture_at_a_time_and_stop_kills_the_helper():
     class Endless(FakeContainer):
-        def logs(self, **kwargs):
+        def _stream(self):
             while not self.killed:
                 time.sleep(0.02)
             yield (json.dumps({"t": "end", "reason": "stopped", "ts": 1}) + "\n").encode()
@@ -249,7 +271,7 @@ def test_start_refuses_bad_requests_before_touching_docker(body, message):
     client = _client(FakeContainer([]))
     with pytest.raises(capture.CaptureError, match=message):
         capture.start(client, body)
-    client.containers.run.assert_not_called()
+    client.containers.create.assert_not_called()
 
 
 def test_pcap_is_a_valid_file_with_one_record_per_packet():
@@ -368,13 +390,13 @@ def test_the_agent_validates_the_expression_before_starting():
     client = _client(FakeContainer([]))
     with pytest.raises(capture.CaptureError, match="filter:"):
         capture.start(client, {"filter": {"expr": "host"}})
-    client.containers.run.assert_not_called()
+    client.containers.create.assert_not_called()
 
 
-def test_the_worker_applies_the_expression_on_top_of_the_simple_fields():
+def test_the_worker_applies_the_expression_together_with_the_simple_fields():
     flt = {"proto": "tcp", "expr": "port 443"}
     expression = cf.compile_filter(flt["expr"])
-    keep = lambda p: w.matches(p, flt) and expression(p)  # noqa: E731
+    keep = cf.compile_filter(cf.combine(flt))
     assert keep(SYN) and not keep(UDP_DNS) and not keep(PING)
 
 
@@ -511,20 +533,20 @@ def test_new_option_validation(body, message):
     client = _client(FakeContainer([]))
     with pytest.raises(capture.CaptureError, match=message):
         capture.start(client, body)
-    client.containers.run.assert_not_called()
+    client.containers.create.assert_not_called()
 
 
 def test_options_reach_the_helper_and_the_snapshot_and_a_boolean_payload_still_works():
     client = _client(FakeContainer([{"t": "end", "reason": "finished", "ts": 1}]))
     capture.start(client, {"payload": "full", "promisc": True, "iface": "eth0"})
-    config = json.loads(client.containers.run.call_args.kwargs["environment"]["CAPTURE_CONFIG"])
+    config = json.loads(client.containers.create.call_args.kwargs["environment"]["CAPTURE_CONFIG"])
     assert (config["payload"], config["promisc"]) == ("full", True)
     out = _wait_done()
     assert (out["payload"], out["promisc"]) == ("full", True)
     capture._job = capture._container = None
     client = _client(FakeContainer([]))
     capture.start(client, {"payload": True})
-    assert json.loads(client.containers.run.call_args.kwargs["environment"]["CAPTURE_CONFIG"])["payload"] == "64"
+    assert json.loads(client.containers.create.call_args.kwargs["environment"]["CAPTURE_CONFIG"])["payload"] == "64"
 
 
 def test_drops_and_tcp_issues_are_summed_per_capture_and_per_flow():
@@ -560,3 +582,153 @@ def test_new_protocols_problems_and_name_in_filters():
         ("problem", SYN, False), ("tcp and not problem", SYN, True),
     ]:
         assert cf.compile_filter(expr)(pkt) is want, expr
+
+
+# --- review fixes -------------------------------------------------------------------
+
+def test_a_helper_that_crashes_says_why():
+    capture.start(_client(FakeContainer(["Traceback (most recent call last):", 'ImportError: no module named "capture_filter"'])), {})
+    out = _wait_done()
+    assert out["state"] == "error" and "capture_filter" in out["error"]
+
+
+def test_two_simultaneous_starts_start_one_sniffer(monkeypatch):
+    gate = threading.Event()
+    real = capture._validated
+
+    def slow(client, body):
+        gate.wait(2)  # the second request arrives while the first is still validating
+        return real(client, body)
+
+    monkeypatch.setattr(capture, "_validated", slow)
+    client = _client(FakeContainer([{"t": "end", "reason": "finished", "ts": 1}]))
+    results = []
+
+    def attempt():
+        try:
+            capture.start(client, {})
+            results.append("started")
+        except capture.CaptureError as error:
+            results.append(str(error))
+
+    first = threading.Thread(target=attempt)
+    first.start()
+    time.sleep(0.1)
+    attempt()  # refused on the spot, without waiting
+    gate.set()
+    first.join(3)
+    assert sorted(results) == ["a capture is already running — stop it first", "started"]
+    assert client.containers.create.call_count == 1
+    assert capture._starting is False
+
+
+def test_a_failed_start_releases_the_reservation():
+    client = _client(FakeContainer([]))
+    client.containers.create.side_effect = RuntimeError("no such image")
+    with pytest.raises(capture.CaptureError, match="couldn't start the capture helper"):
+        capture.start(client, {})
+    assert capture._starting is False
+    client.containers.create.side_effect = None
+    capture.start(client, {})  # not stuck
+
+
+def test_a_helper_that_cannot_attach_is_removed_not_leaked():
+    container = FakeContainer([])
+    container.attach = lambda **k: (_ for _ in ()).throw(RuntimeError("daemon went away"))
+    with pytest.raises(capture.CaptureError, match="daemon went away"):
+        capture.start(_client(container), {})
+    assert container.removed and not getattr(container, "started", False)
+
+
+def test_interfaces_are_listed_once_per_half_minute(monkeypatch):
+    calls = []
+    host = {"default": "eth0", "ifaces": [{"name": "eth0", "ip": "192.168.1.10"}]}
+    monkeypatch.setattr(capture.lan_scan, "read_host", lambda c: calls.append(1) or host)
+    capture.interfaces(None)
+    capture.interfaces(None)
+    assert len(calls) == 1
+    capture._interfaces_cache = (time.monotonic() - capture.INTERFACES_TTL - 1, capture._interfaces_cache[1])
+    capture.interfaces(None)
+    assert len(calls) == 2
+
+
+def test_a_poll_never_drops_packets_however_many_arrived():
+    capture._job = capture._fresh({"iface": "eth0", "filter": {}, "payload": "full", "promisc": False, "duration": 5})
+    capture._job["packets"] = [{"n": n, "ts": n, "len": 1, "hex": ""} for n in range(1, 1501)]
+    capture._job["seq"] = 1500
+    assert len(capture.snapshot(0)["packets"]) == 1500
+    assert [p["n"] for p in capture.snapshot(1000)["packets"]] == list(range(1001, 1501))
+
+
+def test_lines_from_the_helper_that_are_not_ours_or_are_malformed_do_no_harm():
+    job = capture._fresh({"iface": "eth0", "filter": {}, "payload": "none", "promisc": False, "duration": 5})
+    capture._job = job
+    assert capture._ingest(job, "Traceback (most recent call last):") is False
+    assert capture._ingest(job, '{"t": "mystery"}') is False
+    assert capture._ingest(job, "[1, 2]") is False
+    assert capture._ingest(job, '{"t": "tick"}') is True  # ours, but missing its fields
+    assert capture._ingest(job, '{"t": "tick", "ts": 1, "pkts": 1, "bytes": 1, "flows": [[1, 2]]}') is True
+    assert job["state"] == "capturing"  # and the capture carried on
+
+
+# --- the sniffer loop, with a fake socket ----------------------------------------------
+
+def _run_worker(monkeypatch, frames, config=None):
+    """Run ``run()`` over (frame, pkttype) pairs; returns the emitted messages."""
+    emitted = []
+    monkeypatch.setattr(w, "emit", emitted.append)
+    monkeypatch.setattr(w, "open_socket", lambda iface, promisc: (mock.MagicMock(), True))
+    monkeypatch.setattr(w, "kernel_drops", lambda sock: 0)
+    queue = list(frames)
+
+    def read(sock, stamped):
+        if not queue:
+            raise KeyboardInterrupt  # ends the loop the way a stop would
+        frame, pkttype = queue.pop(0)
+        return frame, ("eth0", 3, pkttype, 1, b""), 1700000000.5
+
+    monkeypatch.setattr(w, "read_packet", read)
+    w.run({"iface": "eth0", "duration": 5, **(config or {})})
+    return emitted
+
+
+def test_a_packet_nobody_anticipated_costs_one_packet_not_the_capture(monkeypatch, capsys):
+    real = w.decode_frame
+    poison = b"poison"
+
+    def decode(frame, hatype):
+        if frame == poison:
+            raise RuntimeError("unforeseen packet")
+        return real(frame, hatype)
+
+    monkeypatch.setattr(w, "decode_frame", decode)
+    good = eth(0x0800, ipv4(6, tcp(51000, 443, 0x02)))
+    out = _run_worker(monkeypatch, [(good, 0), (poison, 0), (poison, 0), (good, 0)])
+    assert [m["t"] for m in out].count("pkt") == 2
+    assert out[-1]["t"] == "end" and out[-1]["reason"] == "stopped"
+    assert capsys.readouterr().err.count("Traceback") == 1  # reported once, not per packet
+
+
+def test_a_packets_direction_and_kernel_timestamp(monkeypatch):
+    frame = eth(0x0800, ipv4(6, tcp(51000, 443, 0x02)))
+    out = _run_worker(monkeypatch, [(frame, 0), (frame, 4), (frame, 3)])
+    packets = [m for m in out if m["t"] == "pkt"]
+    assert [p["dir"] for p in packets] == ["in", "out", "other"]
+    assert packets[0]["ts"] == 1700000000.5
+
+
+def test_the_worker_filters_with_the_combined_expression_and_counts_only_matches(monkeypatch):
+    syn = eth(0x0800, ipv4(6, tcp(51000, 443, 0x02)))
+    ping = eth(0x0800, ipv4(1, bytes([8, 0, 0, 0, 0, 0, 0, 0])))
+    out = _run_worker(monkeypatch, [(syn, 0), (ping, 0), (syn, 0)], {"filter": {"proto": "tcp", "expr": "port 443"}})
+    assert [m["proto"] for m in out if m["t"] == "pkt"] == ["TCP", "TCP"]
+
+
+def test_arp_for_other_hardware_is_not_misread_as_ethernet_arp():
+    infiniband = struct.pack("!HHBBH6s4s6s4s", 32, 0x0800, 6, 4, 1, CLIENT_MAC, bytes(4), bytes(6), bytes(4))
+    assert w.decode_frame(eth(0x0806, infiniband), 1)["proto"] == "eth 0x0806"
+
+
+def test_dhcp_between_relay_and_server_is_read_too():
+    pkt = udp(67, 67, dhcp(1), src="10.0.0.1", dst="192.168.1.1")
+    assert pkt["app"] == "dhcp" and pkt["info"].startswith("DHCP Discover")
