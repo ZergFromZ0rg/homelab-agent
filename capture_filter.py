@@ -14,10 +14,13 @@ than compiled to kernel BPF, so a mistake costs a message, not a crash.
 Primitives:  [proto] [src|dst] host IP · [proto] [src|dst] net CIDR ·
              [tcp|udp] [src|dst] port N · [tcp|udp] [src|dst] portrange A-B ·
              ether [src|dst] host MAC · len <|<=|>|>=|=|== N · less N · greater N ·
-             sni NAME (a TLS server name, ``*`` wildcards allowed, ``*.example.com``
-             also matches example.com — an addition to pcap-filter, which
-             cannot see inside TLS)
-Protocols:   tcp udp icmp icmp6 arp ip ip6 dns tls
+             sni NAME (a TLS server name) · name NAME (a TLS server name, an HTTP
+             Host or a DHCP host name) — ``*`` wildcards allowed, and
+             ``*.example.com`` also matches example.com. Both are additions to
+             pcap-filter, which cannot see inside those protocols.
+Protocols:   tcp udp icmp icmp6 arp ip ip6 dns tls http dhcp ntp
+Problems:    retransmit reset zerowindow dupack gap problem (any of them) —
+             what the capture flagged on a TCP packet
 Combinators: and && · or || · not ! · parentheses
 
 Not supported (and refused with a message rather than guessed at): byte
@@ -34,7 +37,9 @@ from typing import Callable
 MAX_LENGTH = 300
 MAX_DEPTH = 16
 
-PROTOCOLS = {"tcp", "udp", "icmp", "icmp6", "arp", "ip", "ip6", "dns", "tls"}
+APP_PROTOCOLS = {"dns", "tls", "http", "dhcp", "ntp"}
+PROTOCOLS = {"tcp", "udp", "icmp", "icmp6", "arp", "ip", "ip6"} | APP_PROTOCOLS
+ISSUES = {"retransmit": "retransmit", "reset": "reset", "zerowindow": "zero-window", "dupack": "dup-ack", "gap": "gap"}
 DIRECTIONS = {"src", "dst"}
 _TOKEN = re.compile(r"\s*(&&|\|\||<=|>=|==|[()!<>=]|[^\s()!<>=&|]+)")
 _MAC = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$", re.I)
@@ -68,7 +73,7 @@ def _protocol(name: str) -> Predicate:
         return lambda p: p.get("ip") == 6
     if name == "icmp6":
         return lambda p: p.get("proto") == "ICMPv6"
-    if name in ("dns", "tls"):
+    if name in APP_PROTOCOLS:
         return lambda p: p.get("app") == name
     wanted = name.upper()
     return lambda p: p.get("proto") == wanted
@@ -169,6 +174,12 @@ class _Parser:
         if word in _UNSUPPORTED or "[" in word:
             raise FilterError(f"{first!r} isn't supported here")
 
+        if word in ISSUES:
+            wanted = ISSUES[word]
+            return lambda p: wanted in p.get("issues", ())
+        if word == "problem":
+            return lambda p: bool(p.get("issues"))
+
         qualifier: str | None = None
         if word in PROTOCOLS:
             qualifier = word
@@ -183,10 +194,10 @@ class _Parser:
             if qualifier:
                 raise FilterError(f"{qualifier!r} can't qualify {word!r}")
             return self.length(word)
-        if word == "sni":
+        if word in ("sni", "name"):
             if qualifier:
-                raise FilterError(f"{qualifier!r} can't qualify 'sni'")
-            return self.sni()
+                raise FilterError(f"{qualifier!r} can't qualify {word!r}")
+            return self.named(word)
 
         direction = None
         if word in DIRECTIONS:
@@ -254,15 +265,19 @@ class _Parser:
         }[op]
         return lambda p: compare(p.get("len", 0))
 
-    def sni(self) -> Predicate:
+    def named(self, word: str) -> Predicate:
         pattern = self.take().lower()
         if not re.fullmatch(r"[a-z0-9*._-]{1,253}", pattern):
             raise FilterError(f"{pattern!r} isn't a host name")
         bare = pattern[2:] if pattern.startswith("*.") else None  # *.example.com covers example.com too
+        fields = ("sni",) if word == "sni" else ("sni", "name")
 
         def named(p: dict) -> bool:
-            name = (p.get("sni") or "").lower()
-            return bool(name) and (fnmatch.fnmatchcase(name, pattern) or name == bare)
+            for field in fields:
+                name = (p.get(field) or "").lower()
+                if name and (fnmatch.fnmatchcase(name, pattern) or name == bare):
+                    return True
+            return False
 
         return named
 

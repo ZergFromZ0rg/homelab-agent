@@ -254,7 +254,7 @@ def test_start_refuses_bad_requests_before_touching_docker(body, message):
 
 def test_pcap_is_a_valid_file_with_one_record_per_packet():
     frame = eth(0x0800, ipv4(6, tcp(51000, 443, 0x02)))
-    capture._job = capture._fresh({"iface": "eth0", "filter": {}, "payload": False, "duration": 5})
+    capture._job = capture._fresh({"iface": "eth0", "filter": {}, "payload": "none", "promisc": False, "duration": 5})
     capture._job["packets"] = [{"n": 1, "ts": 1700000000.25, "len": len(frame), "hex": frame[:54].hex(), "l2": 14}]
     data = capture.pcap()
     magic, major, minor, _, _, snaplen, link = struct.unpack("<IHHiIII", data[:24])
@@ -376,3 +376,187 @@ def test_the_worker_applies_the_expression_on_top_of_the_simple_fields():
     expression = cf.compile_filter(flt["expr"])
     keep = lambda p: w.matches(p, flt) and expression(p)  # noqa: E731
     assert keep(SYN) and not keep(UDP_DNS) and not keep(PING)
+
+
+# --- DHCP / NTP / HTTP ---------------------------------------------------------
+
+def dhcp(kind: int, yiaddr="0.0.0.0", host=None, wanted=None) -> bytes:
+    head = struct.pack("!BBBBIHH4s4s4s4s", 1, 1, 6, 0, 0xCAFE, 0, 0, bytes(4), socket.inet_aton(yiaddr), bytes(4), bytes(4))
+    head += CLIENT_MAC + bytes(10) + bytes(64) + bytes(128) + b"\x63\x82\x53\x63"
+    opts = bytes([53, 1, kind])
+    if host:
+        opts += bytes([12, len(host)]) + host.encode()
+    if wanted:
+        opts += bytes([50, 4]) + socket.inet_aton(wanted)
+    return head + opts + b"\xff"
+
+
+def udp(sport, dport, payload, src="192.168.1.10", dst="192.168.1.1"):
+    return _pkt(eth(0x0800, ipv4(17, struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload, src=src, dst=dst)))
+
+
+def test_dhcp_messages_are_read():
+    request = udp(68, 67, dhcp(3, host="living-room-tv", wanted="192.168.1.50"))
+    assert request["app"] == "dhcp" and request["name"] == "living-room-tv"
+    assert request["info"] == "DHCP Request wants 192.168.1.50 “living-room-tv” (aa:bb:cc:00:00:01)"
+    offer = udp(67, 68, dhcp(2, yiaddr="192.168.1.50"), src="192.168.1.1", dst="255.255.255.255")
+    assert offer["info"] == "DHCP Offer 192.168.1.50"
+    assert udp(68, 67, b"\x00" * 300).get("app") is None  # not DHCP: no magic cookie
+
+
+def test_ntp_client_and_server():
+    client = udp(51000, 123, bytes([0x23]) + bytes(47))  # v4, mode 3
+    assert client["app"] == "ntp" and client["info"] == "NTP v4 client"
+    server = udp(123, 51000, bytes([0x24, 2]) + bytes(46))
+    assert server["info"] == "NTP v4 server stratum 2"
+    assert udp(51000, 123, b"short").get("app") is None
+
+
+def http_pkt(payload: bytes, sport=51000, dport=80):
+    return _pkt(eth(0x0800, ipv4(6, tcp(sport, dport, 0x18) + payload)))
+
+
+def test_http_request_keeps_the_host_but_not_the_query_string():
+    pkt = http_pkt(b"GET /api/items?token=SECRET&page=2 HTTP/1.1\r\nHost: nas.lan:8080\r\nCookie: a=b\r\n\r\n")
+    assert pkt["app"] == "http" and pkt["name"] == "nas.lan:8080"
+    assert pkt["info"] == "GET /api/items?…  Host: nas.lan:8080"
+    assert "SECRET" not in json.dumps(pkt) and "Cookie" not in json.dumps(pkt)
+
+
+def test_http_response_and_non_http():
+    assert http_pkt(b"HTTP/1.1 404 Not Found\r\nServer: x\r\n\r\n", sport=80, dport=51000)["info"] == "HTTP 404 Not Found"
+    assert http_pkt(b"GET garbage\r\n").get("app") is None
+    assert http_pkt(b"\x00\x01binary").get("app") is None
+
+
+# --- TCP health ----------------------------------------------------------------
+
+def seg(seq, plen=0, flags=0x10, ack=1, win=1000, src_port=51000, dst_port=443):
+    frame = eth(0x0800, ipv4(6, struct.pack("!HHIIBBHHH", src_port, dst_port, seq, ack, 5 << 4, flags, win, 0, 0) + b"x" * plen))
+    return w.decode_frame(frame, 1)
+
+
+def test_tcp_health_flags_retransmits_gaps_resets_and_zero_windows():
+    h = w.TcpHealth()
+    assert h.check(seg(100, 0, 0x02)) == []                      # SYN
+    assert h.check(seg(101, 10, 0x18)) == []                     # data 101..110
+    assert h.check(seg(101, 10, 0x18)) == ["retransmit"]
+    assert h.check(seg(111, 10, 0x18)) == []                     # in order again
+    assert h.check(seg(200, 10, 0x18)) == ["gap"]
+    assert h.check(seg(210, 0, 0x14)) == ["reset"]
+    assert h.check(seg(300, 0, 0x10, win=0)) == ["zero-window"]
+
+
+def test_duplicate_acks_need_three_identical_acks_and_data_resets_the_count():
+    h = w.TcpHealth()
+    got = [h.check(seg(1, 0, 0x10, ack=500)) for _ in range(4)]
+    assert got == [[], [], ["dup-ack"], ["dup-ack"]]
+    assert h.check(seg(1, 0, 0x10, ack=900)) == []
+
+
+def test_a_keep_alive_probe_is_not_a_retransmission():
+    h = w.TcpHealth()
+    h.check(seg(100, 10, 0x18))               # next = 110
+    assert h.check(seg(109, 1, 0x10)) == []   # one byte at next-1
+
+
+def test_each_direction_and_each_connection_is_tracked_separately():
+    h = w.TcpHealth()
+    h.check(seg(100, 10, 0x18))
+    assert h.check(seg(100, 10, 0x18, src_port=51001)) == []  # another connection
+    reply = w.decode_frame(eth(0x0800, ipv4(6, struct.pack("!HHIIBBHHH", 443, 51000, 100, 1, 5 << 4, 0x18, 1000, 0, 0) + b"x" * 5, src="192.168.1.1", dst="192.168.1.10")), 1)
+    assert h.check(reply) == []                                # the reverse direction
+
+
+def test_tcp_payload_length_ignores_ethernet_padding():
+    frame = eth(0x0800, ipv4(6, tcp(51000, 443, 0x10))) + b"\x00" * 6
+    assert w.decode_frame(frame, 1)["plen"] == 0
+
+
+# --- kernel side (faked: AF_PACKET only exists on Linux) -------------------------
+
+def test_kernel_timestamp_is_taken_from_the_ancillary_data():
+    class Sock:
+        def recvmsg(self, size, anc):
+            stamp = struct.pack("qq", 1700000000, 250_000_000)
+            return b"frame", [(socket.SOL_SOCKET, w.SO_TIMESTAMPNS, stamp)], 0, ("eth0", 3, 0, 1, b"")
+    frame, addr, stamp = w.read_packet(Sock(), True)
+    assert (frame, addr[0], stamp) == (b"frame", "eth0", 1700000000.25)
+
+    class Plain:
+        def recvmsg(self, size, anc):
+            return b"f", [], 0, ("eth0", 3, 0, 1, b"")
+    assert w.read_packet(Plain(), False)[2] is None
+
+
+def test_kernel_drop_counter_is_the_second_field():
+    class Sock:
+        def getsockopt(self, level, name, size):
+            return struct.pack("II", 900, 17)
+    assert w.kernel_drops(Sock()) == 17
+
+    class Refuses:
+        def getsockopt(self, *a):
+            raise OSError
+    assert w.kernel_drops(Refuses()) == 0
+
+
+# --- controller: options, drops and issues -----------------------------------------
+
+@pytest.mark.parametrize("body,message", [
+    ({"payload": "everything"}, "payload must be one of"),
+    ({"promisc": True, "iface": "any"}, "promiscuous mode needs one interface"),
+])
+def test_new_option_validation(body, message):
+    client = _client(FakeContainer([]))
+    with pytest.raises(capture.CaptureError, match=message):
+        capture.start(client, body)
+    client.containers.run.assert_not_called()
+
+
+def test_options_reach_the_helper_and_the_snapshot_and_a_boolean_payload_still_works():
+    client = _client(FakeContainer([{"t": "end", "reason": "finished", "ts": 1}]))
+    capture.start(client, {"payload": "full", "promisc": True, "iface": "eth0"})
+    config = json.loads(client.containers.run.call_args.kwargs["environment"]["CAPTURE_CONFIG"])
+    assert (config["payload"], config["promisc"]) == ("full", True)
+    out = _wait_done()
+    assert (out["payload"], out["promisc"]) == ("full", True)
+    capture._job = capture._container = None
+    client = _client(FakeContainer([]))
+    capture.start(client, {"payload": True})
+    assert json.loads(client.containers.run.call_args.kwargs["environment"]["CAPTURE_CONFIG"])["payload"] == "64"
+
+
+def test_drops_and_tcp_issues_are_summed_per_capture_and_per_flow():
+    tick = {"t": "tick", "ts": 5.0, "pkts": 2, "bytes": 200, "protos": {}, "drops": 4, "issues": {"retransmit": 2},
+            "flows": [["TCP", "a", 1, "b", 2, 2, 200, 1, 1, "x.example.com", {"retransmit": 2}]]}
+    capture.start(_client(FakeContainer([tick, tick, {"t": "end", "reason": "finished", "ts": 6}])), {})
+    out = _wait_done()
+    assert out["drops"] == 8 and out["issues"] == {"retransmit": 4}
+    assert out["flows"][0]["issues"] == {"retransmit": 4} and out["flows"][0]["name"] == "x.example.com"
+
+
+def test_snapshot_route_takes_a_limit(monkeypatch):
+    monkeypatch.setattr(main, "AGENT_TOKEN", "")
+    capture._job = capture._fresh({"iface": "eth0", "filter": {}, "payload": "none", "promisc": False, "duration": 5})
+    capture._job["packets"] = [{"n": n, "ts": n, "len": 1, "hex": ""} for n in range(1, 11)]
+    capture._job["seq"] = 10
+    http = TestClient(main.app)
+    assert len(http.get("/capture", params={"limit": 3}).json()["packets"]) == 3
+    assert len(http.get("/capture", params={"limit": 99999}).json()["packets"]) == 10
+
+
+# --- the filter language, new words ----------------------------------------------
+
+def test_new_protocols_problems_and_name_in_filters():
+    dhcp_pkt = udp(68, 67, dhcp(3, host="tv"))
+    web = http_pkt(b"GET / HTTP/1.1\r\nHost: Nas.LAN\r\n\r\n")
+    bad = dict(SYN, issues=["retransmit"])
+    for expr, pkt, want in [
+        ("dhcp", dhcp_pkt, True), ("http", web, True), ("ntp", dhcp_pkt, False),
+        ("name tv", dhcp_pkt, True), ("name nas.lan", web, True), ("name *.lan", web, True), ("name *.local", web, False),
+        ("name *.example.com", HELLO, True), ("sni nas.lan", web, False),
+        ("retransmit", bad, True), ("reset", bad, False), ("problem", bad, True),
+        ("problem", SYN, False), ("tcp and not problem", SYN, True),
+    ]:
+        assert cf.compile_filter(expr)(pkt) is want, expr

@@ -4,7 +4,7 @@ Docker's bridge and would only see its own traffic.
 
 Reads an AF_PACKET socket (no tcpdump, no libpcap — the helper image is the
 agent's own), decodes Ethernet / IPv4 / IPv6 / ARP / TCP / UDP / ICMP / DNS
-by hand, and prints JSON lines on stdout for the agent to read:
+DHCP / NTP / plain HTTP by hand, and prints JSON lines on stdout for the agent to read:
 
   {"t": "pkt", ...}   one decoded packet (capped per second, see MAX_PPS)
   {"t": "tick", ...}  once a second: exact totals and the busiest flows
@@ -13,6 +13,14 @@ by hand, and prints JSON lines on stdout for the agent to read:
 Totals and flows count *every* matching packet; only the packet list is
 sampled. By default only headers are kept — the bytes after the transport
 header are cut off, so a capture does not hold what people were reading.
+``payload`` can be raised to the first 64 bytes, or to whole packets (what
+"Follow stream" needs). Things read out of the payload and kept regardless —
+a TLS server name, a DNS name, an HTTP request line without its query string
+and its Host header, a DHCP host name — are the only exceptions.
+
+Kernel side: the socket asks the kernel for packet timestamps (not the time
+Python got round to reading it), reports the kernel's own drop counter once a
+second, and can put the interface in promiscuous mode.
 """
 
 from __future__ import annotations
@@ -28,11 +36,26 @@ import capture_filter
 
 ETH_P_ALL = 0x0003
 MAX_PPS = 120  # packets per second sent to the list; totals stay exact
+MAX_PPS_FULL = 600  # with whole packets kept: a stream needs most of its segments
 MAX_FLOWS = 150  # flows per tick line
-PAYLOAD_BYTES = 64  # kept after the headers when payload is switched on
+PAYLOAD_BYTES = {"none": 0, "64": 64, "full": 1600}  # kept after the headers
+
+# linux/if_packet.h, which the socket module doesn't export.
+SOL_PACKET = 263
+PACKET_ADD_MEMBERSHIP = 1
+PACKET_STATISTICS = 6
+PACKET_MR_PROMISC = 1
+SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
 
 PROTOS = {1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP", 41: "IPv6", 47: "GRE", 50: "ESP", 58: "ICMPv6", 89: "OSPF", 132: "SCTP"}
 TCP_FLAGS = (("F", 0x01), ("S", 0x02), ("R", 0x04), ("P", 0x08), ("A", 0x10), ("U", 0x20))
+DHCP_TYPES = {1: "Discover", 2: "Offer", 3: "Request", 4: "Decline", 5: "ACK", 6: "NAK", 7: "Release", 8: "Inform"}
+NTP_MODES = {1: "symmetric active", 2: "symmetric passive", 3: "client", 4: "server", 5: "broadcast"}
+HTTP_METHODS = (b"GET ", b"POST ", b"PUT ", b"HEAD ", b"DELETE ", b"OPTIONS ", b"PATCH ", b"CONNECT ")
+ISSUE_LABELS = {
+    "retransmit": "TCP retransmission", "gap": "gap: lost or reordered", "dup-ack": "duplicate ACK",
+    "zero-window": "zero window", "reset": "connection reset",
+}
 DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 12: "PTR", 15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 65: "HTTPS", 255: "ANY"}
 ICMP_TYPES = {0: "echo reply", 3: "unreachable", 5: "redirect", 8: "echo request", 11: "time exceeded"}
 # Well-known ports worth naming in the list.
@@ -136,6 +159,144 @@ def tls_server_name(data: bytes) -> str | None:
     return None
 
 
+def decode_dhcp(data: bytes) -> dict | None:
+    """"DHCP Offer 192.168.1.50 “iphone”" — the message type, the address
+    offered or asked for, and the client's host name."""
+    if len(data) < 241 or data[236:240] != b"\x63\x82\x53\x63":
+        return None
+    yiaddr = socket.inet_ntoa(data[16:20])
+    client = mac(data[28:34])
+    options, pos = {}, 240
+    while pos < len(data):
+        code = data[pos]
+        if code == 255:
+            break
+        if code == 0:
+            pos += 1
+            continue
+        if pos + 1 >= len(data):
+            break
+        size = data[pos + 1]
+        options[code] = data[pos + 2:pos + 2 + size]
+        pos += 2 + size
+    kind = DHCP_TYPES.get(options.get(53, b"\0")[0] if options.get(53) else 0, "message")
+    host = options[12].decode("ascii", "replace")[:63] if options.get(12) else None
+    wanted = socket.inet_ntoa(options[50]) if len(options.get(50, b"")) == 4 else None
+    parts = [f"DHCP {kind}"]
+    if kind in ("Offer", "ACK") and yiaddr != "0.0.0.0":
+        parts.append(yiaddr)
+    elif wanted:
+        parts.append(f"wants {wanted}")
+    if host:
+        parts.append(f"\u201c{host}\u201d")
+    if kind not in ("Offer", "ACK", "NAK"):
+        parts.append(f"({client})")
+    out = {"app": "dhcp", "info": " ".join(parts)}
+    if host:
+        out["name"] = host
+    return out
+
+
+def decode_ntp(data: bytes) -> dict | None:
+    if len(data) < 48:
+        return None
+    version, mode = (data[0] >> 3) & 7, data[0] & 7
+    if version not in (1, 2, 3, 4) or mode not in NTP_MODES:
+        return None
+    info = f"NTP v{version} {NTP_MODES[mode]}"
+    if mode in (4, 5):
+        info += f" stratum {data[1]}"
+    return {"app": "ntp", "info": info}
+
+
+def decode_http(payload: bytes) -> dict | None:
+    """A plain-HTTP request line (query string cut off — it is where tokens
+    live) with its Host header, or a response status line."""
+    head = payload[:1500]
+    if head.startswith(b"HTTP/1."):
+        parts = head.split(b"\r\n", 1)[0][:100].decode("latin-1").split(" ", 2)
+        if len(parts) >= 2 and parts[1].isdigit():
+            return {"app": "http", "info": f"HTTP {parts[1]} {parts[2] if len(parts) > 2 else ''}".strip()}
+        return None
+    if not head.startswith(HTTP_METHODS):
+        return None
+    line, _, rest = head.partition(b"\r\n")
+    pieces = line.decode("latin-1").split(" ")
+    if len(pieces) < 3 or not pieces[2].startswith("HTTP/"):
+        return None
+    target, cut, _ = pieces[1].partition("?")
+    target = target[:120] + ("?\u2026" if cut else "")
+    host = None
+    for header in rest.split(b"\r\n"):
+        if not header:
+            break
+        if header[:5].lower() == b"host:":
+            host = header[5:].strip().decode("latin-1")[:253] or None
+            break
+    out = {"app": "http", "info": f"{pieces[0]} {target}" + (f"  Host: {host}" if host else "")}
+    if host:
+        out["name"] = host
+    return out
+
+
+class TcpHealth:
+    """Per-direction sequence tracking, to flag what Wireshark's expert info
+    would: retransmissions, gaps, duplicate ACKs, zero windows and resets.
+    Seen on every TCP packet before any filter, so a narrow filter doesn't
+    blind it. Bounded: a flood of flows resets the table."""
+
+    MAX = 50_000
+
+    def __init__(self) -> None:
+        self.state: dict[tuple, dict] = {}
+
+    @staticmethod
+    def _signed(diff: int) -> int:
+        return ((diff + 2**31) % 2**32) - 2**31
+
+    def check(self, pkt: dict) -> list[str]:
+        if pkt.get("proto") != "TCP" or "seq" not in pkt:
+            return []
+        key = (pkt["src"], pkt["sport"], pkt["dst"], pkt["dport"])
+        st = self.state.get(key)
+        if st is None:
+            if len(self.state) >= self.MAX:
+                self.state.clear()
+            st = self.state[key] = {"next": None, "ack": None, "dups": 0}
+        flags, plen, seq = pkt.get("flags", ""), pkt.get("plen", 0), pkt["seq"]
+        syn, fin, rst = "S" in flags, "F" in flags, "R" in flags
+        issues: list[str] = []
+        if rst:
+            issues.append("reset")
+        elif pkt.get("win") == 0 and not syn:
+            issues.append("zero-window")
+        span = plen + (1 if syn else 0) + (1 if fin else 0)
+        if span and not rst:
+            end = (seq + span) & 0xFFFFFFFF
+            if st["next"] is None:
+                st["next"] = end
+            else:
+                behind = self._signed(seq - st["next"])
+                if behind < 0:
+                    if not (plen <= 1 and not syn and not fin and behind == -1):  # keep-alive probe
+                        issues.append("retransmit")
+                    if self._signed(end - st["next"]) > 0:
+                        st["next"] = end
+                else:
+                    if behind > 0:
+                        issues.append("gap")
+                    st["next"] = end
+        if "A" in flags and not (span or rst):
+            marker = (pkt.get("ack"), pkt.get("win"))
+            if st["ack"] == marker:
+                st["dups"] += 1
+                if st["dups"] >= 2:
+                    issues.append("dup-ack")
+            else:
+                st["ack"], st["dups"] = marker, 0
+        return issues
+
+
 def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
     """Ports, flags and a one-line summary for the transport layer; ``hdr``
     is how many bytes of ``data`` are header (the rest is payload)."""
@@ -146,9 +307,16 @@ def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
         names = "".join(n for n, bit in TCP_FLAGS if flags & bit) or "."
         out.update(sport=sport, dport=dport, hdr=min(hdr, len(data)), flags=names, win=win, seq=seq, ack=ack)
         out["info"] = f"{sport} → {dport} [{names}] win {win}"
-        name = tls_server_name(data[hdr:])
-        if name:
-            out.update(sni=name, app="tls", info=f"Client Hello → {name}")
+        payload = data[hdr:]
+        out["plen"] = len(payload)
+        if payload:
+            name = tls_server_name(payload)
+            if name:
+                out.update(sni=name, app="tls", info=f"Client Hello → {name}")
+            else:
+                http = decode_http(payload)
+                if http:
+                    out.update(http)
     elif proto == 17 and len(data) >= 8:
         sport, dport, length = struct.unpack("!HHH", data[:6])
         out.update(sport=sport, dport=dport, hdr=8)
@@ -157,6 +325,10 @@ def decode_l4(proto: int, data: bytes, v6: bool = False) -> dict:
             dns = decode_dns(data[8:])
             if dns:
                 out["info"], out["app"] = dns, "dns" if 53 in (sport, dport) else "mdns"
+        elif {sport, dport} == {67, 68} or (67 in (sport, dport) and 68 in (sport, dport)):
+            out.update(decode_dhcp(data[8:]) or {})
+        elif 123 in (sport, dport):
+            out.update(decode_ntp(data[8:]) or {})
     elif proto in (1, 58) and len(data) >= 4:
         kind, code = data[0], data[1]
         if proto == 58:
@@ -181,7 +353,8 @@ def decode_ip(data: bytes, hatype_note: str = "") -> dict | None:
         if frag & 0x1FFF:  # a later fragment has no transport header
             out.update(proto="IPv4 frag", hdr=ihl, info="fragment")
             return out
-        l4 = decode_l4(proto, data[ihl:])
+        end = total if ihl <= total <= len(data) else len(data)
+        l4 = decode_l4(proto, data[ihl:end])
         out.update(l4)
         out["proto"] = PROTOS.get(proto, f"proto {proto}")
         out["hdr"] = ihl + l4["hdr"]
@@ -198,7 +371,8 @@ def decode_ip(data: bytes, hatype_note: str = "") -> dict | None:
             proto, ext = data[pos], (data[pos + 1] + 1) * 8
             pos += ext
         out = {"src": src, "dst": dst, "ttl": hop, "ip": 6, "ip_len": plen + 40}
-        l4 = decode_l4(proto, data[pos:], v6=True)
+        end = 40 + plen if 40 + plen <= len(data) and plen else len(data)
+        l4 = decode_l4(proto, data[pos:end], v6=True)
         out.update(l4)
         out["proto"] = PROTOS.get(proto, f"proto {proto}")
         out["hdr"] = pos + l4["hdr"]
@@ -257,7 +431,7 @@ def matches(pkt: dict, flt: dict) -> bool:
         return False
     proto = flt.get("proto")
     if proto:
-        if proto in ("dns", "tls"):
+        if proto in ("dns", "tls", "http", "dhcp", "ntp"):
             return pkt.get("app") == proto
         if proto != pkt.get("proto", "").lower():
             return False
@@ -284,27 +458,68 @@ def emit(obj: dict) -> None:
     sys.stdout.flush()
 
 
-def run(config: dict) -> None:
-    iface = config.get("iface") or ""
-    duration = max(1, min(int(config.get("duration", 60)), 600))
-    flt = config.get("filter") or {}
-    keep_payload = bool(config.get("payload"))
-    expression = capture_filter.compile_filter(flt["expr"]) if flt.get("expr") else None
-    deadline = time.time() + duration
+def kernel_drops(sock: socket.socket) -> int:
+    """Packets the kernel had to throw away since the last call (reading the
+    counter resets it). 0 where the platform won't say."""
+    try:
+        return struct.unpack("II", sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))[1]
+    except (OSError, struct.error):
+        return 0
 
+
+def open_socket(iface: str, promisc: bool) -> tuple[socket.socket, bool]:
+    """The raw socket, bound and tuned; and whether kernel timestamps are on."""
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ALL))
     if iface and iface != "any":
         sock.bind((iface, 0))
+        if promisc:
+            # Dropped by the kernel when the socket closes, so it can't be left on.
+            try:
+                mreq = struct.pack("iHH8s", socket.if_nametoindex(iface), PACKET_MR_PROMISC, 0, b"")
+                sock.setsockopt(SOL_PACKET, PACKET_ADD_MEMBERSHIP, mreq)
+            except OSError as error:
+                sock.close()
+                raise OSError(f"couldn't enter promiscuous mode on {iface}: {error}") from error
     sock.settimeout(0.25)
     # Big enough that a burst between two reads isn't dropped by the kernel.
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
     except OSError:
         pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMPNS, 1)
+        stamped = True
+    except OSError:
+        stamped = False
+    return sock, stamped
+
+
+def read_packet(sock: socket.socket, stamped: bool) -> tuple[bytes, tuple, float | None]:
+    """(frame, address, kernel timestamp or None)."""
+    frame, ancillary, _flags, addr = sock.recvmsg(65535, socket.CMSG_SPACE(16) if stamped else 0)
+    for level, kind, data in ancillary:
+        if level == socket.SOL_SOCKET and kind == SO_TIMESTAMPNS and len(data) >= 16:
+            seconds, nanos = struct.unpack("qq", data[:16])
+            return frame, addr, seconds + nanos / 1e9
+    return frame, addr, None
+
+
+def run(config: dict) -> None:
+    iface = config.get("iface") or ""
+    duration = max(1, min(int(config.get("duration", 60)), 600))
+    flt = config.get("filter") or {}
+    payload_mode = config.get("payload") if config.get("payload") in PAYLOAD_BYTES else "none"
+    max_pps = MAX_PPS_FULL if payload_mode == "full" else MAX_PPS
+    expression = capture_filter.compile_filter(flt["expr"]) if flt.get("expr") else None
+    deadline = time.time() + duration
+
+    sock, stamped = open_socket(iface, bool(config.get("promisc")))
+    health = TcpHealth()
 
     totals = {"pkts": 0, "bytes": 0}
     protos: dict[str, list[int]] = {}
     flows: dict[tuple, list] = {}
+    issue_counts: dict[str, int] = {}
     sent_this_second, second_start, tick_at = 0, time.time(), time.time() + 1
     skipped_list = 0
     reason = "finished"
@@ -318,14 +533,15 @@ def run(config: dict) -> None:
                 top = sorted(flows.items(), key=lambda kv: kv[1][1], reverse=True)[:MAX_FLOWS]
                 emit({
                     "t": "tick", "ts": now, "pkts": totals["pkts"], "bytes": totals["bytes"],
-                    "protos": protos, "skipped": skipped_list,
+                    "protos": protos, "skipped": skipped_list, "drops": kernel_drops(sock),
+                    "issues": issue_counts,
                     "flows": [[*k, *v] for k, v in top],
                 })
-                totals, protos, flows = {"pkts": 0, "bytes": 0}, {}, {}
+                totals, protos, flows, issue_counts = {"pkts": 0, "bytes": 0}, {}, {}, {}
                 skipped_list = 0
                 tick_at = now + 1
             try:
-                frame, addr = sock.recvfrom(65535)
+                frame, addr, stamp = read_packet(sock, stamped)
             except socket.timeout:
                 continue
             except OSError as error:
@@ -333,8 +549,14 @@ def run(config: dict) -> None:
                 break
             ifname, _, pkttype, hatype = addr[0], addr[1], addr[2], addr[3]
             pkt = decode_frame(frame, hatype)
-            if pkt is None or not matches(pkt, flt) or (expression and not expression(pkt)):
+            if pkt is None:
                 continue
+            issues = health.check(pkt)  # before the filter: it needs both directions
+            if not matches(pkt, flt) or (expression and not expression(pkt)):
+                continue
+            if issues:
+                pkt["issues"] = issues
+                pkt["info"] += "  [" + ", ".join(ISSUE_LABELS[i] for i in issues) + "]"
             size = len(frame)
             totals["pkts"] += 1
             totals["bytes"] += size
@@ -342,26 +564,31 @@ def run(config: dict) -> None:
             row[0] += 1
             row[1] += size
             key = flow_key(pkt)
-            flow = flows.setdefault(key, [0, 0, 0, 0, None])  # pkts, bytes, out pkts, in pkts, server name
-            if pkt.get("sni"):
-                flow[4] = pkt["sni"]
+            # pkts, bytes, out pkts, in pkts, server/host name, issue counts
+            flow = flows.setdefault(key, [0, 0, 0, 0, None, {}])
+            name = pkt.get("sni") or pkt.get("name")
+            if name:
+                flow[4] = name
             flow[0] += 1
             flow[1] += size
             flow[2 if pkttype == 4 else 3] += 1
+            for issue in issues:
+                flow[5][issue] = flow[5].get(issue, 0) + 1
+                issue_counts[issue] = issue_counts.get(issue, 0) + 1
 
             if now - second_start >= 1:
                 second_start, sent_this_second = now, 0
-            if sent_this_second >= MAX_PPS:
+            if sent_this_second >= max_pps:
                 skipped_list += 1
                 continue
             sent_this_second += 1
-            keep = pkt.get("hdr", 0) + (PAYLOAD_BYTES if keep_payload else 0)
+            offset = pkt.pop("hdr", 0)
             pkt.update(
-                t="pkt", ts=now, len=size, iface=ifname,
+                t="pkt", ts=stamp or now, len=size, iface=ifname,
                 dir="out" if pkttype == 4 else "in",
-                svc=service(pkt), hex=frame[:keep].hex(),
+                svc=service(pkt), poff=offset, flow="|".join(str(part) for part in key),
+                hex=frame[:offset + PAYLOAD_BYTES[payload_mode]].hex(),
             )
-            pkt.pop("hdr", None)
             emit(pkt)
     except KeyboardInterrupt:
         reason = "stopped"

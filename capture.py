@@ -11,9 +11,12 @@ and the busiest conversations.
 Limits, because sniffing is sensitive even on your own network:
 
 - one capture at a time, ten minutes at most, then it stops by itself;
-- headers only unless payload is asked for, and then only 64 bytes of it
-  (the one exception is a TLS ClientHello's server name, which is read and
-  kept as a hostname — nothing else of the handshake is);
+- headers only unless payload is asked for: the first 64 bytes of it, or
+  whole packets (what "Follow stream" needs). Names read out of a payload —
+  a TLS server name, an HTTP Host and path (no query string), a DHCP host
+  name — are kept regardless;
+- promiscuous mode (see other devices' traffic on a mirror port) is a
+  separate, explicit switch and is recorded with the capture;
 - nothing is written to disk — stopping or restarting the agent discards it;
 - the filter is a host, a port, a protocol and/or an expression in the style of
   tcpdump (capture_filter.py), parsed here before anything starts.
@@ -35,9 +38,10 @@ from log import audit, log
 MAX_DURATION = 600
 DEFAULT_DURATION = 60
 MAX_PACKETS = 3000  # the ring the list and the pcap read from
+PAYLOAD_MODES = ("none", "64", "full")
 MAX_SERIES = 600  # one point a second
 MAX_FLOWS = 200
-FILTER_PROTOS = ("tcp", "udp", "icmp", "arp", "dns", "tls", "icmpv6")
+FILTER_PROTOS = ("tcp", "udp", "icmp", "arp", "dns", "tls", "http", "dhcp", "ntp", "icmpv6")
 LABEL = "homelab-agent-capture"
 
 _lock = threading.RLock()
@@ -97,6 +101,7 @@ def _fresh(config: dict) -> dict:
         "iface": config["iface"],
         "filter": config["filter"],
         "payload": config["payload"],
+        "promisc": config["promisc"],
         "duration": config["duration"],
         "started_at": time.time(),
         "finished_at": None,
@@ -108,6 +113,8 @@ def _fresh(config: dict) -> dict:
         "flows": {},  # key -> {..., pkts, bytes, first, last}
         "totals": {"pkts": 0, "bytes": 0},
         "unlisted": 0,  # packets counted but not kept in the list
+        "drops": 0,  # packets the kernel dropped because we read too slowly
+        "issues": {},  # TCP problem -> count
     }
 
 
@@ -133,6 +140,9 @@ def _ingest(job: dict, line: str) -> None:
             job["totals"]["pkts"] += msg["pkts"]
             job["totals"]["bytes"] += msg["bytes"]
             job["unlisted"] += msg.get("skipped", 0)
+            job["drops"] += msg.get("drops", 0)
+            for issue, count in msg.get("issues", {}).items():
+                job["issues"][issue] = job["issues"].get(issue, 0) + count
             for name, (pkts, size) in msg.get("protos", {}).items():
                 row = job["protocols"].setdefault(name, {"pkts": 0, "bytes": 0})
                 row["pkts"] += pkts
@@ -145,7 +155,7 @@ def _ingest(job: dict, line: str) -> None:
                         continue  # a scan or flood: keep what we have, stay bounded
                     flow = job["flows"][key] = {
                         "proto": proto, "a": a, "a_port": ap, "b": b, "b_port": bp,
-                        "pkts": 0, "bytes": 0, "out": 0, "in": 0, "name": None, "first": msg["ts"],
+                        "pkts": 0, "bytes": 0, "out": 0, "in": 0, "name": None, "issues": {}, "first": msg["ts"],
                     }
                 flow["pkts"] += pkts
                 flow["bytes"] += size
@@ -153,6 +163,9 @@ def _ingest(job: dict, line: str) -> None:
                 flow["in"] += inn
                 if extra and extra[0]:
                     flow["name"] = extra[0]
+                if len(extra) > 1:
+                    for issue, count in (extra[1] or {}).items():
+                        flow["issues"][issue] = flow["issues"].get(issue, 0) + count
                 flow["last"] = msg["ts"]
         elif kind == "end":
             reason = msg.get("reason", "")
@@ -221,11 +234,20 @@ def start(client, body: dict | None) -> dict:
     if not 5 <= duration <= MAX_DURATION:
         raise CaptureError(f"the duration must be between 5 and {MAX_DURATION} seconds")
 
+    payload = body.get("payload") or "none"
+    if payload is True:  # older callers sent a boolean
+        payload = "64"
+    if payload not in PAYLOAD_MODES:
+        raise CaptureError(f"payload must be one of {', '.join(PAYLOAD_MODES)}")
+    promisc = bool(body.get("promisc"))
+    if promisc and iface == "any":
+        raise CaptureError("promiscuous mode needs one interface, not all of them")
     config = {
         "iface": iface,
         "duration": duration,
         "filter": validate_filter(body.get("filter")),
-        "payload": bool(body.get("payload")),
+        "payload": payload,
+        "promisc": promisc,
     }
     try:
         _clear_stale(client)
@@ -247,8 +269,8 @@ def start(client, body: dict | None) -> dict:
     with _lock:
         _job, _container = job, container
     audit.info(
-        "packet capture started on %s for %ss filter=%s payload=%s",
-        iface, duration, config["filter"] or "none", config["payload"],
+        "packet capture started on %s for %ss filter=%s payload=%s promisc=%s",
+        iface, duration, config["filter"] or "none", config["payload"], config["promisc"],
     )
     threading.Thread(target=_read, args=(client, job, container), daemon=True).start()
     return snapshot(0)
@@ -285,6 +307,7 @@ def snapshot(after: int = 0, limit: int = 400) -> dict:
             "iface": job["iface"],
             "filter": job["filter"],
             "payload": job["payload"],
+            "promisc": job["promisc"],
             "duration": job["duration"],
             "started_at": job["started_at"],
             "finished_at": job["finished_at"],
@@ -296,6 +319,8 @@ def snapshot(after: int = 0, limit: int = 400) -> dict:
             "packets": [dict(p) for p in packets],
             "last": job["seq"],
             "unlisted": job["unlisted"],
+            "drops": job["drops"],
+            "issues": dict(job["issues"]),
         }
 
 
