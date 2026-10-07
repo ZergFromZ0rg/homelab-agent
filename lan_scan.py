@@ -43,14 +43,15 @@ HELPER_TIMEOUT = 60
 
 # Tried in order until one answers or refuses; any reply at all means "alive".
 LIVENESS_PORTS = (80, 443, 22, 445, 53, 8080, 139, 3389, 62078)
-# What a live host is asked about.
+# What a live host is asked about. 9100 is left unnamed: it is both raw
+# printing (JetDirect) and Prometheus node-exporter.
 SERVICES = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http",
     110: "pop3", 139: "netbios", 143: "imap", 443: "https", 445: "smb",
     548: "afp", 631: "ipp", 1883: "mqtt", 2049: "nfs", 3000: "http",
     3306: "mysql", 3389: "rdp", 5000: "http", 5432: "postgres", 5900: "vnc",
     8000: "http", 8080: "http", 8096: "jellyfin", 8123: "agent", 8443: "https",
-    8989: "sonarr", 9000: "http", 9090: "http", 9100: "printer", 32400: "plex",
+    8989: "sonarr", 9000: "http", 9090: "http", 9100: "9100", 32400: "plex",
     51820: "wireguard",
 }
 SKIP_IFACE = ("lo", "docker", "br-", "veth", "virbr", "tailscale", "wg", "tun")
