@@ -103,8 +103,12 @@ def dns_name(data: bytes, pos: int, depth: int = 0) -> tuple[str, int]:
     return ".".join(labels), end
 
 
-def decode_dns(data: bytes) -> str | None:
-    """"A example.com?" for a query, "A example.com → 1.2.3.4" for an answer."""
+def parse_dns(data: bytes) -> tuple[str, list[list[str]]] | None:
+    """(summary, [[name, address], ...]) for a DNS message. The summary reads
+    "A example.com?" for a query and "A example.com → 1.2.3.4" for an answer;
+    the pairs are the *asked-for* name with each address it resolved to, which
+    is what lets the viewer name an address it only ever saw as a number (a
+    CNAME's target would be the less useful name)."""
     if len(data) < 12:
         return None
     ident, flags, qd, an = struct.unpack("!HHHH", data[:8])
@@ -115,25 +119,34 @@ def decode_dns(data: bytes) -> str | None:
         qtype = struct.unpack("!H", data[pos:pos + 2])[0]
         kind = DNS_TYPES.get(qtype, str(qtype))
         if not flags & 0x8000:
-            return f"{kind} {name}?"
+            return f"{kind} {name}?", []
         rcode = flags & 0xF
         if rcode:
-            return f"{kind} {name} → {('NXDOMAIN' if rcode == 3 else 'rcode %d' % rcode)}"
-        answers, pos = [], pos + 4
-        for _ in range(min(an, 4)):
+            return f"{kind} {name} → {('NXDOMAIN' if rcode == 3 else 'rcode %d' % rcode)}", []
+        found, shown, pos = [], [], pos + 4
+        for _ in range(min(an, 8)):
             _, pos = dns_name(data, pos)
             rtype, _, _, rdlen = struct.unpack("!HHIH", data[pos:pos + 10])
             rdata = data[pos + 10:pos + 10 + rdlen]
             pos += 10 + rdlen
+            address = None
             if rtype == 1 and rdlen == 4:
-                answers.append(socket.inet_ntoa(rdata))
+                address = socket.inet_ntoa(rdata)
             elif rtype == 28 and rdlen == 16:
-                answers.append(socket.inet_ntop(socket.AF_INET6, rdata))
+                address = socket.inet_ntop(socket.AF_INET6, rdata)
             elif rtype in (5, 12):
-                answers.append(dns_name(data, pos - rdlen)[0])
-        return f"{kind} {name} → {', '.join(answers) if answers else 'no answer'}"
+                shown.append(dns_name(data, pos - rdlen)[0])
+            if address:
+                shown.append(address)
+                found.append([name, address])
+        return f"{kind} {name} → {', '.join(shown[:4]) if shown else 'no answer'}", found
     except (ValueError, struct.error, IndexError):
-        return f"{ident:#06x} (truncated)"
+        return f"{ident:#06x} (truncated)", []
+
+
+def decode_dns(data: bytes) -> str | None:
+    parsed = parse_dns(data)
+    return parsed[0] if parsed else None
 
 
 def tls_server_name(data: bytes) -> str | None:
@@ -198,6 +211,9 @@ def decode_dhcp(data: bytes) -> dict | None:
     out = {"app": "dhcp", "info": " ".join(parts)}
     if host:
         out["name"] = host
+    # The parts a watcher needs, so it doesn't parse the summary text.
+    server = socket.inet_ntoa(options[54]) if len(options.get(54, b"")) == 4 else None
+    out["dhcp"] = {"type": kind, "server": server, "yiaddr": yiaddr, "client": client, "name": host}
     return out
 
 
@@ -326,9 +342,11 @@ def decode_l4(proto: int, data: bytes) -> dict:
         out.update(sport=sport, dport=dport, hdr=8)
         out["info"] = f"{sport} → {dport} len {max(0, length - 8)}"
         if 53 in (sport, dport) or 5353 in (sport, dport):
-            dns = decode_dns(data[8:])
+            dns = parse_dns(data[8:])
             if dns:
-                out["info"], out["app"] = dns, "dns" if 53 in (sport, dport) else "mdns"
+                out["info"], out["app"] = dns[0], "dns" if 53 in (sport, dport) else "mdns"
+                if dns[1] and 53 in (sport, dport):  # mDNS answers name local devices, not remote hosts
+                    out["answers"] = dns[1]
         elif sport in (67, 68) and dport in (67, 68):  # client↔server, or relay↔server (67↔67)
             out.update(decode_dhcp(data[8:]) or {})
         elif 123 in (sport, dport):
@@ -419,7 +437,12 @@ def _decode_frame(frame: bytes, hatype: int) -> dict | None:
         sha, spa = mac(frame[pos + 8:pos + 14]), socket.inet_ntoa(frame[pos + 14:pos + 18])
         tpa = socket.inet_ntoa(frame[pos + 24:pos + 28])
         info = f"who has {tpa}? tell {spa}" if op == 1 else f"{spa} is at {sha}"
-        return {"proto": "ARP", "src": spa, "dst": tpa, "src_mac": src_mac, "dst_mac": dst_mac, "info": info, "hdr": pos + 28, "l2": pos}
+        return {
+            "proto": "ARP", "src": spa, "dst": tpa, "src_mac": src_mac, "dst_mac": dst_mac, "info": info,
+            # The sender's claimed hardware address, which is not always the Ethernet source (spoofing).
+            "arp": {"op": op, "sha": sha, "spa": spa, "tpa": tpa},
+            "hdr": pos + 28, "l2": pos,
+        }
     if ethertype == 0x88CC:
         return {"proto": "LLDP", "src": src_mac, "dst": dst_mac, "src_mac": src_mac, "dst_mac": dst_mac, "info": "", "hdr": pos, "l2": pos}
     return {"proto": f"eth {ethertype:#06x}", "src": src_mac, "dst": dst_mac, "src_mac": src_mac, "dst_mac": dst_mac, "info": "", "hdr": pos, "l2": pos}
@@ -581,6 +604,8 @@ def run(config: dict) -> None:
                 continue
             sent_this_second += 1
             offset = pkt.pop("hdr", 0)
+            pkt.pop("arp", None)  # structured records are for the watcher; the list has the summary
+            pkt.pop("dhcp", None)
             pkt.update(
                 t="pkt", ts=stamp or time.time(), len=size, iface=ifname,
                 dir=PACKET_TYPES.get(pkttype, "in"),

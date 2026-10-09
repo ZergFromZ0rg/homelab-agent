@@ -23,6 +23,7 @@ import config
 import capture
 import connections
 import lan_scan
+import netwatch
 import disk_usage
 import files
 import compose_edit
@@ -814,6 +815,7 @@ def startup_event():
     host_control.start_loop(client)
     stack_backup.start()
     registrar.start()
+    netwatch.resume(client)  # the watch stays on across an agent restart if it was on
 
 def _own_working_dir() -> str | None:
     """This agent's own checkout, as seen from inside the container.
@@ -1291,11 +1293,26 @@ def get_network_scan(x_agent_token: str | None = Header(default=None)):
     return lan_scan.snapshot()
 
 
+@app.get("/netwatch")
+def get_netwatch(x_agent_token: str | None = Header(default=None)):
+    require_agent_token(x_agent_token)
+    return netwatch.snapshot()
+
+
+@app.post("/netwatch")
+def post_netwatch(body: dict | None = None, x_agent_token: str | None = Header(default=None)):
+    """Turn the network watch on or off — see netwatch.py for what it reads."""
+    require_agent_token(x_agent_token)
+    if (body or {}).get("enabled"):
+        return netwatch.enable(client)
+    return netwatch.disable(client)
+
+
 @app.get("/capture/interfaces")
 def get_capture_interfaces(x_agent_token: str | None = Header(default=None)):
     require_agent_token(x_agent_token)
     try:
-        return capture.interfaces(client)
+        return capture.context(client)
     except lan_scan.ScanError as error:
         return JSONResponse(status_code=400, content={"error": str(error)})
 

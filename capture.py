@@ -11,6 +11,9 @@ and the busiest conversations.
 Limits, because sniffing is sensitive even on your own network:
 
 - one capture at a time, ten minutes at most, then it stops by itself;
+- the host's network, or one running container's: the helper joins that
+  container's network namespace (``container:<id>``), which is what makes
+  "what is qbittorrent actually talking to?" a one-click question;
 - headers only unless payload is asked for: the first 64 bytes of it, or
   whole packets (what "Follow stream" needs). Names read out of a payload —
   a TLS server name, an HTTP Host and path (no query string), a DHCP host
@@ -30,6 +33,8 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
+import re
 import struct
 import threading
 import time
@@ -37,6 +42,7 @@ import time
 from docker.types import LogConfig
 
 import capture_filter
+import connections
 import lan_scan
 import rebuild
 from log import audit, log
@@ -47,10 +53,13 @@ MAX_PACKETS = 3000  # the ring the list and the pcap read from
 PAYLOAD_MODES = ("none", "64", "full")
 MAX_SERIES = 600  # one point a second
 MAX_FLOWS = 200
+MAX_NAMES = 2000  # addresses named by DNS answers seen during one capture
 INTERFACES_TTL = 30  # seconds: listing them costs a helper container run
 STDERR_LINES = 5  # kept from the helper, to say why it died
 FILTER_PROTOS = ("tcp", "udp", "icmp", "arp", "dns", "tls", "http", "dhcp", "ntp", "icmpv6")
 LABEL = "homelab-agent-capture"
+HOST_NAME = os.getenv("HOST_NAME", "this host")
+_IFACE = re.compile(r"^[A-Za-z0-9_.:@-]{1,15}$")  # a Linux interface name
 
 _lock = threading.RLock()
 _job: dict | None = None
@@ -107,11 +116,32 @@ def interfaces(client) -> dict:
         if _interfaces_cache and time.monotonic() - _interfaces_cache[0] < INTERFACES_TTL:
             return _interfaces_cache[1]
     host = lan_scan.read_host(client)
-    names = [i["name"] for i in host.get("ifaces", []) if i.get("ip")]
-    found = {"default": host.get("default"), "interfaces": names}
+    ifaces = [i for i in host.get("ifaces", []) if i.get("ip")]
+    found = {
+        "default": host.get("default"),
+        "interfaces": [i["name"] for i in ifaces],
+        # This host's own LAN addresses, so the viewer can call them by name.
+        "addresses": [i["ip"] for i in ifaces if not i["name"].startswith(lan_scan.SKIP_IFACE)],
+    }
     with _lock:
         _interfaces_cache = (time.monotonic(), found)
     return found
+
+
+def context(client) -> dict:
+    """Everything the page needs to set a capture up and read it: the host's
+    interfaces, the running containers (a capture can join one's network) and
+    the names of the addresses this host knows — its own, and each container's."""
+    found = interfaces(client)
+    containers, names = [], {}
+    for item in connections.container_map(client):
+        containers.append({"name": item["name"], "ips": item["ips"]})
+        for ip in item["ips"]:
+            names[ip] = item["name"]
+    for ip in found.get("addresses", []):
+        names.setdefault(ip, HOST_NAME)
+    containers.sort(key=lambda c: c["name"])
+    return {**found, "host": HOST_NAME, "containers": containers, "names": names}
 
 
 def _fresh(config: dict) -> dict:
@@ -121,6 +151,7 @@ def _fresh(config: dict) -> dict:
         "filter": config["filter"],
         "payload": config["payload"],
         "promisc": config["promisc"],
+        "container": config.get("container"),
         "duration": config["duration"],
         "started_at": time.time(),
         "finished_at": None,
@@ -134,6 +165,7 @@ def _fresh(config: dict) -> dict:
         "unlisted": 0,  # packets counted but not kept in the list
         "drops": 0,  # packets the kernel dropped because we read too slowly
         "issues": {},  # TCP problem -> count
+        "names": {},  # address -> the name DNS answers in this capture gave it
     }
 
 
@@ -162,6 +194,9 @@ def _apply(job: dict, kind: str, msg: dict) -> None:
             job["seq"] += 1
             msg["n"] = job["seq"]
             msg.pop("t", None)
+            for name, address in msg.get("answers") or []:
+                if address in job["names"] or len(job["names"]) < MAX_NAMES:
+                    job["names"][address] = name
             job["packets"].append(msg)
             if len(job["packets"]) > MAX_PACKETS:
                 del job["packets"][: len(job["packets"]) - MAX_PACKETS]
@@ -270,18 +305,39 @@ def start(client, body: dict | None) -> dict:
         with _lock:
             _starting = False
     audit.info(
-        "packet capture started on %s for %ss filter=%s payload=%s promisc=%s",
-        config["iface"], config["duration"], config["filter"] or "none", config["payload"], config["promisc"],
+        "packet capture started on %s%s for %ss filter=%s payload=%s promisc=%s",
+        f"{config['container']}'s network, " if config["container"] else "", config["iface"], config["duration"],
+        config["filter"] or "none", config["payload"], config["promisc"],
     )
     threading.Thread(target=_read, args=(job, container, stream), daemon=True).start()
     return snapshot(0)
 
 
+def _target_container(client, name: str):
+    """The running container a capture should join, or CaptureError."""
+    try:
+        container = client.containers.get(name)
+    except Exception as error:  # noqa: BLE001 - not found, or the daemon is unwell
+        raise CaptureError(f"no container called {name!r} on this host") from error
+    if container.status != "running":
+        raise CaptureError(f"{container.name} isn't running, so it has no network to capture")
+    return container
+
+
 def _validated(client, body: dict) -> dict:
-    available = interfaces(client)
-    iface = str(body.get("iface") or available["default"] or "").strip()
-    if iface != "any" and iface not in available["interfaces"]:
-        raise CaptureError(f"{iface or 'no interface'!r} isn't a capturable interface on this host")
+    container = str(body.get("container") or "").strip()
+    target = _target_container(client, container) if container else None
+    if target is not None:
+        # Interfaces are those inside the container, which the host can't list;
+        # "any" is safe there (one namespace: a packet crosses one interface).
+        iface = str(body.get("iface") or "any").strip()
+        if iface != "any" and not _IFACE.match(iface):
+            raise CaptureError(f"{iface!r} isn't an interface name")
+    else:
+        available = interfaces(client)
+        iface = str(body.get("iface") or available["default"] or "").strip()
+        if iface != "any" and iface not in available["interfaces"]:
+            raise CaptureError(f"{iface or 'no interface'!r} isn't a capturable interface on this host")
     try:
         duration = int(body.get("duration") or DEFAULT_DURATION)
     except (TypeError, ValueError) as error:
@@ -303,6 +359,8 @@ def _validated(client, body: dict) -> dict:
         "filter": validate_filter(body.get("filter")),
         "payload": payload,
         "promisc": promisc,
+        "container": target.name if target is not None else None,
+        "network_mode": f"container:{target.id}" if target is not None else "host",
     }
 
 
@@ -319,11 +377,11 @@ def _launch(client, config: dict):
         container = client.containers.create(
             rebuild.helper_image(client),
             ["python", "/app/capture_worker.py"],
-            network_mode="host",
+            network_mode=config["network_mode"],
             cap_drop=["ALL"],
             cap_add=["NET_RAW"],
             read_only=True,
-            environment={"CAPTURE_CONFIG": json.dumps(config)},
+            environment={"CAPTURE_CONFIG": json.dumps({k: v for k, v in config.items() if k != "network_mode"})},
             labels={LABEL: "1"},
             log_config=LogConfig(type=LogConfig.types.NONE),
         )
@@ -385,6 +443,8 @@ def snapshot(after: int = 0, limit: int = MAX_PACKETS) -> dict:
             "unlisted": job["unlisted"],
             "drops": job["drops"],
             "issues": dict(job["issues"]),
+            "container": job["container"],
+            "names": dict(job["names"]),
         }
 
 

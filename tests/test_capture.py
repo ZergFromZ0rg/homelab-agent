@@ -732,3 +732,155 @@ def test_arp_for_other_hardware_is_not_misread_as_ethernet_arp():
 def test_dhcp_between_relay_and_server_is_read_too():
     pkt = udp(67, 67, dhcp(1), src="10.0.0.1", dst="192.168.1.1")
     assert pkt["app"] == "dhcp" and pkt["info"].startswith("DHCP Discover")
+
+
+# --- names, and capturing inside a container ---------------------------------------------
+
+def dns_response(name, addresses, cname=None):
+    question = dns_query(name)
+    body = question[:2] + struct.pack("!H", 0x8180) + struct.pack("!HHHH", 1, len(addresses) + (1 if cname else 0), 0, 0) + question[12:]
+    if cname:
+        target = b"".join(bytes([len(p)]) + p.encode() for p in cname.split(".")) + b"\0"
+        body += b"\xc0\x0c" + struct.pack("!HHIH", 5, 1, 60, len(target)) + target
+    for address in addresses:
+        raw = socket.inet_pton(socket.AF_INET6 if ":" in address else socket.AF_INET, address)
+        body += b"\xc0\x0c" + struct.pack("!HHIH", 28 if ":" in address else 1, 1, 60, len(raw)) + raw
+    return body
+
+
+def test_dns_answers_pair_the_asked_for_name_with_each_address():
+    body = dns_response("media.example.com", ["10.0.0.5", "2001:db8::5"])
+    info, found = w.parse_dns(body)
+    assert info == "A media.example.com → 10.0.0.5, 2001:db8::5"
+    assert found == [["media.example.com", "10.0.0.5"], ["media.example.com", "2001:db8::5"]]
+    # Through a CNAME the name worth showing is still the one that was asked for.
+    _, via_cname = w.parse_dns(dns_response("www.example.com", ["93.184.216.34"], cname="edge.cdn.example.net"))
+    assert via_cname == [["www.example.com", "93.184.216.34"]]
+
+
+def test_queries_failures_and_truncated_answers_name_nothing():
+    assert w.parse_dns(dns_query("a.example.com"))[1] == []
+    assert w.parse_dns(dns_response("a.example.com", ["10.0.0.5"])[:40])[1] == []
+    assert w.parse_dns(b"short") is None
+    assert w.decode_dns(dns_query("a.example.com")) == "A a.example.com?"  # the old entry point still answers
+
+
+def test_a_dns_reply_packet_carries_its_answers_but_mdns_does_not():
+    reply = _pkt(eth(0x0800, ipv4(17, struct.pack("!HHHH", 53, 40000, 8 + len(dns_response("nas.lan", ["192.168.1.20"])), 0)
+                                  + dns_response("nas.lan", ["192.168.1.20"]), src="192.168.1.1", dst="192.168.1.10")))
+    assert reply["answers"] == [["nas.lan", "192.168.1.20"]]
+    body = dns_response("printer.local", ["192.168.1.42"])
+    mdns = _pkt(eth(0x0800, ipv4(17, struct.pack("!HHHH", 5353, 5353, 8 + len(body), 0) + body, dst="224.0.0.251")))
+    assert mdns["app"] == "mdns" and "answers" not in mdns  # local announcements aren't a remote host's name
+
+
+def test_the_agent_remembers_which_name_an_address_was_given_in_this_capture():
+    packet = {"t": "pkt", "ts": 1.0, "len": 80, "hex": "", "proto": "UDP", "src": "a", "dst": "b", "l2": 14,
+              "answers": [["media.example.com", "10.0.0.5"]]}
+    later = {**packet, "answers": [["media.example.com", "10.0.0.6"], ["media.example.com", "10.0.0.5"]]}
+    capture.start(_client(FakeContainer([packet, later, {"t": "end", "reason": "finished", "ts": 2}])), {})
+    assert _wait_done()["names"] == {"10.0.0.5": "media.example.com", "10.0.0.6": "media.example.com"}
+
+
+def test_the_names_map_is_bounded(monkeypatch):
+    monkeypatch.setattr(capture, "MAX_NAMES", 3)
+    packets = [{"t": "pkt", "ts": 1.0, "len": 1, "hex": "", "proto": "UDP", "src": "a", "dst": "b", "l2": 14,
+                "answers": [[f"h{i}.example.com", f"10.0.0.{i}"]]} for i in range(10)]
+    capture.start(_client(FakeContainer([*packets, {"t": "end", "reason": "finished", "ts": 2}])), {})
+    assert len(_wait_done()["names"]) == 3
+
+
+class FakeDocker:
+    """Just enough of a container for the target lookup."""
+
+    def __init__(self, name, status="running", cid="c0ffee" * 10 + "abcd", ips=()):
+        self.name, self.status, self.id, self.short_id = name, status, cid, cid[:12]
+        self.attrs = {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": ip} for ip in ips[:1]}}, "HostConfig": {}}
+
+
+def _client_with_containers(*containers):
+    client = _client(FakeContainer([{"t": "end", "reason": "finished", "ts": 1}]))
+    by_name = {c.name: c for c in containers}
+
+    def get(name):
+        if name not in by_name:
+            raise RuntimeError("404 not found")
+        return by_name[name]
+
+    client.containers.get.side_effect = get
+    client.containers.list.return_value = list(containers)
+    return client
+
+
+def test_a_capture_can_join_one_containers_network():
+    client = _client_with_containers(FakeDocker("jellyfin", ips=["172.18.0.4"]))
+    capture.start(client, {"container": "jellyfin"})
+    kwargs = client.containers.create.call_args.kwargs
+    assert kwargs["network_mode"] == f"container:{'c0ffee' * 10 + 'abcd'}"  # joins its namespace; not the host's
+    config = json.loads(kwargs["environment"]["CAPTURE_CONFIG"])
+    assert config["container"] == "jellyfin" and config["iface"] == "any"
+    assert "network_mode" not in config  # a docker detail, not the sniffer's
+    assert kwargs["cap_add"] == ["NET_RAW"] and kwargs["log_config"]["Type"] == "none"
+    out = _wait_done()
+    assert out["container"] == "jellyfin" and out["iface"] == "any"
+
+
+def test_the_host_network_is_still_the_default():
+    client = _client(FakeContainer([{"t": "end", "reason": "finished", "ts": 1}]))
+    capture.start(client, {})
+    assert client.containers.create.call_args.kwargs["network_mode"] == "host"
+    assert _wait_done()["container"] is None
+
+
+@pytest.mark.parametrize("body,message", [
+    ({"container": "nope"}, "no container called 'nope'"),
+    ({"container": "db"}, "isn't running"),
+    ({"container": "jellyfin", "iface": "eth0; rm -rf /"}, "isn't an interface name"),
+    ({"container": "jellyfin", "promisc": True}, "promiscuous mode needs one interface"),
+])
+def test_a_container_capture_refuses_bad_requests_before_starting(body, message):
+    client = _client_with_containers(FakeDocker("jellyfin"), FakeDocker("db", status="exited"))
+    with pytest.raises(capture.CaptureError, match=message):
+        capture.start(client, body)
+    client.containers.create.assert_not_called()
+    assert capture._starting is False
+
+
+def test_inside_a_container_a_named_interface_and_promiscuous_mode_are_allowed():
+    client = _client_with_containers(FakeDocker("jellyfin"))
+    capture.start(client, {"container": "jellyfin", "iface": "eth0", "promisc": True})
+    config = json.loads(client.containers.create.call_args.kwargs["environment"]["CAPTURE_CONFIG"])
+    assert (config["iface"], config["promisc"]) == ("eth0", True)
+
+
+def test_the_context_lists_interfaces_containers_and_every_name_it_knows(monkeypatch):
+    monkeypatch.setattr(capture.lan_scan, "read_host", lambda c: {
+        "default": "eth0",
+        "ifaces": [{"name": "eth0", "ip": "192.168.1.10"}, {"name": "docker0", "ip": "172.17.0.1"}, {"name": "tailscale0", "ip": "100.64.0.5"}],
+    })
+    monkeypatch.setattr(capture, "HOST_NAME", "thinkpad")
+    client = _client_with_containers(FakeDocker("qbittorrent", ips=["172.18.0.4"]), FakeDocker("jellyfin", ips=["172.18.0.2"]))
+    ctx = capture.context(client)
+    assert ctx["default"] == "eth0" and ctx["host"] == "thinkpad"
+    assert [c["name"] for c in ctx["containers"]] == ["jellyfin", "qbittorrent"]  # sorted
+    assert ctx["names"] == {"172.18.0.4": "qbittorrent", "172.18.0.2": "jellyfin", "192.168.1.10": "thinkpad"}
+    assert ctx["addresses"] == ["192.168.1.10"]  # not the Docker bridge or the VPN
+
+
+def test_the_context_route_is_the_interfaces_route_and_is_gated(monkeypatch):
+    monkeypatch.setattr(main, "AGENT_TOKEN", "secret")
+    http = TestClient(main.app)
+    assert http.get("/capture/interfaces").status_code == 401
+    monkeypatch.setattr(main, "AGENT_TOKEN", "")
+    monkeypatch.setattr(main.capture, "context", lambda c: {"default": "eth0", "containers": []})
+    assert http.get("/capture/interfaces").json()["containers"] == []
+
+
+def test_structured_arp_and_dhcp_records_are_for_the_watcher_not_the_capture_list(monkeypatch):
+    request = _pkt(eth(0x0806, struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1, CLIENT_MAC, socket.inet_aton("192.168.1.10"),
+                                           bytes(6), socket.inet_aton("192.168.1.99"))))
+    assert request["arp"] == {"op": 1, "sha": "aa:bb:cc:00:00:01", "spa": "192.168.1.10", "tpa": "192.168.1.99"}
+    out = _run_worker(monkeypatch, [(eth(0x0806, struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 1, CLIENT_MAC,
+                                         socket.inet_aton("192.168.1.10"), bytes(6), socket.inet_aton("192.168.1.99"))), 0)])
+    [listed] = [m for m in out if m["t"] == "pkt"]
+    assert "arp" not in listed and "dhcp" not in listed and listed["info"].startswith("who has")
