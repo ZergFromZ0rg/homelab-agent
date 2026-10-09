@@ -491,3 +491,61 @@ def test_routes_are_token_gated_and_toggle_the_watch(monkeypatch):
     assert http.post("/netwatch", json={"enabled": False}).json() == {"enabled": False}
     assert http.post("/netwatch").json() == {"enabled": False}  # no body means off, never on
     assert calls == ["on", "off", "off"]
+
+
+# --- review fixes ---------------------------------------------------------------------------
+
+def test_a_flood_of_new_devices_cannot_push_the_gateway_alert_out():
+    d = detector()
+    d.learning_until = 0
+    d.observe_arp("192.168.1.1", MAC_GW, T0)
+    d.observe_arp("192.168.1.1", MAC_GW2, T0 + 1)  # the alert
+    for i in range(500):  # a phone that randomises its MAC, or someone doing it on purpose
+        d.observe_arp(f"10.0.{i >> 8}.{(i & 255) + 1}", f"02:00:00:00:{i >> 8:02x}:{i & 255:02x}", T0 + 2 + i)
+    kinds_kept = [f["kind"] for f in d.findings.values()]
+    assert "gateway-changed" in kinds_kept
+    assert kinds_kept.count("new-device") <= netwatch.MAX_INFO_FINDINGS
+    assert len(d.active(T0 + 600)) == 1  # and it is still an alert
+
+
+def test_when_everything_is_serious_the_oldest_of_the_least_serious_goes_first(monkeypatch):
+    monkeypatch.setattr(netwatch, "MAX_FINDINGS", 4)
+    d = detector()
+    d.learning_until = 0
+    d.observe_arp("192.168.1.1", MAC_GW, T0)
+    d.observe_arp("192.168.1.1", MAC_GW2, T0 + 1)  # bad
+    for i in range(6):  # warnings, newer than the bad one
+        ip = f"192.168.1.{20 + i}"
+        d.observe_arp(ip, MAC_A, T0 + 10 + i)
+        d.observe_arp(ip, MAC_B, T0 + 20 + i)
+    severities = sorted(f["severity"] for f in d.findings.values())
+    assert len(d.findings) == 4 and "bad" in severities  # the older bad one outlived newer warnings
+
+
+def test_state_is_serialised_while_the_lock_is_held(tmp_path, monkeypatch):
+    seen = []
+    real = netwatch.json.dumps
+    monkeypatch.setattr(netwatch.json, "dumps", lambda *a, **k: (seen.append(netwatch._lock._is_owned()), real(*a, **k))[1])
+    netwatch._detector = netwatch.Detector(None, now=T0)
+    netwatch._detector.observe_arp("192.168.1.30", MAC_A, T0)
+    netwatch._save(force=True)
+    assert seen == [True]  # otherwise the watcher thread can change a table mid-encode
+
+
+def test_a_failed_save_is_retried_not_forgotten(tmp_path, monkeypatch):
+    netwatch._detector = netwatch.Detector(None, now=T0)
+    netwatch._detector.observe_arp("192.168.1.30", MAC_A, T0)
+    monkeypatch.setattr(netwatch, "STATE_FILE", tmp_path / "no" / "such" / "dir" / "x.json")
+    monkeypatch.setattr(netwatch.Path, "mkdir", lambda *a, **k: (_ for _ in ()).throw(OSError("read-only file system")))
+    netwatch._save(force=True)
+    assert netwatch._detector.dirty is True
+
+
+@pytest.mark.parametrize("value,expected", [(True, "on"), (False, "off"), ("false", "off"), ("true", "off"), (1, "off"), (None, "off"), ("", "off")])
+def test_only_a_real_true_switches_the_watch_on(monkeypatch, value, expected):
+    monkeypatch.setattr(main, "AGENT_TOKEN", "")
+    calls = []
+    monkeypatch.setattr(main.netwatch, "enable", lambda c: calls.append("on") or {})
+    monkeypatch.setattr(main.netwatch, "disable", lambda c=None: calls.append("off") or {})
+    TestClient(main.app).post("/netwatch", json={"enabled": value})
+    assert calls == [expected]

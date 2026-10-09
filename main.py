@@ -1303,7 +1303,7 @@ def get_netwatch(x_agent_token: str | None = Header(default=None)):
 def post_netwatch(body: dict | None = None, x_agent_token: str | None = Header(default=None)):
     """Turn the network watch on or off — see netwatch.py for what it reads."""
     require_agent_token(x_agent_token)
-    if (body or {}).get("enabled"):
+    if (body or {}).get("enabled") is True:  # not merely truthy: the string "false" must not switch it on
         return netwatch.enable(client)
     return netwatch.disable(client)
 

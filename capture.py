@@ -92,6 +92,8 @@ def validate_filter(raw: dict | None) -> dict:
             raise CaptureError(f"{host!r} isn't an IP address") from error
     port = raw.get("port")
     if port not in (None, ""):
+        if isinstance(port, bool):
+            raise CaptureError("the port must be a number")
         try:
             port = int(port)
         except (TypeError, ValueError) as error:
@@ -134,7 +136,12 @@ def context(client) -> dict:
     the names of the addresses this host knows — its own, and each container's."""
     found = interfaces(client)
     containers, names = [], {}
-    for item in connections.container_map(client):
+    try:
+        listed = connections.container_map(client)
+    except Exception as error:  # noqa: BLE001 - the interfaces are still worth showing
+        log.warning("capture: couldn't list containers: %s", error)
+        listed = []
+    for item in listed:
         containers.append({"name": item["name"], "ips": item["ips"]})
         for ip in item["ips"]:
             names[ip] = item["name"]
@@ -350,7 +357,7 @@ def _validated(client, body: dict) -> dict:
         payload = "64"
     if payload not in PAYLOAD_MODES:
         raise CaptureError(f"payload must be one of {', '.join(PAYLOAD_MODES)}")
-    promisc = bool(body.get("promisc"))
+    promisc = body.get("promisc") is True  # not merely truthy: "false" is a string
     if promisc and iface == "any":
         raise CaptureError("promiscuous mode needs one interface, not all of them")
     return {

@@ -102,8 +102,7 @@ def events_from(pkt: dict) -> list[dict]:
         out.append({"t": "arp", "ip": arp["spa"], "mac": arp["sha"], "op": arp["op"], "eth": pkt.get("src_mac")})
     dhcp = pkt.get("dhcp")
     if dhcp:
-        out.append({"t": "dhcp", **{k: v for k, v in dhcp.items() if k != "client"}, "client": dhcp["client"],
-                    "src": pkt.get("src"), "eth": pkt.get("src_mac")})
+        out.append({"t": "dhcp", **dhcp, "src": pkt.get("src"), "eth": pkt.get("src_mac")})
     return out
 
 

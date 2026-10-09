@@ -123,23 +123,30 @@ def parse_dns(data: bytes) -> tuple[str, list[list[str]]] | None:
         rcode = flags & 0xF
         if rcode:
             return f"{kind} {name} → {('NXDOMAIN' if rcode == 3 else 'rcode %d' % rcode)}", []
-        found, shown, pos = [], [], pos + 4
+        found, shown, pos, cut = [], [], pos + 4, False
         for _ in range(min(an, 8)):
-            _, pos = dns_name(data, pos)
-            rtype, _, _, rdlen = struct.unpack("!HHIH", data[pos:pos + 10])
-            rdata = data[pos + 10:pos + 10 + rdlen]
-            pos += 10 + rdlen
-            address = None
-            if rtype == 1 and rdlen == 4:
-                address = socket.inet_ntoa(rdata)
-            elif rtype == 28 and rdlen == 16:
-                address = socket.inet_ntop(socket.AF_INET6, rdata)
-            elif rtype in (5, 12):
-                shown.append(dns_name(data, pos - rdlen)[0])
+            try:
+                _, pos = dns_name(data, pos)
+                rtype, _, _, rdlen = struct.unpack("!HHIH", data[pos:pos + 10])
+                rdata = data[pos + 10:pos + 10 + rdlen]
+                if len(rdata) != rdlen:  # the message ends inside this record
+                    raise ValueError("truncated")
+                pos += 10 + rdlen
+                address = None
+                if rtype == 1 and rdlen == 4:
+                    address = socket.inet_ntoa(rdata)
+                elif rtype == 28 and rdlen == 16:
+                    address = socket.inet_ntop(socket.AF_INET6, rdata)
+                elif rtype in (5, 12):
+                    shown.append(dns_name(data, pos - rdlen)[0])
+            except (ValueError, struct.error, IndexError):
+                cut = True  # keep the answers that did parse; say the rest is missing
+                break
             if address:
                 shown.append(address)
                 found.append([name, address])
-        return f"{kind} {name} → {', '.join(shown[:4]) if shown else 'no answer'}", found
+        suffix = " (truncated)" if cut else ""
+        return f"{kind} {name} → {', '.join(shown[:4]) if shown else 'no answer'}{suffix}", found
     except (ValueError, struct.error, IndexError):
         return f"{ident:#06x} (truncated)", []
 

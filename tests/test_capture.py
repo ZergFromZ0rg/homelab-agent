@@ -394,9 +394,7 @@ def test_the_agent_validates_the_expression_before_starting():
 
 
 def test_the_worker_applies_the_expression_together_with_the_simple_fields():
-    flt = {"proto": "tcp", "expr": "port 443"}
-    expression = cf.compile_filter(flt["expr"])
-    keep = cf.compile_filter(cf.combine(flt))
+    keep = cf.compile_filter(cf.combine({"proto": "tcp", "expr": "port 443"}))
     assert keep(SYN) and not keep(UDP_DNS) and not keep(PING)
 
 
@@ -884,3 +882,33 @@ def test_structured_arp_and_dhcp_records_are_for_the_watcher_not_the_capture_lis
                                          socket.inet_aton("192.168.1.10"), bytes(6), socket.inet_aton("192.168.1.99"))), 0)])
     [listed] = [m for m in out if m["t"] == "pkt"]
     assert "arp" not in listed and "dhcp" not in listed and listed["info"].startswith("who has")
+
+
+# --- review fixes ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("value", ["false", "0", "no", 1, "yes", [True]])
+def test_promiscuous_mode_needs_a_real_true(value):
+    client = _client(FakeContainer([{"t": "end", "reason": "finished", "ts": 1}]))
+    capture.start(client, {"promisc": value})
+    assert json.loads(client.containers.create.call_args.kwargs["environment"]["CAPTURE_CONFIG"])["promisc"] is False
+
+
+def test_a_boolean_is_not_a_port():
+    with pytest.raises(capture.CaptureError, match="must be a number"):
+        capture.validate_filter({"port": True})
+    assert capture.validate_filter({"port": "443"}) == {"port": 443}
+
+
+def test_a_dns_reply_cut_off_part_way_still_names_the_addresses_that_arrived():
+    complete = dns_response("media.example.com", ["10.0.0.5", "10.0.0.6"])
+    info, found = w.parse_dns(complete[:-3])  # ends inside the second address
+    assert found == [["media.example.com", "10.0.0.5"]]
+    assert info == "A media.example.com → 10.0.0.5 (truncated)"
+    assert w.parse_dns(complete)[0] == "A media.example.com → 10.0.0.5, 10.0.0.6"  # a whole one is unchanged
+
+
+def test_the_page_still_loads_when_docker_cannot_list_containers(monkeypatch):
+    monkeypatch.setattr(capture.lan_scan, "read_host", lambda c: {"default": "eth0", "ifaces": [{"name": "eth0", "ip": "192.168.1.10"}]})
+    monkeypatch.setattr(capture.connections, "container_map", lambda c: (_ for _ in ()).throw(RuntimeError("daemon went away")))
+    ctx = capture.context(mock.MagicMock())
+    assert ctx["default"] == "eth0" and ctx["containers"] == [] and ctx["names"] == {"192.168.1.10": capture.HOST_NAME}

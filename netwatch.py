@@ -49,6 +49,7 @@ LEARN_SECONDS = 300  # after the very first start: don't announce everyone as ne
 ACTIVE_SECONDS = 3600  # a finding stays "active" (an alert) this long after its last sighting
 IDLE_BINDING_SECONDS = 3600  # an address quiet this long being reused is routine
 MAX_FINDINGS = 200
+MAX_INFO_FINDINGS = 60  # "new device" notes are cheap to produce and must not crowd out the rest
 MAX_KNOWN = 2000
 SAVE_EVERY = 30
 RESTART_BACKOFF = (5, 15, 60)
@@ -107,10 +108,21 @@ class Detector:
             "at": now, "last": now, "count": 1, **extra,
         }
         self.findings[finding_id] = found
-        if len(self.findings) > MAX_FINDINGS:
-            oldest = min(self.findings.values(), key=lambda f: f["last"])
-            del self.findings[oldest["id"]]
+        self._evict()
         return found
+
+    def _evict(self) -> None:
+        """Keep the list bounded without ever losing what matters. A flood of
+        new MAC addresses (a phone that randomises its address, or someone
+        doing it on purpose) produces a stream of information notes; they go
+        first, oldest first, so an alert can't be pushed out by noise."""
+        info = sorted((f for f in self.findings.values() if f["severity"] == "info"), key=lambda f: f["last"])
+        for stale in info[: max(0, len(info) - MAX_INFO_FINDINGS)]:
+            del self.findings[stale["id"]]
+        while len(self.findings) > MAX_FINDINGS:
+            rank = {"info": 0, "warn": 1, "bad": 2}
+            worst_last = min(self.findings.values(), key=lambda f: (rank.get(f["severity"], 0), f["last"]))
+            del self.findings[worst_last["id"]]
 
     def _trim(self) -> None:
         for table in (self.known, self.bindings):
@@ -247,16 +259,21 @@ def _save(force: bool = False) -> None:
     with _lock:
         if _detector is None or (not force and (not _detector.dirty or now - _last_save < SAVE_EVERY)):
             return
-        body = {"enabled": _enabled, **_detector.export()}
+        # Serialised while holding the lock: the watcher thread keeps changing
+        # these tables, and encoding a dict that changes underneath raises.
+        text = json.dumps({"enabled": _enabled, **_detector.export()})
         _detector.dirty = False
     _last_save = now
     try:
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = STATE_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(body))
+        tmp.write_text(text)
         tmp.replace(STATE_FILE)
     except OSError as error:
         log.warning("netwatch: couldn't save its state: %s", error)
+        with _lock:
+            if _detector:
+                _detector.dirty = True  # try again next time rather than forget it
 
 
 def _launch(client, iface: str):
@@ -423,9 +440,9 @@ def disable(client=None) -> dict:
 
 def resume(client) -> None:
     """Start again at agent startup if the watch was left on."""
+    global _detector
     saved = _load()
     if saved.get("enabled"):
-        global _detector
         with _lock:
             _detector = Detector(saved)
         enable(client)
