@@ -9,7 +9,6 @@ a DNS reply cut off inside an address record used to disappear that way.
 """
 
 import random
-import socket
 import struct
 
 import capture_filter as cf
@@ -107,4 +106,3 @@ def test_the_fuzz_corpus_is_deterministic():
     one = [f for s in _seeds(random.Random(5)) for f in list(_mutations(random.Random(6), s))[:5]]
     two = [f for s in _seeds(random.Random(5)) for f in list(_mutations(random.Random(6), s))[:5]]
     assert one == two
-    assert socket  # imported for the frames above
