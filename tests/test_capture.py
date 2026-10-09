@@ -671,7 +671,7 @@ def test_lines_from_the_helper_that_are_not_ours_or_are_malformed_do_no_harm():
 
 # --- the sniffer loop, with a fake socket ----------------------------------------------
 
-def _run_worker(monkeypatch, frames, config=None):
+def _run_worker(monkeypatch, frames, config=None, ifname="eth0"):
     """Run ``run()`` over (frame, pkttype) pairs; returns the emitted messages."""
     emitted = []
     monkeypatch.setattr(w, "emit", emitted.append)
@@ -683,7 +683,7 @@ def _run_worker(monkeypatch, frames, config=None):
         if not queue:
             raise KeyboardInterrupt  # ends the loop the way a stop would
         frame, pkttype = queue.pop(0)
-        return frame, ("eth0", 3, pkttype, 1, b""), 1700000000.5
+        return frame, (ifname, 3, pkttype, 1, b""), 1700000000.5
 
     monkeypatch.setattr(w, "read_packet", read)
     w.run({"iface": "eth0", "duration": 5, **(config or {})})
@@ -912,3 +912,18 @@ def test_the_page_still_loads_when_docker_cannot_list_containers(monkeypatch):
     monkeypatch.setattr(capture.connections, "container_map", lambda c: (_ for _ in ()).throw(RuntimeError("daemon went away")))
     ctx = capture.context(mock.MagicMock())
     assert ctx["default"] == "eth0" and ctx["containers"] == [] and ctx["names"] == {"192.168.1.10": capture.HOST_NAME}
+
+
+def test_a_loopback_packet_is_counted_once_not_as_leaving_and_arriving(monkeypatch):
+    frame = eth(0x0800, ipv4(6, struct.pack("!HHIIBBHHH", 51000, 80, 7, 0, 5 << 4, 0x18, 1000, 0, 0) + b"data"))
+    # lo hands a sniffer every packet twice: the outgoing copy (type 4), then the incoming one.
+    out = _run_worker(monkeypatch, [(frame, 4), (frame, 0)], ifname="lo")
+    packets = [m for m in out if m["t"] == "pkt"]
+    assert len(packets) == 1 and packets[0]["dir"] == "in"
+    assert not packets[0].get("issues")  # the duplicate would have been flagged as a retransmission
+
+
+def test_a_real_interfaces_outgoing_packets_are_kept(monkeypatch):
+    frame = eth(0x0800, ipv4(6, tcp(51000, 443, 0x02)))
+    out = _run_worker(monkeypatch, [(frame, 4), (frame, 0)], ifname="eth0")
+    assert [m["dir"] for m in out if m["t"] == "pkt"] == ["out", "in"]  # only loopback is deduplicated

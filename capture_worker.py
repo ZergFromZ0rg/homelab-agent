@@ -568,6 +568,11 @@ def run(config: dict) -> None:
                 reason = f"socket error: {error}"
                 break
             ifname, _, pkttype, hatype = addr[0], addr[1], addr[2], addr[3]
+            if ifname == "lo" and pkttype == 4:
+                # The loopback interface hands a packet to a sniffer twice, once as it
+                # leaves and once as it arrives. Count it once, as tcpdump does — the
+                # second copy would otherwise double every total and read as a retransmission.
+                continue
             # Every byte here came off the network, so a packet nobody
             # anticipated must cost one packet, not the whole capture.
             try:

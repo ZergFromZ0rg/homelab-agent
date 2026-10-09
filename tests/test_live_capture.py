@@ -115,6 +115,21 @@ def inject(frame: bytes) -> None:
         sender.close()
 
 
+def udp_from(source_port: int, to_port: int, payload: bytes) -> None:
+    """A datagram from a *specific* source port, as real DHCP (67 <-> 68) always
+    is. Binding a low port needs root or NET_BIND_SERVICE; without it the test
+    that needs this is skipped rather than failed."""
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        try:
+            sender.bind(("127.0.0.1", source_port))
+        except PermissionError:
+            pytest.skip("binding a port below 1024 needs root or NET_BIND_SERVICE")
+        sender.sendto(payload, ("127.0.0.1", to_port))
+    finally:
+        sender.close()
+
+
 def dhcp_offer() -> bytes:
     head = struct.pack("!BBBBIHH4s4s4s4s", 2, 1, 6, 0, 0xBEEF, 0, 0, bytes(4), socket.inet_aton("192.168.77.50"), bytes(4), bytes(4))
     head += bytes.fromhex("aabbcc000009") + bytes(10) + bytes(64) + bytes(128) + b"\x63\x82\x53\x63"
@@ -142,6 +157,15 @@ def traffic_capture():
     lines = run_sniffer("capture_worker.py", "CAPTURE_CONFIG",
                         {"iface": LOOPBACK, "duration": 3, "payload": "full", "filter": {}}, traffic)
     return started, time.time(), lines
+
+
+def test_loopback_packets_are_counted_once_not_as_leaving_and_arriving(traffic_capture):
+    """lo hands every packet to a sniffer twice. Seen twice, each data packet's
+    copy looks like a retransmission — so this also guards the TCP health check."""
+    _, _, lines = traffic_capture
+    assert not [p for p in packets(lines) if p["dir"] == "out"]
+    requests_seen = [p for p in packets(lines) if p.get("app") == "http" and p["info"].startswith("GET")]
+    assert len(requests_seen) == 1
 
 
 def test_it_reads_real_packets_and_finishes_cleanly(traffic_capture):
@@ -291,7 +315,7 @@ def test_the_watcher_turns_real_arp_and_dhcp_into_events_and_ignores_everything_
     def traffic():
         udp_to(9999, b"noise")
         http_exchange(b"GET / HTTP/1.1\r\nHost: noise\r\n\r\n")
-        udp_to(68, dhcp_offer())
+        udp_from(67, 68, dhcp_offer())  # a server answering a client, ports and all
         inject(arp_frame(mac, "192.168.77.10", "192.168.77.1"))
         time.sleep(0.8)
 
