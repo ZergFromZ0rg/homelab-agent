@@ -374,3 +374,21 @@ def test_a_bad_passphrase_setup_reports_gpgs_own_error(tmp_path):
     if code != 0:
         assert "gpg" in report["error"].lower()
         assert "broken pipe" not in report["error"].lower()
+
+
+def test_progress_lines_precede_the_result(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.bin").write_bytes(b"x" * 5000)
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    done = subprocess.run(
+        [sys.executable, HELPER], capture_output=True, text=True,
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "BACKUP_SRC": str(src),
+             "BACKUP_DEST": str(dest), "BACKUP_NAME": "t.tar.gz"},
+    )
+    lines = [json.loads(line) for line in done.stdout.splitlines()]
+    progress = [line["progress"] for line in lines if "progress" in line]
+    assert progress[0].get("scanning")
+    assert progress[-1]["total"] == 5000 and progress[-1]["done"] <= 5000
+    assert lines[-1]["name"] == "t.tar.gz"  # the result is still last

@@ -229,21 +229,77 @@ def for_container(container, labels: dict | None) -> dict | None:
 # --- updating -------------------------------------------------------------------
 
 
+def _public(job: dict) -> dict:
+    return {**{k: v for k, v in job.items() if not k.startswith("_")},
+            "steps": list(job["steps"]), "progress": dict(job.get("progress") or {})}
+
+
 def status(job_id: str) -> dict | None:
     with _lock:
         job = _jobs.get(job_id)
-        return dict(job, steps=list(job["steps"])) if job else None
+        return _public(job) if job else None
 
 
 def recent() -> list[dict]:
     with _lock:
-        return [dict(j, steps=list(j["steps"])) for j in
+        return [_public(j) for j in
                 sorted(_jobs.values(), key=lambda j: j["started_at"], reverse=True)[:10]]
 
 
 def _step(job, text, output=None):
     with _lock:
         job["steps"].append({"at": time.time(), "text": text, "output": output})
+
+
+class PullProgress:
+    """Bytes downloaded across every layer of every image being pulled.
+
+    Docker streams one event per layer; a layer's size is only known once
+    its download starts, so the total grows as the pull goes. The figure
+    only ever moves forward (a late-announced layer must not drag the bar
+    back) and reads 100% when the stream ends.
+    """
+
+    def __init__(self):
+        self.layers: dict[tuple, dict] = {}
+        self.extracting = False
+        self.peak = 0.0
+
+    def feed(self, ref: str, event: dict) -> None:
+        layer, status = event.get("id"), event.get("status") or ""
+        if not layer or status.startswith(("Pulling from", "Digest", "Status")):
+            return
+        entry = self.layers.setdefault((ref, layer), {"current": 0, "total": 0})
+        detail = event.get("progressDetail") or {}
+        if status == "Downloading" and detail.get("total"):
+            entry["current"], entry["total"] = detail.get("current", 0), detail["total"]
+        elif status in ("Download complete", "Pull complete", "Already exists"):
+            entry["current"] = entry["total"]
+        elif status == "Extracting":
+            entry["current"] = entry["total"]
+            self.extracting = True
+
+    def bytes(self) -> tuple[int, int]:
+        return (sum(e["current"] for e in self.layers.values()),
+                sum(e["total"] for e in self.layers.values()))
+
+    def fraction(self) -> float:
+        done, total = self.bytes()
+        self.peak = max(self.peak, min(1.0, done / total) if total else 0.0)
+        return self.peak
+
+
+# How much of a project's share of the bar each stage takes: the pull is
+# the long part, then recreating the containers, then watching them start.
+PULL_SHARE, UP_SHARE = 0.85, 0.10
+
+
+def _progress(job, index: int, total: int, within: float, phase: str, **extra) -> None:
+    with _lock:
+        job["progress"] = {
+            "percent": round(100 * (index + min(1.0, within)) / max(total, 1), 1),
+            "phase": phase, **extra,
+        }
 
 
 def plan(client, names: list[str] | None) -> dict[str, dict]:
@@ -282,6 +338,7 @@ def start(client, names: list[str] | None, *, by: str = "dashboard") -> dict:
             "id": uuid.uuid4().hex[:12], "state": "running", "by": by,
             "projects": sorted(projects), "steps": [], "results": {},
             "started_at": time.time(), "finished_at": None,
+            "progress": {"percent": 0.0, "phase": "starting"}, "_index": 0,
         }
         _jobs[job["id"]] = job
     threading.Thread(target=_run, args=(client, job, projects), daemon=True).start()
@@ -319,22 +376,66 @@ def _update_project(client, job, project: str, entry: dict) -> str:
                 log.debug("could not drop rollback tag: %s", error)
 
 
+def _pull_images(client, job, project, services, index: int, total: int) -> str | None:
+    """Pull each service's image through the Docker API, publishing byte
+    progress on the job. The pull's last status lines, or None when it
+    couldn't be streamed (the caller falls back to Compose)."""
+    progress, lines = PullProgress(), []
+    try:
+        for ref in sorted(set(services.values())):
+            repository, tag = local_name(ref)
+            _progress(job, index, total, progress.fraction() * PULL_SHARE, f"pulling {repository}:{tag}")
+            last = 0.0
+            for event in client.api.pull(repository, tag=tag, stream=True, decode=True):
+                if event.get("error"):
+                    raise RuntimeError(event["error"])
+                progress.feed(ref, event)
+                if event.get("status") and not event.get("progressDetail"):
+                    lines.append(event["status"])
+                now = time.monotonic()
+                if now - last >= 0.5:
+                    last = now
+                    done, size = progress.bytes()
+                    _progress(
+                        job, index, total, progress.fraction() * PULL_SHARE,
+                        ("extracting " if progress.extracting and done >= size else "pulling ") + f"{repository}:{tag}",
+                        bytes_done=done, bytes_total=size,
+                    )
+    except Exception as error:  # noqa: BLE001 - any failure here falls back to Compose
+        log.warning("streamed pull of %s failed (%s); falling back to compose pull", project, error)
+        return None
+    done, size = progress.bytes()
+    _progress(job, index, total, PULL_SHARE, f"pulled {project}", bytes_done=done, bytes_total=size)
+    return "\n".join(lines)
+
+
 def _rollback_tag(service: str) -> str:
     return f"{ROLLBACK_TAG}-{re.sub(r'[^A-Za-z0-9_.-]', '-', service)}"[:128]
 
 
 def _pull_and_watch(client, job, project, info, services, names, old) -> str:
 
-    code, output = compose_edit._run_helper(
-        client,
-        compose_edit._compose_args(info, "", "") + ["pull", *names],
-        compose_edit._mounts(info, socket=True), network=True,
-    )
-    _step(job, f"{project}: pulled {', '.join(names)}", output[-2000:])
-    if code != 0:
-        return f"pull failed (exit {code})"
+    index, total = job["_index"], len(job["projects"])
+    pulled = _pull_images(client, job, project, services, index, total)
+    if pulled is not None:
+        _step(job, f"{project}: pulled {', '.join(names)}", pulled[-2000:])
+    else:
+        # Streaming the pull ourselves didn't work (a registry the agent
+        # can't reach but Compose's own config can): Compose's pull, with
+        # no byte counts.
+        _progress(job, index, total, 0, f"pulling {', '.join(names)}")
+        code, output = compose_edit._run_helper(
+            client,
+            compose_edit._compose_args(info, "", "") + ["pull", *names],
+            compose_edit._mounts(info, socket=True), network=True,
+        )
+        _step(job, f"{project}: pulled {', '.join(names)}", output[-2000:])
+        if code != 0:
+            return f"pull failed (exit {code})"
 
+    _progress(job, index, total, PULL_SHARE, f"recreating {project}")
     code, output = compose_edit._up(client, info)
+    _progress(job, index, total, PULL_SHARE + UP_SHARE, f"waiting for {project} to come up")
     _step(job, f"{project}: docker compose up -d", output[-2000:])
     failed = (
         {"name": project, "why": f"up failed (exit {code})"} if code != 0
@@ -357,7 +458,8 @@ def _pull_and_watch(client, job, project, info, services, names, old) -> str:
 
 def _run(client, job, projects) -> None:
     try:
-        for project, entry in sorted(projects.items()):
+        for index, (project, entry) in enumerate(sorted(projects.items())):
+            job["_index"] = index
             try:
                 result = _update_project(client, job, project, entry)
             except Exception as error:  # noqa: BLE001 - one project's failure isn't the others'
@@ -377,6 +479,7 @@ def _run(client, job, projects) -> None:
     with _lock:
         job["state"] = state
         job["finished_at"] = time.time()
+        job["progress"] = {"percent": 100.0, "phase": state}
     _wake.set()  # re-check soon, so badges clear
 
 

@@ -67,6 +67,9 @@ class Counter:
     """What went into the archive, and what came out of the gzip."""
 
     def __init__(self):
+        self.total_bytes = 0   # size of the source, from a scan before the copy
+        self.read_bytes = 0    # source bytes read so far
+        self._last_report = 0.0
         self.files = 0
         self.skipped = 0
         self.raw_bytes = 0
@@ -91,6 +94,67 @@ def _tar_filter(info: tarfile.TarInfo, counts: Counter):
         counts.raw_bytes += info.size
 
     return info
+
+
+REPORT_SECONDS = 1.0
+
+
+def report(counts: Counter, *, force: bool = False) -> None:
+    """One JSON line on stdout saying how far along the copy is. The agent
+    follows this container's logs and takes the newest; the result line at
+    the very end is still the last line, as it always was."""
+    now = time.monotonic()
+    if not force and now - counts._last_report < REPORT_SECONDS:
+        return
+    counts._last_report = now
+    print(json.dumps({"progress": {
+        "done": counts.read_bytes, "total": counts.total_bytes,
+        "files": counts.files,
+    }}), flush=True)
+
+
+def scan(root: str) -> int:
+    """Bytes in the regular files under ``root``, for the denominator. Only
+    an estimate (files change while a backup runs) and skipped on error."""
+    total = 0
+    for folder, _dirs, names in os.walk(root, followlinks=False):
+        for name in names:
+            try:
+                info = os.lstat(os.path.join(folder, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total
+
+
+class _Reader:
+    """Wraps a file being added to the tar so each read is counted."""
+
+    def __init__(self, handle, counts: Counter):
+        self._handle = handle
+        self._counts = counts
+
+    def read(self, size=-1):
+        data = self._handle.read(size)
+        self._counts.read_bytes += len(data)
+        report(self._counts)
+        return data
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+
+class _CountingTar(tarfile.TarFile):
+    """A TarFile that counts the bytes of file content as they are read, so
+    a single huge file moves the progress instead of freezing it."""
+
+    counts: Counter | None = None
+
+    def addfile(self, tarinfo, fileobj=None):
+        if fileobj is not None and self.counts is not None:
+            fileobj = _Reader(fileobj, self.counts)
+        return super().addfile(tarinfo, fileobj)
 
 
 class _Sink:
@@ -150,7 +214,8 @@ def _write_archive(emit, counts: Counter, *, count_output: bool = True) -> None:
     gz = gzip.GzipFile(filename="", mode="wb", fileobj=sink, mtime=0)
 
     try:
-        with tarfile.open(mode="w|", fileobj=gz, format=tarfile.PAX_FORMAT) as tar:
+        _CountingTar.counts = counts
+        with _CountingTar.open(mode="w|", fileobj=gz, format=tarfile.PAX_FORMAT) as tar:
             tar.add(SRC, arcname=".", filter=lambda i: _tar_filter(i, counts))
     finally:
         gz.close()
@@ -350,6 +415,15 @@ def main() -> int:
     counts = Counter()
     started = time.time()
     remote = None
+
+    # A scan first, so the copy has a denominator. Failing to scan only
+    # means no percentage — never a failed backup.
+    try:
+        print(json.dumps({"progress": {"done": 0, "total": 0, "scanning": True}}), flush=True)
+        counts.total_bytes = scan(SRC)
+        report(counts, force=True)
+    except Exception:  # noqa: BLE001
+        counts.total_bytes = 0
 
     try:
         if dest_url:

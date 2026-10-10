@@ -45,6 +45,7 @@ wrong.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import threading
@@ -843,6 +844,8 @@ def _finish(job: dict, state: str, error: str | None = None) -> None:
         job["state"] = state
         job["error"] = error
         job["finished_at"] = time.time()
+        if state == "succeeded":
+            job["progress"] = {**(job.get("progress") or {}), "percent": 100.0, "scanning": False}
 
     level = audit.warning if state == "failed" else audit.info
     level("backup %s %s%s", job["id"], state, f": {error}" if error else "")
@@ -961,6 +964,7 @@ def start(client, *, volume: str | None = None, path: str | None = None,
             "stopped": [],
             "not_stopped": [],
             "state": "running",
+            "progress": None,
             "started_at": time.time(),
             "finished_at": None,
             "result": None,
@@ -996,6 +1000,31 @@ def _run_job(client, job: dict, *, host_path: str | None,
                 source_host_path=source_host_path, token=token)
     except Exception as error:  # noqa: BLE001 - the thread must not die silently
         _finish(job, "failed", str(error))
+
+
+def _follow(job: dict, container) -> None:
+    """Copy the helper's newest progress line onto the job."""
+    try:
+        tail = container.logs(tail=5).decode("utf-8", "replace").splitlines()
+    except Exception:  # noqa: BLE001 - progress is a courtesy
+        return
+    for line in reversed(tail):
+        try:
+            progress = json.loads(line).get("progress")
+        except (ValueError, AttributeError):
+            continue
+        if not progress:
+            continue
+        total = progress.get("total") or 0
+        with _lock:
+            job["progress"] = {
+                "done": progress.get("done", 0), "total": total,
+                "files": progress.get("files", 0),
+                "scanning": bool(progress.get("scanning")),
+                # Held at 99 until the archive is committed and checked.
+                "percent": round(min(99.0, 100 * progress.get("done", 0) / total), 1) if total else None,
+            }
+        return
 
 
 def _backup(client, job: dict, *, host_path: str | None,
@@ -1049,8 +1078,16 @@ def _backup(client, job: dict, *, host_path: str | None,
             labels={"homelab-agent-backup": job["id"]},
         )
 
-        result = container.wait(timeout=TIMEOUT)
-        code = result.get("StatusCode", 1) if isinstance(result, dict) else 1
+        deadline = time.monotonic() + TIMEOUT
+        while True:
+            container.reload()
+            if container.status not in ("created", "running", "restarting"):
+                break
+            _follow(job, container)
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"still running after {TIMEOUT // 3600}h")
+            time.sleep(1)
+        code = (container.attrs.get("State") or {}).get("ExitCode", 1)
         output = container.logs().decode("utf-8", "replace").strip()
 
     except Exception as error:  # noqa: BLE001

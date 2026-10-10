@@ -234,3 +234,40 @@ def test_check_update_and_roll_back(registry_and_stack):
     assert app.image.id == good and app.status == "running"
     # Nothing left pinning old images.
     assert not [t for i in _real.images.list() for t in i.tags if "hl-rollback" in t]
+
+
+def test_pull_progress_counts_layers_and_never_goes_back():
+    progress = updates.PullProgress()
+    progress.feed("app:1", {"id": "aaa", "status": "Downloading", "progressDetail": {"current": 50, "total": 100}})
+    assert progress.fraction() == 0.5
+    # A layer announced late adds to the total but must not drag the bar back.
+    progress.feed("app:1", {"id": "bbb", "status": "Downloading", "progressDetail": {"current": 0, "total": 300}})
+    assert progress.fraction() == 0.5
+    progress.feed("app:1", {"id": "aaa", "status": "Pull complete"})
+    progress.feed("app:1", {"id": "bbb", "status": "Pull complete"})
+    assert progress.bytes() == (400, 400)
+    assert progress.fraction() == 1.0
+
+
+def test_streamed_pull_publishes_progress_on_the_job():
+    events = [
+        {"status": "Pulling from library/app", "id": "1"},
+        {"id": "aaa", "status": "Downloading", "progressDetail": {"current": 10, "total": 40}},
+        {"id": "aaa", "status": "Pull complete"},
+        {"status": "Status: Downloaded newer image for app:1"},
+    ]
+    client = mock.MagicMock()
+    client.api.pull.return_value = iter(events)
+    job = {"progress": {}}
+    out = updates._pull_images(client, job, "proj", {"web": "app:1"}, 0, 2)
+    client.api.pull.assert_called_once_with("app", tag="1", stream=True, decode=True)
+    assert out is not None and "Downloaded newer image" in out
+    # Half of the bar is this project's; the pull is 85% of that.
+    assert job["progress"]["percent"] == round(100 * 0.85 / 2, 1)
+    assert job["progress"]["bytes_total"] == 40
+
+
+def test_streamed_pull_failure_falls_back_to_compose():
+    client = mock.MagicMock()
+    client.api.pull.side_effect = RuntimeError("registry unreachable")
+    assert updates._pull_images(client, {"progress": {}}, "proj", {"web": "app:1"}, 0, 1) is None
