@@ -29,11 +29,13 @@ import files
 import compose_edit
 import container_logs
 import host_control
+import smart
 import updates
 import web_links
 import networks
 import probes
 import deploy
+from gpu import get_drm_gpu_stats
 import rebuild
 import terminal
 import version
@@ -169,7 +171,7 @@ def get_nvidia_gpu_stats():
         result = subprocess.run(
             [
                 nvidia_smi,
-                "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed",
+                "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit,fan.speed,clocks.current.graphics,clocks.current.memory",
                 "--format=csv,noheader,nounits",
             ],
             capture_output=True,
@@ -205,95 +207,14 @@ def get_nvidia_gpu_stats():
                 "power_draw_w": _safe_float(parts[5]),
                 "power_limit_w": _safe_float(parts[6]),
                 "fan_percent": _safe_float(parts[7]),
+                "core_clock_mhz": _safe_float(parts[8]) if len(parts) > 8 else None,
+                "memory_clock_mhz": _safe_float(parts[9]) if len(parts) > 9 else None,
             })
 
         return gpus or None
 
     except Exception:
         return None
-
-
-def get_drm_gpu_stats():
-    gpus = []
-
-    for card_path in sorted(glob.glob("/sys/class/drm/card*")):
-        card = Path(card_path)
-
-        # Only accept real DRM card directories:
-        # card0, card1, card2, ...
-        # Ignore connector entries such as card0-HDMI-A-1.
-        suffix = card.name.removeprefix("card")
-
-        if not suffix.isdigit():
-            continue
-
-        device_path = card / "device"
-
-        if not device_path.exists():
-            continue
-
-        vendor_file = device_path / "vendor"
-
-        if not vendor_file.exists():
-            continue
-
-        vendor_id = _read_text_file(device_path / "vendor")
-        device_id = _read_text_file(device_path / "device")
-
-        vendor_map = {
-            "0x10de": "nvidia",
-            "0x1002": "amd",
-            "0x8086": "intel",
-        }
-
-        vendor = vendor_map.get(
-            (vendor_id or "").lower(),
-            "unknown",
-        )
-
-        name = f"{vendor.upper()} GPU"
-
-        uevent = _read_text_file(device_path / "uevent")
-
-        if uevent:
-            for line in uevent.splitlines():
-                if line.startswith("PCI_ID="):
-                    name = f"{vendor.upper()} GPU {line.split('=', 1)[1]}"
-                    break
-
-        temperature_c = None
-
-        for hwmon in glob.glob(
-            str(device_path / "hwmon" / "hwmon*")
-        ):
-            temp_raw = _read_text_file(
-                Path(hwmon) / "temp1_input"
-            )
-
-            if temp_raw:
-                try:
-                    temperature_c = round(
-                        float(temp_raw) / 1000,
-                        1,
-                    )
-                    break
-                except ValueError:
-                    pass
-
-        gpus.append({
-            "vendor": vendor,
-            "name": name,
-            "device_id": device_id,
-            "utilization_percent": None,
-            "memory_used_mb": None,
-            "memory_total_mb": None,
-            "temperature_c": temperature_c,
-            "power_draw_w": None,
-            "power_limit_w": None,
-            "fan_percent": None,
-        })
-
-    return gpus or None
 
 
 def get_gpu_stats():
@@ -304,9 +225,11 @@ def get_gpu_stats():
     covered by it alone. It is only present when the container has the
     NVIDIA runtime.
 
-    The DRM scan reads ``/sys/class/drm``, which Docker mounts into every
-    container by default, so AMD and Intel cards need no configuration at
-    all. It costs detail: vendor, PCI id and temperature, no utilisation.
+    The DRM scan (gpu.py) reads ``/sys/class/drm``, which Docker mounts into
+    every container by default, so AMD and Intel cards need no configuration
+    at all. How much it can say depends on the driver: amdgpu gives load,
+    VRAM, clocks, power and fan; Intel gives clocks and how active the GPU
+    was; a card whose driver says nothing is listed with a ``limited`` note.
 
     Both run. Previously the DRM scan was only a fallback, which meant a
     host with an NVIDIA card *and* an AMD one reported only the NVIDIA
@@ -821,6 +744,7 @@ def startup_event():
     web_links.start(client, HOST_NAME)
     updates.start_loop(client)
     host_control.start_loop(client)
+    smart.start_loop(client)
     stack_backup.start()
     registrar.start()
     netwatch.resume(client)  # the watch stays on across an agent restart if it was on
@@ -896,6 +820,8 @@ def get_containers():
         # the background when host control is on. See host_control.py.
         # (Not "host": that key is this host's name, above.)
         "host_facts": host_control.facts() if host_control.enabled() else None,
+        # SMART health of each disk, from a short-lived helper. See smart.py.
+        "disk_health": smart.snapshot(),
     }
 
 

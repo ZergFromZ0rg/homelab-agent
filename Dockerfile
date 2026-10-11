@@ -6,7 +6,7 @@ WORKDIR /app
 # plugin so POST /stacks can run `docker compose` against the host daemon
 # over the mounted socket.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates curl gnupg \
+    && apt-get install -y --no-install-recommends git ca-certificates curl gnupg smartmontools \
     && install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
     && chmod a+r /etc/apt/keyrings/docker.asc \
@@ -21,7 +21,7 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY log.py main.py capture.py capture_filter.py capture_worker.py config.py compose_edit.py connections.py container_logs.py disk_delete.py disk_usage.py files.py host_control.py lan_scan.py netwatch.py netwatch_worker.py networks.py probes.py sockets.py rebuild.py terminal.py updates.py version.py web_links.py \
+COPY log.py main.py capture.py capture_filter.py capture_worker.py config.py compose_edit.py connections.py container_logs.py disk_delete.py disk_usage.py files.py gpu.py host_control.py lan_scan.py netwatch.py netwatch_worker.py networks.py probes.py sockets.py rebuild.py smart.py terminal.py updates.py version.py web_links.py \
      stack_backup.py register.py deploy.py stack_deploy.py \
      volume_backup.py backup_helper.py ./
 
