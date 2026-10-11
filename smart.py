@@ -71,7 +71,10 @@ def collect() -> dict:
         name = entry.get("name")
         if not name:
             continue
-        args = ["-a", "-n", "standby", name] + (["-d", entry["type"]] if entry.get("type") else [])
+        # The scan calls a SATA disk "scsi" (that is how libata presents it) and forcing
+        # that type reads no ATA data at all; left alone, smartctl works out SAT itself.
+        kind = entry.get("type")
+        args = ["-a", "-n", "standby", name] + (["-d", kind] if kind and kind != "scsi" else [])
         code, data = _smartctl(args)
         if data is None:
             # No JSON is what a drive in standby gives (exit status 2).

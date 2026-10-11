@@ -186,6 +186,16 @@ def test_collect_scans_then_reads_each_disk_with_its_own_type_and_trims_the_json
     assert smart.assess(out["disks"][0])["health"] == "ok"
 
 
+def test_a_sata_disk_the_scan_calls_scsi_is_not_forced_to_that_type(monkeypatch):
+    """Found on a real Seagate: `-d scsi` returns nothing; no -d at all reads it fine."""
+    seen = []
+    fake_smartctl(monkeypatch, [{"name": "/dev/sda", "type": "scsi"}], {"/dev/sda": (0, ata(HEALTHY))})
+    real = smart.subprocess.run
+    monkeypatch.setattr(smart.subprocess, "run", lambda cmd, **kw: seen.append(cmd) or real(cmd, **kw))
+    smart.collect()
+    assert "-d" not in seen[-1]
+
+
 def test_collect_marks_a_sleeping_drive_by_the_exit_status_not_by_guessing(monkeypatch):
     fake_smartctl(monkeypatch, [{"name": "/dev/sda", "type": "sat"}, {"name": "/dev/sdb", "type": "sat"}],
                   {"/dev/sda": (2, None), "/dev/sdb": (1, None)})
