@@ -483,6 +483,35 @@ Empty (`{}`) if the container publishes nothing. A consumer can use the
 first entry to link to whatever web UI the container serves, e.g.
 `http://<HOST_NAME>:<port>`.
 
+### `web`
+
+Where the container's web UI is, found by connecting to it rather than
+guessing from `ports`:
+
+```json
+"web": {"port": 8053, "scheme": "http", "path": "/admin/",
+        "status": 302, "ok": true, "host_rejected": false}
+```
+
+The agent tries every candidate port — the host ports a container
+publishes, and for a container on the host network the TCP ports its own
+processes listen on — sends the request a browser will send (`Host:
+<HOST_NAME>:<port>`), and reports the one that works. That covers what
+`ports` can't: host-network containers (Pi-hole publishes nothing), several
+ports with one web UI, apps whose root isn't the page (a 403 root falls
+back to `/admin/`, `/web/`, `/ui/`, `/login`, `/dashboard` — each only if it
+answers), and https-only UIs. `host_rejected: true` means the app answers by
+address but refuses the node's name (Homepage's `HOMEPAGE_ALLOWED_HOSTS`);
+`ok: false` with another status means it answered with an error.
+Loopback-only ports are skipped, since another machine's browser can't
+reach them.
+
+`"web": null` means every candidate was reached and none speaks HTTP (or
+there was nothing to try). The key is **absent** while the answer isn't known
+yet — not probed, or a port that didn't connect — so a consumer should fall
+back to `ports` then, not treat it as "no web UI". Probes run in the
+background every few minutes and are cached; `WEB_LINKS=0` turns them off.
+
 ### `updated_at`
 
 `updated_at` is a Unix timestamp representing when the latest background metrics snapshot completed.

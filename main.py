@@ -30,6 +30,7 @@ import compose_edit
 import container_logs
 import host_control
 import updates
+import web_links
 import networks
 import probes
 import deploy
@@ -392,6 +393,12 @@ def build_container_snapshot():
                 "rebuild": rebuild.summary_for(container.labels),
                 "update": updates.for_container(container, container.labels),
             })
+
+            # Only once the probe has an answer: absent means "not known
+            # yet", which the dashboard treats differently from "no web UI".
+            known, web = web_links.lookup(container.id)
+            if known:
+                containers[-1]["web"] = web
 
         except Exception as error:
             log.debug("snapshot error for %s: %s", container.name, error)
@@ -811,6 +818,7 @@ def get_container_inventory():
 def startup_event():
     terminal.cleanup_helpers(client)
     start_cache_worker()
+    web_links.start(client, HOST_NAME)
     updates.start_loop(client)
     host_control.start_loop(client)
     stack_backup.start()
