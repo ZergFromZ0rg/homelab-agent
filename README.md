@@ -483,6 +483,15 @@ Empty (`{}`) if the container publishes nothing. A consumer can use the
 first entry to link to whatever web UI the container serves, e.g.
 `http://<HOST_NAME>:<port>`.
 
+### `listening`
+
+Only on a container that runs on the host network, which publishes nothing
+(so `ports` is `{}`): the TCP ports its own processes listen on, lowest
+first, e.g. `[53, 8053]` for Pi-hole. Loopback-only ports are left out, UDP
+isn't looked at. Found with the same host `/proc` scan as `web` below, so it
+shares its schedule (absent until the first probe, refreshed every few
+minutes, off with `WEB_LINKS=0`).
+
 ### `web`
 
 Where the container's web UI is, found by connecting to it rather than

@@ -323,6 +323,12 @@ def build_container_snapshot():
             if known:
                 containers[-1]["web"] = web
 
+            # Host-network containers publish nothing; the TCP ports they
+            # listen on are the ones they hold on this host.
+            listening = web_links.lookup_listening(container.id)
+            if listening is not None:
+                containers[-1]["listening"] = listening
+
         except Exception as error:
             log.debug("snapshot error for %s: %s", container.name, error)
 

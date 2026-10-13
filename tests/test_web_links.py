@@ -236,6 +236,15 @@ def test_loopback_listeners_are_never_candidates(tmp_path):
     assert web_links.host_network_listeners(cid, root) == []
 
 
+def test_a_host_network_container_reports_the_ports_it_holds_and_others_report_none(tmp_path):
+    cid = "d" * 64
+    root = fake_proc(tmp_path, {500: (f"0::/system.slice/docker-{cid}.scope\n", [1001, 1003])})
+    host = {"HostConfig": {"NetworkMode": "host"}}
+    bridge = {"HostConfig": {"NetworkMode": "default", "PortBindings": {"80/tcp": [{"HostPort": "8080"}]}}}
+    assert web_links.listening_ports(host, cid, root) == [53, 8037]
+    assert web_links.listening_ports(bridge, cid, root) is None
+
+
 # ---- candidates --------------------------------------------------------------
 
 
@@ -307,6 +316,20 @@ def test_a_recreated_container_is_probed_again_and_a_gone_one_forgotten(monkeypa
 
     web_links.refresh(FakeClient([]), "n", now=1020)
     assert web_links.lookup(c.id) == (False, None)
+
+
+def test_listening_ports_are_cached_with_the_probe_and_only_for_host_network(monkeypatch):
+    monkeypatch.setattr(web_links, "gateway", lambda *_: "10.0.0.1")
+    monkeypatch.setattr(web_links, "inspect_container", lambda *a, **k: (True, None))
+    monkeypatch.setattr(web_links, "host_network_listeners", lambda cid, root=None: [{"port": 8053}, {"port": 53}])
+    host = FakeContainer("5" * 64, "pihole", {})
+    host.attrs["HostConfig"]["NetworkMode"] = "host"
+    bridge = FakeContainer("6" * 64, "db", {})
+
+    assert web_links.lookup_listening(host.id) is None  # not looked at yet
+    web_links.refresh(FakeClient([host, bridge]), "n", now=1)
+    assert web_links.lookup_listening(host.id) == [53, 8053]
+    assert web_links.lookup_listening(bridge.id) is None
 
 
 def test_a_container_with_nothing_to_try_is_known_to_have_no_link(monkeypatch):

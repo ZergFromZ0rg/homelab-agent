@@ -171,6 +171,19 @@ def host_network_listeners(container_id: str, root: str | None = None) -> list[d
     return [row for row in listeners if row["inode"] in owned]
 
 
+def listening_ports(attrs: dict, container_id: str, root: str | None = None) -> list[int] | None:
+    """TCP ports a host-network container listens on, lowest first.
+
+    ``None`` for any other container: what it exposes is what it publishes,
+    which ``/containers`` already reports as ``ports``. A host-network
+    container publishes nothing, so this is the only way to say what it
+    holds on the host.
+    """
+    if (attrs.get("HostConfig") or {}).get("NetworkMode") != "host":
+        return None
+    return sorted({row["port"] for row in host_network_listeners(container_id, root)})
+
+
 def candidates(attrs: dict, container_id: str, host: str, root: str | None = None) -> list[tuple[str, int]]:
     """``(address to connect to, port)`` for every port a browser could use."""
     host_config = attrs.get("HostConfig") or {}
@@ -309,13 +322,21 @@ def choose(probed: list[tuple[int, dict]]) -> tuple[bool, dict | None]:
 # --- cache and worker --------------------------------------------------------
 
 _lock = threading.Lock()
-_cache: dict[str, dict] = {}  # full container id -> {sig, at, known, web}
+_cache: dict[str, dict] = {}  # full container id -> {sig, at, known, web, listening}
 
 
 def lookup(container_id: str) -> tuple[bool, dict | None]:
     with _lock:
         entry = _cache.get(container_id)
     return (True, entry["web"]) if entry and entry["known"] else (False, None)
+
+
+def lookup_listening(container_id: str) -> list[int] | None:
+    """The cached ``listening_ports``; ``None`` when it isn't a host-network
+    container or hasn't been looked at yet."""
+    with _lock:
+        entry = _cache.get(container_id)
+    return entry["listening"] if entry else None
 
 
 def _signature(container) -> str:
@@ -367,11 +388,15 @@ def refresh(client, node: str, now: float | None = None) -> None:
     def work(container):
         try:
             known, web = inspect_container(container, node, host)
+            listening = listening_ports(container.attrs or {}, container.id)
         except Exception as error:  # noqa: BLE001
             log.debug("web link check for %s failed: %s", container.name, error)
-            known, web = False, None
+            known, web, listening = False, None, None
         with _lock:
-            _cache[container.id] = {"sig": _signature(container), "at": now, "known": known, "web": web}
+            _cache[container.id] = {
+                "sig": _signature(container), "at": now,
+                "known": known, "web": web, "listening": listening,
+            }
 
     if due:
         with ThreadPoolExecutor(max_workers=6) as pool:
