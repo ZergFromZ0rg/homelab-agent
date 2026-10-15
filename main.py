@@ -278,8 +278,16 @@ def build_container_snapshot():
     containers = []
 
     listed = client.containers.list(all=True)
-    for gone in set(previous_cpu) - {container.id for container in listed}:
-        previous_cpu.pop(gone, None)
+    ids = {container.id for container in listed}
+    for cache in (previous_cpu, size_cache):
+        for gone in set(cache) - ids:
+            cache.pop(gone, None)
+    for old_image in [
+        image_id
+        for image_id, info in image_info_cache.items()
+        if time.time() - info["at"] > 10 * IMAGE_INFO_TTL
+    ]:
+        image_info_cache.pop(old_image, None)
 
     for container in listed:
         try:
@@ -296,11 +304,7 @@ def build_container_snapshot():
             containers.append({
                 "id": container.short_id,
                 "name": container.name,
-                "image": (
-                    container.image.tags[0]
-                    if container.image.tags
-                    else container.image.short_id
-                ),
+                "image": image_name(container),
                 "status": container.status,
                 "health": health,
                 "started_at": state.get("StartedAt"),
@@ -497,15 +501,68 @@ def calculate_block_io(stats):
     }
 
 
-def get_container_size(container):
-    image_size = 0
+# What a snapshot needs about an image, and about a container's disk use,
+# barely changes — but asking Docker costs: an image inspect ~60 ms and a size
+# query ~17 ms of dockerd/containerd CPU each (measured on the thinkpad), per
+# container, every 2 s. Together that was ~1 core-second per snapshot, so both
+# are cached.
+IMAGE_INFO_TTL = 60
+SIZE_TTL = 120
+
+image_info_cache = {}
+size_cache = {}
+
+
+def image_info(container):
+    """Tags, short id and size of a container's image, cached per image id."""
+    image_id = container.attrs.get("Image")
+    now = time.time()
+    hit = image_info_cache.get(image_id)
+
+    if hit and now - hit["at"] < IMAGE_INFO_TTL:
+        return hit
 
     try:
-        image_size = int(
-            container.image.attrs.get("Size", 0) or 0
-        )
+        image = container.image
+        info = {
+            "tags": list(image.tags or []),
+            "short_id": image.short_id,
+            "size": int(image.attrs.get("Size", 0) or 0),
+            "at": now,
+        }
     except Exception as error:
-        log.debug("image size lookup failed for %s: %s", container.name, error)
+        # Deleted or untagged since the container was made: keep what was
+        # known, so the container stays listed.
+        log.debug("image lookup failed for %s: %s", container.name, error)
+        info = {**(hit or {"tags": [], "short_id": None, "size": 0}), "at": now}
+
+    image_info_cache[image_id] = info
+    return info
+
+
+def image_name(container):
+    info = image_info(container)
+
+    return (
+        info["tags"][0]
+        if info["tags"]
+        else info["short_id"]
+        or container.attrs.get("Config", {}).get("Image")
+        or ""
+    )
+
+
+def get_container_size(container):
+    image_size = image_info(container)["size"]
+    now = time.time()
+    hit = size_cache.get(container.id)
+
+    if hit and now - hit["at"] < SIZE_TTL:
+        return {
+            "writable_bytes": hit["writable_bytes"],
+            "rootfs_bytes": hit["rootfs_bytes"],
+            "image_bytes": image_size,
+        }
 
     try:
         url = client.api._url(
@@ -523,11 +580,13 @@ def get_container_size(container):
             json=True,
         )
 
-        return {
+        disk = {
             "writable_bytes": int(info.get("SizeRw", 0) or 0),
             "rootfs_bytes": int(info.get("SizeRootFs", 0) or 0),
-            "image_bytes": image_size,
         }
+        size_cache[container.id] = {**disk, "at": now}
+
+        return {**disk, "image_bytes": image_size}
 
     except Exception as error:
         log.debug("container size lookup failed for %s: %s", container.name, error)

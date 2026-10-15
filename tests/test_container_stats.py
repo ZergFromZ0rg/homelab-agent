@@ -29,9 +29,11 @@ def sample(container_ns, host_ns, cpus=4):
 
 @pytest.fixture(autouse=True)
 def _clean():
-    main.previous_cpu.clear()
+    for cache in (main.previous_cpu, main.image_info_cache, main.size_cache):
+        cache.clear()
     yield
-    main.previous_cpu.clear()
+    for cache in (main.previous_cpu, main.image_info_cache, main.size_cache):
+        cache.clear()
 
 
 def cpu_percent(container_id, stats):
@@ -78,3 +80,53 @@ def test_a_control_action_wakes_the_snapshot_worker(action):
     assert result.json()["success"] is True
     assert main.cache_wake.is_set()
     main.cache_wake.clear()
+
+
+def a_container(image_tags=("jellyfin/jellyfin:latest",), image_error=None):
+    container = mock.MagicMock()
+    container.id = "c1"
+    container.name = "jellyfin"
+    container.attrs = {"Image": "sha256:aaa", "Config": {"Image": "jellyfin/jellyfin"}}
+    if image_error:
+        type(container).image = mock.PropertyMock(side_effect=image_error)
+    else:
+        container.image.tags = list(image_tags)
+        container.image.short_id = "sha256:aaa"
+        container.image.attrs = {"Size": 700}
+    return container
+
+
+def test_an_image_is_inspected_once_however_many_snapshots_ask():
+    container = a_container()
+    inspected = mock.PropertyMock(return_value=container.image)
+    type(container).image = inspected
+    for _ in range(5):
+        assert main.image_name(container) == "jellyfin/jellyfin:latest"
+    assert inspected.call_count == 1
+
+
+def test_a_container_whose_image_was_deleted_is_still_listed_by_its_config_name():
+    container = a_container(image_error=RuntimeError("No such image"))
+    assert main.image_name(container) == "jellyfin/jellyfin"
+    assert main.image_info(container)["size"] == 0
+
+
+def test_disk_use_is_asked_for_once_per_ttl_and_the_image_size_rides_along():
+    container = a_container()
+    answer = {"SizeRw": 5, "SizeRootFs": 900}
+    with mock.patch.object(main, "client") as docker_client:
+        docker_client.api._result.return_value = answer
+        first = main.get_container_size(container)
+        second = main.get_container_size(container)
+    assert first == second == {"writable_bytes": 5, "rootfs_bytes": 900, "image_bytes": 700}
+    assert docker_client.api._get.call_count == 1
+
+
+def test_a_failed_size_query_is_retried_next_time_not_cached():
+    container = a_container()
+    with mock.patch.object(main, "client") as docker_client:
+        docker_client.api._get.side_effect = RuntimeError("busy")
+        assert main.get_container_size(container)["writable_bytes"] == 0
+        docker_client.api._get.side_effect = None
+        docker_client.api._result.return_value = {"SizeRw": 7, "SizeRootFs": 8}
+        assert main.get_container_size(container)["writable_bytes"] == 7
