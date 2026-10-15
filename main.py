@@ -37,6 +37,7 @@ import probes
 import deploy
 from gpu import get_drm_gpu_stats
 import rebuild
+import repo_status
 import terminal
 import version
 import volume_backup
@@ -327,6 +328,9 @@ def build_container_snapshot():
                 "size": get_container_size(container),
                 "ports": _container_ports(container),
                 "rebuild": rebuild.summary_for(container.labels),
+                # The GitHub repo this container's project was built from and
+                # whether its checkout has fallen behind it (repo_status.py).
+                "repo": repo_status.lookup(rebuild.target_for(container.labels)),
                 "update": updates.for_container(container, container.labels),
             })
 
@@ -840,6 +844,7 @@ def startup_event():
     terminal.cleanup_helpers(client)
     start_cache_worker()
     web_links.start(client, HOST_NAME)
+    repo_status.start()
     updates.start_loop(client)
     host_control.start_loop(client)
     smart.start_loop(client)

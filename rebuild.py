@@ -33,6 +33,7 @@ import uuid
 from pathlib import Path
 
 import config
+import repo_status
 from log import audit, log
 
 TIMEOUT = int(os.getenv("REBUILD_TIMEOUT", "1800"))
@@ -296,6 +297,9 @@ def _finish(job: dict, state: str, error: str | None = None) -> None:
 
     level = audit.warning if state == "failed" else audit.info
     level("rebuild %s %s%s", job["id"], state, f": {error}" if error else "")
+
+    # The pull moved the checkout: re-read it now rather than at the next tick.
+    repo_status.invalidate(str(host_path(job["working_dir"])))
 
 
 def _add_step(job: dict, step: dict) -> None:
