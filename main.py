@@ -80,13 +80,18 @@ container_cache = {
 
 cache_lock = threading.Lock()
 
-# Set by the create/delete routes so the cache worker rebuilds its snapshot
-# right away instead of on its next 2s tick — the dashboard then sees a
-# just-deployed container without the extra lag.
+# Set by the create/delete/start/stop/restart routes so the cache worker
+# rebuilds its snapshot right away instead of on its next 2s tick — the
+# dashboard then sees the change without the extra lag.
 cache_wake = threading.Event()
 
 
 previous_io = {}
+
+# The last CPU counters seen per container: (container cpu ns, host cpu ns).
+# CPU% is the change between two snapshots, so the stats call can be a single
+# instant sample instead of Docker's two-sample one (~2 s per container).
+previous_cpu = {}
 
 
 def add_io_rates(container_id, stats):
@@ -272,7 +277,11 @@ def get_gpu_stats():
 def build_container_snapshot():
     containers = []
 
-    for container in client.containers.list(all=True):
+    listed = client.containers.list(all=True)
+    for gone in set(previous_cpu) - {container.id for container in listed}:
+        previous_cpu.pop(gone, None)
+
+    for container in listed:
         try:
             container.reload()
 
@@ -367,6 +376,26 @@ def safe_divide(a, b):
     if not b:
         return 0
     return a / b
+
+
+def use_previous_cpu(container_id, stats):
+    """Fill ``precpu_stats`` from the last snapshot's counters.
+
+    A one-shot sample carries no previous reading, and left at zero it would
+    make ``calculate_cpu_percent`` report the average since boot. The first
+    sight of a container compares the sample with itself, which reads 0.
+    """
+    cpu = stats.get("cpu_stats", {})
+    current = (
+        cpu.get("cpu_usage", {}).get("total_usage", 0),
+        cpu.get("system_cpu_usage", 0),
+    )
+    used, system = previous_cpu.get(container_id, current)
+    previous_cpu[container_id] = current
+    stats["precpu_stats"] = {
+        "cpu_usage": {"total_usage": used},
+        "system_cpu_usage": system,
+    }
 
 
 def calculate_cpu_percent(stats):
@@ -530,10 +559,14 @@ def get_container_stats(container):
         }
 
     try:
+        # One instant sample (~3 ms). The default asks Docker to take two a
+        # second apart so it can fill precpu_stats, which blocked ~2 s per
+        # container — a whole snapshot took 20+ s for a dozen containers.
         stats = container.stats(
             stream=False,
-            one_shot=False,
+            one_shot=True,
         )
+        use_previous_cpu(container.id, stats)
 
         return {
             "cpu_percent": calculate_cpu_percent(stats),
@@ -2071,6 +2104,9 @@ def _control(container_id: str, action: str) -> dict:
     container = get_container_or_404(container_id)
     getattr(container, action)()
     audit.info("%s container %s", action, container.name)
+    # Rebuild the snapshot now, so the dashboard sees the new state on its
+    # next poll rather than after the worker's pause.
+    cache_wake.set()
     return {"success": True, "container": container.name, "action": action}
 
 
